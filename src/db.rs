@@ -4,6 +4,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 
+const TRADE_COLUMNS: &str = "id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state, \
+     hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash, hold_received_at";
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -68,6 +71,7 @@ impl Db {
                 hold_invoice TEXT,
                 payout_invoice TEXT,
                 payout_payment_hash TEXT,
+                hold_received_at INTEGER,
                 FOREIGN KEY(order_id) REFERENCES orders(id)
             );
             CREATE TABLE IF NOT EXISTS preimages (
@@ -79,6 +83,14 @@ impl Db {
             );
             ",
         )?;
+        // Databases created before hold_received_at existed.
+        if let Err(error) =
+            conn.execute("ALTER TABLE trades ADD COLUMN hold_received_at INTEGER", [])
+        {
+            if !error.to_string().contains("duplicate column") {
+                return Err(error.into());
+            }
+        }
         Ok(())
     }
 
@@ -163,8 +175,9 @@ impl Db {
         conn.execute(
             "INSERT INTO trades (
                 id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state,
-                hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash,
+                hold_received_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 trade.id,
                 trade.order_id,
@@ -177,6 +190,7 @@ impl Db {
                 trade.hold_invoice,
                 trade.payout_invoice,
                 trade.payout_payment_hash,
+                trade.hold_received_at,
             ],
         )?;
         Ok(())
@@ -184,43 +198,24 @@ impl Db {
 
     pub fn get_trade(&self, id: &str) -> Result<Option<Trade>> {
         let conn = self.conn.lock().expect("db");
-        let mut stmt = conn.prepare(
-            "SELECT id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state,
-                    hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash
-             FROM trades WHERE id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare(&format!("SELECT {TRADE_COLUMNS} FROM trades WHERE id = ?1"))?;
         let trade = stmt.query_row(params![id], row_to_trade).optional()?;
         Ok(trade)
     }
 
     pub fn open_trade_for_order(&self, order_id: &str) -> Result<Option<Trade>> {
-        let states = Phase::open_trade_states();
-        let conn = self.conn.lock().expect("db");
-        let mut stmt = conn.prepare(
-            "SELECT id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state,
-                    hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash
-             FROM trades
-             WHERE order_id = ?1 AND state IN (?2, ?3, ?4, ?5)
-             LIMIT 1",
-        )?;
-        let trade = stmt
-            .query_row(
-                params![order_id, states[0], states[1], states[2], states[3]],
-                row_to_trade,
-            )
-            .optional()?;
-        Ok(trade)
+        Ok(self
+            .trades_in_states(Phase::watched_phases())?
+            .into_iter()
+            .find(|trade| trade.order_id == order_id))
     }
 
     pub fn trades_in_states(&self, phases: &[Phase]) -> Result<Vec<Trade>> {
         let states: Vec<&str> = phases.iter().map(|phase| phase.as_str()).collect();
         let conn = self.conn.lock().expect("db");
         let marks = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state,
-                    hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash
-             FROM trades WHERE state IN ({marks})"
-        );
+        let sql = format!("SELECT {TRADE_COLUMNS} FROM trades WHERE state IN ({marks})");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(states.iter()), row_to_trade)?;
         let mut trades = Vec::new();
@@ -235,6 +230,15 @@ impl Db {
         conn.execute(
             "UPDATE trades SET state = ?1 WHERE id = ?2",
             params![state, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_hold_received_at(&self, id: &str, at: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        conn.execute(
+            "UPDATE trades SET hold_received_at = ?1 WHERE id = ?2",
+            params![at, id],
         )?;
         Ok(())
     }
@@ -307,5 +311,6 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         hold_invoice: row.get(8)?,
         payout_invoice: row.get(9)?,
         payout_payment_hash: row.get(10)?,
+        hold_received_at: row.get(11)?,
     })
 }

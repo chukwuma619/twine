@@ -1,11 +1,21 @@
 /// 1 CKB = 100_000_000 shannons.
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
-/// Hold-invoice final TLC expiry. Fiber minimum is 16 hours.
-pub const FINAL_EXPIRY_DELTA_MS: u64 = 57_600_000;
+/// Hold-invoice final TLC expiry. Fiber's minimum is 16 hours.
+/// 36 hours covers the fiat window, the dispute window, and a safety margin.
+pub const FINAL_EXPIRY_DELTA_MS: u64 = 36 * 3_600 * 1_000;
 
 /// Seconds the seller has to pay the hold invoice while it is still `Open`.
 pub const INVOICE_EXPIRY_SECS: u64 = 3_600;
+
+/// Seconds the buyer has to mark fiat sent after the hold is received.
+pub const FIAT_WINDOW_SECS: u64 = 2 * 3_600;
+
+/// Seconds the solver has to resolve a dispute after the fiat window closes.
+pub const DISPUTE_WINDOW_SECS: u64 = 18 * 3_600;
+
+/// Stop starting a payout this long before the Fiber timelock.
+pub const SAFETY_SECS: u64 = 30 * 60;
 
 /// Routing-fee cap on `send_payment`, per thousand. Fiber's default is 5.
 pub const MAX_FEE_RATE: u64 = 5;
@@ -37,10 +47,15 @@ pub const LOCKED: &str = "locked";
 pub const FIAT_SENT: &str = "fiat-sent";
 pub const RELEASE: &str = "release";
 pub const CANCEL: &str = "cancel";
+pub const DISPUTE: &str = "dispute";
+pub const RESOLVE: &str = "resolve";
 
 pub const PAY_INVOICE: &str = "pay-invoice";
 pub const WAITING_FIAT: &str = "waiting-fiat";
 pub const FIAT_SENT_OK: &str = "fiat-sent-ok";
+pub const NEW_INVOICE: &str = "new-invoice";
+pub const DISPUTED: &str = "disputed";
+pub const REFUNDING: &str = "refunding";
 pub const SETTLED: &str = "settled";
 pub const CANCELED: &str = "canceled";
 pub const EXPIRED: &str = "expired";

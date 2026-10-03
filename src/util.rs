@@ -221,7 +221,7 @@ pub(crate) mod support {
             node.require_ready().await;
             let db = Arc::new(Db::open_in_memory().expect("sqlite"));
             Self {
-                engine: Engine::new(db, node.rpc.clone()),
+                engine: Engine::new(db, node.rpc.clone(), None),
                 fiber: node.rpc,
             }
         }

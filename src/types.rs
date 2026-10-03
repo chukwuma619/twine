@@ -1,6 +1,7 @@
 use crate::constant::{
-    CANCEL, CANCELED, CANT_DO, EXPIRED, FIAT_SENT, FIAT_SENT_OK, LOCKED, NEW_ORDER, PAY_INVOICE,
-    RELEASE, SETTLED, TAKE_SELL, WAITING_FIAT,
+    CANCEL, CANCELED, CANT_DO, DISPUTE, DISPUTED, EXPIRED, FIAT_SENT, FIAT_SENT_OK, LOCKED,
+    NEW_INVOICE, NEW_ORDER, PAY_INVOICE, REFUNDING, RELEASE, RESOLVE, SETTLED, TAKE_SELL,
+    WAITING_FIAT,
 };
 use crate::util::shannons_to_ckb_string;
 use anyhow::{Result, anyhow};
@@ -14,6 +15,9 @@ pub enum Phase {
     WaitingFiat,
     FiatSent,
     Releasing,
+    AwaitingInvoice,
+    Disputed,
+    Refunding,
     Settled,
     Canceled,
     Expired,
@@ -27,6 +31,9 @@ impl Phase {
             Self::WaitingFiat => "waiting-fiat",
             Self::FiatSent => "fiat-sent",
             Self::Releasing => "releasing",
+            Self::AwaitingInvoice => "awaiting-invoice",
+            Self::Disputed => "disputed",
+            Self::Refunding => "refunding",
             Self::Settled => "settled",
             Self::Canceled => "canceled",
             Self::Expired => "expired",
@@ -40,6 +47,9 @@ impl Phase {
             "waiting-fiat" => Some(Self::WaitingFiat),
             "fiat-sent" => Some(Self::FiatSent),
             "releasing" => Some(Self::Releasing),
+            "awaiting-invoice" => Some(Self::AwaitingInvoice),
+            "disputed" => Some(Self::Disputed),
+            "refunding" => Some(Self::Refunding),
             "settled" => Some(Self::Settled),
             "canceled" => Some(Self::Canceled),
             "expired" => Some(Self::Expired),
@@ -48,23 +58,37 @@ impl Phase {
     }
 
     pub fn is_open_trade(self) -> bool {
+        self.watched()
+    }
+
+    /// Hold is still locked, or the daemon is still waiting on that hold.
+    pub fn watched(self) -> bool {
         matches!(
             self,
-            Self::WaitingHold | Self::WaitingFiat | Self::FiatSent | Self::Releasing
+            Self::WaitingHold
+                | Self::WaitingFiat
+                | Self::FiatSent
+                | Self::Releasing
+                | Self::AwaitingInvoice
+                | Self::Disputed
+                | Self::Refunding
         )
+    }
+
+    pub fn watched_phases() -> &'static [Phase] {
+        &[
+            Self::WaitingHold,
+            Self::WaitingFiat,
+            Self::FiatSent,
+            Self::Releasing,
+            Self::AwaitingInvoice,
+            Self::Disputed,
+            Self::Refunding,
+        ]
     }
 
     pub fn returns_slice(self) -> bool {
         matches!(self, Self::Canceled | Self::Expired)
-    }
-
-    pub fn open_trade_states() -> [&'static str; 4] {
-        [
-            Self::WaitingHold.as_str(),
-            Self::WaitingFiat.as_str(),
-            Self::FiatSent.as_str(),
-            Self::Releasing.as_str(),
-        ]
     }
 }
 
@@ -95,6 +119,7 @@ impl OrderStatus {
 pub enum Actor {
     Maker,
     Taker,
+    Solver,
     Other,
 }
 
@@ -135,6 +160,8 @@ pub enum ClientAction {
     FiatSent,
     Release,
     Cancel,
+    Dispute,
+    Resolve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +169,9 @@ pub enum ReplyAction {
     PayInvoice,
     WaitingFiat,
     FiatSentOk,
+    NewInvoice,
+    Disputed,
+    Refunding,
     Settled,
     Canceled,
     Expired,
@@ -184,6 +214,8 @@ impl Envelope {
             FIAT_SENT => Some(ClientAction::FiatSent),
             RELEASE => Some(ClientAction::Release),
             CANCEL => Some(ClientAction::Cancel),
+            DISPUTE => Some(ClientAction::Dispute),
+            RESOLVE => Some(ClientAction::Resolve),
             _ => None,
         }
     }
@@ -193,6 +225,9 @@ impl Envelope {
             PAY_INVOICE => Some(ReplyAction::PayInvoice),
             WAITING_FIAT => Some(ReplyAction::WaitingFiat),
             FIAT_SENT_OK => Some(ReplyAction::FiatSentOk),
+            NEW_INVOICE => Some(ReplyAction::NewInvoice),
+            DISPUTED => Some(ReplyAction::Disputed),
+            REFUNDING => Some(ReplyAction::Refunding),
             SETTLED => Some(ReplyAction::Settled),
             CANCELED => Some(ReplyAction::Canceled),
             EXPIRED => Some(ReplyAction::Expired),
@@ -230,6 +265,24 @@ pub struct TakeSellPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FiatSentPayload {
     pub invoice: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvePayload {
+    pub winner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewInvoicePayload {
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +367,8 @@ pub struct Trade {
     pub hold_invoice: Option<String>,
     pub payout_invoice: Option<String>,
     pub payout_payment_hash: Option<String>,
+    /// Unix seconds when the hold invoice became `Received`.
+    pub hold_received_at: Option<i64>,
 }
 
 impl Trade {

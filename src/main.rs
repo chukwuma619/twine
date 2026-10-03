@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     let db = Arc::new(Db::open(&config.db_path)?);
     info!(network = %config.network, currency = %config.invoice_currency, "fiber");
     let fiber = Arc::new(HttpFiber::new(&config.rpc_url, &config.invoice_currency));
-    let engine = Engine::new(db, fiber);
+    let engine = Engine::new(db, fiber, config.solver.clone());
     let client = connect(&config.relays).await?;
 
     let polling = Arc::new(Mutex::new(HashSet::new()));
@@ -90,20 +90,32 @@ async fn main() -> Result<()> {
                     _ => false,
                 });
                 match (action, trade_id, rejected) {
-                    (Some(ClientAction::Locked), Some(trade_id), false) => engine.spawn_poll(
-                        PollKind::Hold,
-                        client.clone(),
-                        keys.clone(),
-                        trade_id,
-                        polling.clone(),
-                    ),
-                    (Some(ClientAction::Release), Some(trade_id), false) => engine.spawn_poll(
-                        PollKind::Payout,
-                        client.clone(),
-                        keys.clone(),
-                        trade_id,
-                        polling.clone(),
-                    ),
+                    (
+                        Some(
+                            ClientAction::Locked
+                            | ClientAction::FiatSent
+                            | ClientAction::Release
+                            | ClientAction::Dispute
+                            | ClientAction::Resolve,
+                        ),
+                        Some(trade_id),
+                        false,
+                    ) => {
+                        engine.spawn_poll(
+                            PollKind::Hold,
+                            client.clone(),
+                            keys.clone(),
+                            trade_id.clone(),
+                            polling.clone(),
+                        );
+                        engine.spawn_poll(
+                            PollKind::Payout,
+                            client.clone(),
+                            keys.clone(),
+                            trade_id,
+                            polling.clone(),
+                        );
+                    }
                     _ => {}
                 }
             }

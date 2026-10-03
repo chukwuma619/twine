@@ -10,6 +10,7 @@ pub struct Config {
     pub relays: Vec<String>,
     pub rpc_url: String,
     pub db_path: PathBuf,
+    pub solver: Option<String>,
 }
 
 impl Config {
@@ -32,6 +33,10 @@ impl Config {
         let network = std::env::var("FIBER_NETWORK").unwrap_or_else(|_| "testnet".to_string());
         let currency = invoice_currency(network.trim())?.to_string();
         let network = network.trim().to_string();
+        let solver = std::env::var("TWINE_SOLVER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Ok(Self {
             network,
             invoice_currency: currency,
@@ -39,6 +44,7 @@ impl Config {
             relays,
             rpc_url,
             db_path,
+            solver,
         })
     }
 }
