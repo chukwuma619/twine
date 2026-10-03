@@ -4,8 +4,13 @@ Fiber release tags publish official container images to Docker Hub at `nervos/fi
 
 ## Build locally
 
+This directory is the [FiberDocker setup](https://github.com/nervosnetwork/fiber/tree/develop/docker), adapted so it can build from the Twine repo. Twine does not contain the `fnn` source, so the image checks out [nervosnetwork/fiber](https://github.com/nervosnetwork/fiber) `develop` and compiles `fiber-bin` and `fnn-cli` the same way upstream does. Config templates are copied from that checkout (`config/testnet`, `config/mainnet`).
+
+`develop` currently tracks Fiber `0.10.0-rc1` and Rust `1.95.0`. Override the git ref with `FIBER_REF` (branch or tag).
+
 ```bash
 docker build -f docker/Dockerfile -t fiber:local .
+# docker build -f docker/Dockerfile --build-arg FIBER_REF=v0.9.1 -t fiber:local .
 ```
 
 ## Run the published image
@@ -53,7 +58,7 @@ If you enabled RPC authentication, pass the token the same way as on bare metal:
 docker exec -it fiber-node fnn-cli --auth-token 'YOUR_TOKEN' info
 ```
 
-The full CLI reference is available in [../crates/fiber-cli/README.md](../crates/fiber-cli/README.md).
+The full CLI reference is in the Fiber repo: [crates/fiber-cli/README.md](https://github.com/nervosnetwork/fiber/blob/develop/crates/fiber-cli/README.md).
 
 ## Migrate data with Docker
 
