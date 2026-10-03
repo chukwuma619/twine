@@ -1,14 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use twine_daemon::db::Db;
 use twine_daemon::engine::{Engine, PollKind};
-use twine_daemon::fiber::HttpFiber;
+use twine_daemon::fiber::{FiberRpc, HttpFiber, accept_node_pubkey};
 use twine_daemon::nostr::{action_filter, connect, decrypt_action, publish_outbounds, sender_hex};
 use twine_daemon::types::Outbound;
-use twine_daemon::{CANT_DO, ClientAction, Config, KIND_ACTION};
+use twine_daemon::{CANT_DO, ClientAction, Config, KIND_ACTION, Phase};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,8 +25,14 @@ async fn main() -> Result<()> {
 
     let db = Arc::new(Db::open(&config.db_path)?);
     info!(network = %config.network, currency = %config.invoice_currency, "fiber");
-    let fiber = Arc::new(HttpFiber::new(&config.rpc_url, &config.invoice_currency));
+    let fiber = Arc::new(HttpFiber::new(
+        &config.rpc_url,
+        &config.invoice_currency,
+        &config.rpc_token,
+    )?);
+    pin_fiber_node(&db, fiber.as_ref()).await?;
     let engine = Engine::new(db, fiber, config.solver.clone());
+    engine.arm_watchtower().await?;
     let client = connect(&config.relays).await?;
 
     let polling = Arc::new(Mutex::new(HashSet::new()));
@@ -121,6 +127,22 @@ async fn main() -> Result<()> {
             }
             Err(error) => warn!(%error, "handle failed"),
         }
+    }
+    Ok(())
+}
+
+async fn pin_fiber_node(db: &Db, fiber: &HttpFiber) -> Result<()> {
+    let current = fiber
+        .node_pubkey()
+        .await
+        .context("Fiber RPC node_info failed")?;
+    let open = db.trades_in_states(Phase::watched_phases())?.len();
+    let saved = db.fiber_pubkey()?;
+    if accept_node_pubkey(saved.as_deref(), &current, open)? {
+        db.set_fiber_pubkey(&current)?;
+        info!(pubkey = %current, "pinned fiber node");
+    } else {
+        info!(pubkey = %current, open_holds = open, "fiber node");
     }
     Ok(())
 }

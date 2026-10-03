@@ -1,5 +1,5 @@
 use crate::db::Db;
-use crate::fiber::FiberRpc;
+use crate::fiber::{FiberRpc, ParsedInvoice};
 use crate::nostr::publish_outbounds;
 use crate::types::{Order, OrderStatus, Trade};
 use crate::{
@@ -47,6 +47,37 @@ impl<F> Clone for Engine<F> {
 impl<F: FiberRpc> Engine<F> {
     pub fn new(db: Arc<Db>, fiber: Arc<F>, solver: Option<String>) -> Self {
         Self { db, fiber, solver }
+    }
+
+    /// Put every still-claimable hold back on the watchtower, and drop any we have
+    /// already decided not to claim. A force-close can spend the HTLC only while
+    /// `create_preimage` is registered.
+    pub async fn arm_watchtower(&self) -> Result<()> {
+        for trade in self.db.trades_in_states(Phase::watched_phases())? {
+            if trade.phase()? == Phase::Refunding {
+                self.drop_preimage(&trade).await?;
+                continue;
+            }
+            let Some(hash) = trade.hold_payment_hash.as_deref() else {
+                bail!("trade {} is open without a hold hash", trade.id);
+            };
+            let Some(preimage) = self.db.get_preimage(hash)? else {
+                bail!(
+                    "trade {} is open but the hold preimage is missing",
+                    trade.id
+                );
+            };
+            self.fiber
+                .create_preimage(hash, &preimage)
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "watchtower create_preimage failed for trade {}: {error}",
+                        trade.id
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub fn resume_trade_ids(&self) -> Result<(Vec<String>, Vec<String>)> {
@@ -179,10 +210,9 @@ impl<F: FiberRpc> Engine<F> {
             payout_payment_hash: None,
             hold_received_at: None,
         };
-        self.db.insert_trade(&trade)?;
-        self.db
-            .set_available(&order.id, order.available_shannons - shannons)?;
-        self.db.insert_preimage(&payment_hash, &preimage)?;
+        if let Err(error) = self.db.commit_take(&trade, &preimage) {
+            return Ok(vec![cant_do(sender, None, &error.to_string())]);
+        }
 
         let created = match self
             .fiber
@@ -191,7 +221,7 @@ impl<F: FiberRpc> Engine<F> {
         {
             Ok(created) => created,
             Err(error) => {
-                self.rollback_take(&order, &trade, &payment_hash)?;
+                self.rollback_take(&trade, &payment_hash)?;
                 return Ok(vec![cant_do(
                     sender,
                     Some(trade_id),
@@ -201,7 +231,8 @@ impl<F: FiberRpc> Engine<F> {
         };
         if let Err(error) = self.fiber.create_preimage(&payment_hash, &preimage).await {
             let _ = self.fiber.cancel_invoice(&payment_hash).await;
-            self.rollback_take(&order, &trade, &payment_hash)?;
+            let _ = self.fiber.remove_preimage(&payment_hash).await;
+            self.rollback_take(&trade, &payment_hash)?;
             return Ok(vec![cant_do(
                 sender,
                 Some(trade_id),
@@ -235,11 +266,9 @@ impl<F: FiberRpc> Engine<F> {
         ])
     }
 
-    fn rollback_take(&self, order: &Order, trade: &Trade, payment_hash: &str) -> Result<()> {
-        self.db.delete_preimage(payment_hash)?;
-        self.db.delete_trade(&trade.id)?;
-        self.db.set_available(&order.id, order.available_shannons)?;
-        Ok(())
+    fn rollback_take(&self, trade: &Trade, payment_hash: &str) -> Result<()> {
+        self.db
+            .rollback_take(&trade.order_id, &trade.id, payment_hash, trade.shannons)
     }
 
     async fn on_locked(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
@@ -259,7 +288,7 @@ impl<F: FiberRpc> Engine<F> {
     }
 
     pub async fn on_hold_status(&self, trade_id: &str) -> Result<Vec<Outbound>> {
-        let Some(trade) = self.db.get_trade(trade_id)? else {
+        let Some(mut trade) = self.db.get_trade(trade_id)? else {
             bail!("trade {trade_id} not found");
         };
         let phase = trade.phase()?;
@@ -277,11 +306,14 @@ impl<F: FiberRpc> Engine<F> {
         if status == InvoiceStatus::Expired {
             return self.expire_trade(&order, &trade).await;
         }
+        if status == InvoiceStatus::Cancelled && phase == Phase::WaitingHold {
+            return self.complete_cancel(&order, &trade).await;
+        }
         if phase == Phase::WaitingHold && status == InvoiceStatus::Received {
             return match apply_hold_received(Phase::WaitingHold) {
                 Decision::Ok(next) => {
-                    self.db.set_trade_state(&trade.id, next.as_str())?;
-                    self.db.set_hold_received_at(&trade.id, unix_now())?;
+                    self.db
+                        .set_hold_received(&trade.id, next.as_str(), unix_now())?;
                     Ok(party_replies(
                         &order,
                         &trade,
@@ -291,19 +323,40 @@ impl<F: FiberRpc> Engine<F> {
                 other => bail!("invalid hold received: {other:?}"),
             };
         }
+        if status == InvoiceStatus::Received && trade.hold_received_at.is_none() {
+            let now = unix_now();
+            self.db.set_hold_received_at(&trade.id, now)?;
+            trade.hold_received_at = Some(now);
+        }
+        if phase == Phase::Refunding && self.preimage_pending(&trade)? {
+            self.drop_preimage(&trade).await?;
+            return Ok(party_replies(
+                &order,
+                &trade,
+                Envelope::new(REFUNDING).with_trade(&trade.id),
+            ));
+        }
         self.refund_if_due(&order, &trade).await
     }
 
     async fn expire_trade(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
         match apply_expired(trade.phase()?) {
-            Decision::Ok(phase) => {
-                self.drop_preimage(trade).await;
-                self.finish_terminal(order, trade, phase)?;
-                Ok(party_replies(
-                    order,
-                    trade,
-                    Envelope::new(EXPIRED).with_trade(&trade.id),
-                ))
+            Decision::Ok(_) => {
+                // Stop claiming before the slice goes back on the book. Refunding is
+                // watched, so a crash here retries the drop instead of bricking boot.
+                if trade.phase()? != Phase::Refunding {
+                    self.db
+                        .set_trade_state(&trade.id, Phase::Refunding.as_str())?;
+                }
+                if self.preimage_pending(trade)? {
+                    self.drop_preimage(trade).await?;
+                }
+                self.finish_terminal(order, trade, Phase::Expired)?;
+                let order = self.require_order(&order.id)?;
+                let mut outbound =
+                    party_replies(&order, trade, Envelope::new(EXPIRED).with_trade(&trade.id));
+                outbound.insert(0, Outbound::PublicOrder(order.public()));
+                Ok(outbound)
             }
             Decision::Reject(_) => Ok(Vec::new()),
             Decision::NoOp => Ok(Vec::new()),
@@ -319,9 +372,9 @@ impl<F: FiberRpc> Engine<F> {
     }
 
     async fn begin_refund(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
-        self.drop_preimage(trade).await;
         self.db
             .set_trade_state(&trade.id, Phase::Refunding.as_str())?;
+        self.drop_preimage(trade).await?;
         Ok(party_replies(
             order,
             trade,
@@ -329,16 +382,13 @@ impl<F: FiberRpc> Engine<F> {
         ))
     }
 
-    async fn drop_preimage(&self, trade: &Trade) {
+    async fn drop_preimage(&self, trade: &Trade) -> Result<()> {
         let Some(hash) = trade.hold_payment_hash.as_deref() else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = self.fiber.remove_preimage(hash).await {
-            warn!(%error, "remove preimage");
-        }
-        if let Err(error) = self.db.delete_preimage(hash) {
-            warn!(%error, "delete preimage");
-        }
+        self.fiber.remove_preimage(hash).await?;
+        self.db.delete_preimage(hash)?;
+        Ok(())
     }
 
     async fn on_fiat_sent(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
@@ -428,7 +478,19 @@ impl<F: FiberRpc> Engine<F> {
             .clone()
             .ok_or_else(|| anyhow!("missing payout invoice"))?;
         if trade.payout_payment_hash.is_none() {
-            self.fiber.parse_invoice(&invoice).await?;
+            let parsed = match self.fiber.parse_invoice(&invoice).await {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return self.fail_payout(
+                        &order,
+                        &trade,
+                        &format!("payout invoice rejected: {error}"),
+                    );
+                }
+            };
+            if let Err(reason) = payout_invoice_ok(&parsed, self.fiber.currency(), trade.shannons) {
+                return self.fail_payout(&order, &trade, reason);
+            }
             let payment = match self.fiber.send_payment(&invoice).await {
                 Ok(payment) => payment,
                 Err(error) => return self.fail_payout(&order, &trade, &sender_reason(&error)),
@@ -468,12 +530,20 @@ impl<F: FiberRpc> Engine<F> {
             .db
             .get_preimage(payment_hash)?
             .ok_or_else(|| anyhow!("missing preimage"))?;
-        self.fiber.settle_invoice(payment_hash, &preimage).await?;
-        let _ = self.fiber.remove_preimage(payment_hash).await;
-        self.db.delete_preimage(payment_hash)?;
+        if let Err(error) = self.fiber.settle_invoice(payment_hash, &preimage).await {
+            let info = self.fiber.get_invoice(payment_hash).await?;
+            if InvoiceStatus::parse(&info.status) != Some(InvoiceStatus::Paid) {
+                return Err(error);
+            }
+        }
+        // Leave the watchtower copy. settle_invoice pays the live channel; a
+        // force-close of a commitment that still holds the HTLC needs this preimage.
         match apply_release_succeeded(Phase::Releasing) {
             Decision::Ok(phase) => {
                 self.db.set_trade_state(&trade.id, phase.as_str())?;
+                if let Err(error) = self.db.delete_preimage(payment_hash) {
+                    warn!(%error, trade_id = %trade.id, "delete preimage after settle");
+                }
                 Ok(party_replies(
                     order,
                     trade,
@@ -578,9 +648,6 @@ impl<F: FiberRpc> Engine<F> {
             .map(str::trim)
             .filter(|invoice| !invoice.is_empty())
             .map(ToOwned::to_owned);
-        if let Some(invoice) = &supplied {
-            self.db.set_payout(&trade.id, invoice, None)?;
-        }
         let has_invoice = supplied.is_some()
             || trade
                 .payout_invoice
@@ -590,6 +657,9 @@ impl<F: FiberRpc> Engine<F> {
         match apply_resolve(trade.phase()?, actor, winner, has_invoice) {
             Decision::Ok(Phase::Refunding) => self.begin_refund(&order, &trade).await,
             Decision::Ok(Phase::Releasing) => {
+                if let Some(invoice) = &supplied {
+                    self.db.set_payout(&trade.id, invoice, None)?;
+                }
                 self.db
                     .set_trade_state(&trade.id, Phase::Releasing.as_str())?;
                 Ok(Vec::new())
@@ -623,9 +693,9 @@ impl<F: FiberRpc> Engine<F> {
         let actor = self.actor(&order.maker_nostr, None, sender);
         match apply_cancel(Phase::Pending, actor, None) {
             Decision::Ok(Phase::Canceled) => {
-                self.db
-                    .set_order_status(&order.id, OrderStatus::Canceled.as_str())?;
-                self.db.set_available(&order.id, 0)?;
+                if let Err(error) = self.db.cancel_order(&order.id) {
+                    return Ok(vec![cant_do(sender, None, &error.to_string())]);
+                }
                 let order = self.require_order(&order.id)?;
                 Ok(vec![
                     Outbound::PublicOrder(order.public()),
@@ -658,21 +728,12 @@ impl<F: FiberRpc> Engine<F> {
         };
         match apply_cancel(trade.phase()?, actor, invoice_status) {
             Decision::Ok(Phase::Canceled) => {
-                if let Some(hash) = trade.hold_payment_hash.as_deref() {
-                    if invoice_status == Some(InvoiceStatus::Open) {
+                if invoice_status == Some(InvoiceStatus::Open) {
+                    if let Some(hash) = trade.hold_payment_hash.as_deref() {
                         self.fiber.cancel_invoice(hash).await?;
                     }
-                    self.db.delete_preimage(hash)?;
                 }
-                self.finish_terminal(&order, &trade, Phase::Canceled)?;
-                let order = self.require_order(&order.id)?;
-                let mut outbound = party_replies(
-                    &order,
-                    &trade,
-                    Envelope::new(CANCELED).with_trade(&trade.id),
-                );
-                outbound.insert(0, Outbound::PublicOrder(order.public()));
-                Ok(outbound)
+                self.complete_cancel(&order, &trade).await
             }
             Decision::Ok(Phase::Expired) => self.expire_trade(&order, &trade).await,
             Decision::Reject(reason) => {
@@ -686,14 +747,29 @@ impl<F: FiberRpc> Engine<F> {
         }
     }
 
-    fn finish_terminal(&self, order: &Order, trade: &Trade, phase: Phase) -> Result<()> {
-        self.db.set_trade_state(&trade.id, phase.as_str())?;
-        if phase.returns_slice() {
-            let current = self.require_order(&order.id)?;
-            self.db
-                .set_available(&order.id, current.available_shannons + trade.shannons)?;
+    async fn complete_cancel(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
+        self.finish_terminal(order, trade, Phase::Canceled)?;
+        if let Err(error) = self.drop_preimage(trade).await {
+            warn!(%error, trade_id = %trade.id, "remove preimage");
         }
-        Ok(())
+        let order = self.require_order(&order.id)?;
+        let mut outbound =
+            party_replies(&order, trade, Envelope::new(CANCELED).with_trade(&trade.id));
+        outbound.insert(0, Outbound::PublicOrder(order.public()));
+        Ok(outbound)
+    }
+
+    fn preimage_pending(&self, trade: &Trade) -> Result<bool> {
+        let Some(hash) = trade.hold_payment_hash.as_deref() else {
+            return Ok(false);
+        };
+        Ok(self.db.get_preimage(hash)?.is_some())
+    }
+
+    fn finish_terminal(&self, order: &Order, trade: &Trade, phase: Phase) -> Result<()> {
+        let restore = phase.returns_slice().then_some(trade.shannons);
+        self.db
+            .finish_trade(&order.id, &trade.id, phase.as_str(), restore)
     }
 
     async fn refund_due_outbound(
@@ -825,6 +901,21 @@ fn sender_reason(error: &anyhow::Error) -> String {
     format!("taker payout failed: {error}")
 }
 
+fn payout_invoice_ok(
+    parsed: &ParsedInvoice,
+    currency: &str,
+    shannons: u128,
+) -> Result<(), &'static str> {
+    if parsed.currency != currency {
+        return Err("payout invoice currency does not match this node");
+    }
+    match parsed.amount {
+        Some(amount) if amount == shannons => Ok(()),
+        Some(_) => Err("payout invoice amount does not match the trade"),
+        None => Err("payout invoice amount is required"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,8 +925,8 @@ mod tests {
         take, wait_invoice_status,
     };
     use crate::{
-        CANCEL, DISPUTE, DISPUTED, EXPIRED, FIAT_WINDOW_SECS, LOCKED, OrderStatus, REFUNDING,
-        RELEASE, RESOLVE, ResolvePayload, TAKE_SELL, WAITING_FIAT,
+        CANCEL, DISPUTE, DISPUTED, EXPIRED, FIAT_WINDOW_SECS, LOCKED, NEW_INVOICE, OrderStatus,
+        REFUNDING, RELEASE, RESOLVE, ResolvePayload, SETTLED, TAKE_SELL, WAITING_FIAT,
     };
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
@@ -843,6 +934,9 @@ mod tests {
     struct FakeFiber {
         status: StdMutex<String>,
         removed: StdMutex<bool>,
+        preimages: StdMutex<HashSet<String>>,
+        payment_status: StdMutex<String>,
+        parsed_amount: StdMutex<u128>,
     }
 
     #[async_trait]
@@ -864,26 +958,44 @@ mod tests {
             bail!("unused")
         }
         async fn settle_invoice(&self, _: &str, _: &str) -> Result<()> {
-            bail!("unused")
-        }
-        async fn create_preimage(&self, _: &str, _: &str) -> Result<()> {
             Ok(())
         }
-        async fn remove_preimage(&self, _: &str) -> Result<()> {
+        async fn create_preimage(&self, payment_hash: &str, _: &str) -> Result<()> {
+            self.preimages
+                .lock()
+                .expect("preimages")
+                .insert(payment_hash.to_string());
+            Ok(())
+        }
+        async fn remove_preimage(&self, payment_hash: &str) -> Result<()> {
+            self.preimages
+                .lock()
+                .expect("preimages")
+                .remove(payment_hash);
             *self.removed.lock().expect("removed") = true;
             Ok(())
         }
         async fn send_payment(&self, _: &str) -> Result<PaymentInfo> {
             bail!("unused")
         }
-        async fn get_payment(&self, _: &str) -> Result<PaymentInfo> {
-            bail!("unused")
+        async fn get_payment(&self, payment_hash: &str) -> Result<PaymentInfo> {
+            Ok(PaymentInfo {
+                payment_hash: payment_hash.to_string(),
+                status: self.payment_status.lock().expect("payment").clone(),
+            })
         }
         async fn parse_invoice(&self, _: &str) -> Result<ParsedInvoice> {
-            bail!("unused")
+            Ok(ParsedInvoice {
+                payment_hash: "parsed".into(),
+                currency: "Fibt".into(),
+                amount: Some(*self.parsed_amount.lock().expect("amount")),
+            })
         }
         async fn node_pubkey(&self) -> Result<String> {
             bail!("unused")
+        }
+        fn currency(&self) -> &str {
+            "Fibt"
         }
     }
 
@@ -891,6 +1003,9 @@ mod tests {
         let fiber = Arc::new(FakeFiber {
             status: StdMutex::new(status.to_string()),
             removed: StdMutex::new(false),
+            preimages: StdMutex::new(HashSet::from(["hash".to_string()])),
+            payment_status: StdMutex::new("Inflight".to_string()),
+            parsed_amount: StdMutex::new(100_000_000),
         });
         let db = Arc::new(Db::open_in_memory().unwrap());
         db.insert_order(&Order {
@@ -976,6 +1091,29 @@ mod tests {
             .await
             .unwrap();
         assert!(cant_do_reason(&missing).contains("payout invoice"));
+        let sneaky = engine
+            .handle(
+                "buyer",
+                Envelope::new(RESOLVE)
+                    .with_trade("trade")
+                    .with_payload(ResolvePayload {
+                        winner: "buyer".into(),
+                        invoice: Some("evil".into()),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&sneaky).contains("solver"));
+        assert!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .payout_invoice
+                .is_none()
+        );
         let seller = engine
             .handle(
                 "solver",
@@ -995,6 +1133,97 @@ mod tests {
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::Refunding.as_str()
         );
+        assert!(!fiber.preimages.lock().unwrap().contains("hash"));
+    }
+
+    #[tokio::test]
+    async fn restart_rearms_a_claimable_hold_and_drops_a_refund() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_trade_state("trade", Phase::WaitingFiat.as_str())
+            .unwrap();
+        fiber.preimages.lock().unwrap().clear();
+        engine.arm_watchtower().await.unwrap();
+        assert!(fiber.preimages.lock().unwrap().contains("hash"));
+
+        engine
+            .db
+            .set_trade_state("trade", Phase::Refunding.as_str())
+            .unwrap();
+        engine.arm_watchtower().await.unwrap();
+        assert!(!fiber.preimages.lock().unwrap().contains("hash"));
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn settle_leaves_the_watchtower_preimage() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_trade_state("trade", Phase::Releasing.as_str())
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", Some("payout"))
+            .unwrap();
+        *fiber.payment_status.lock().unwrap() = "Success".into();
+        let settled = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&settled, SETTLED));
+        assert!(fiber.preimages.lock().unwrap().contains("hash"));
+        assert!(!*fiber.removed.lock().unwrap());
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn payout_rejects_an_invoice_for_the_wrong_amount() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_trade_state("trade", Phase::Releasing.as_str())
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", None)
+            .unwrap();
+        *fiber.parsed_amount.lock().unwrap() = 1;
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, NEW_INVOICE));
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        assert_eq!(trade.state, Phase::AwaitingInvoice.as_str());
+        assert!(trade.payout_payment_hash.is_none());
+    }
+
+    #[test]
+    fn payout_invoice_must_match_the_trade() {
+        let invoice = ParsedInvoice {
+            payment_hash: "h".into(),
+            currency: "Fibt".into(),
+            amount: Some(10),
+        };
+        assert!(payout_invoice_ok(&invoice, "Fibt", 10).is_ok());
+        assert!(payout_invoice_ok(&invoice, "Fibb", 10).is_err());
+        let wrong = ParsedInvoice {
+            amount: Some(11),
+            ..invoice
+        };
+        assert!(payout_invoice_ok(&wrong, "Fibt", 10).is_err());
+        let open = ParsedInvoice {
+            amount: None,
+            ..wrong
+        };
+        assert!(payout_invoice_ok(&open, "Fibt", 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_open_hold_without_a_preimage_refuses_to_boot() {
+        let (engine, _) = fake_engine("Received");
+        engine.db.delete_preimage("hash").unwrap();
+        engine
+            .db
+            .set_trade_state("trade", Phase::WaitingFiat.as_str())
+            .unwrap();
+        assert!(engine.arm_watchtower().await.is_err());
     }
 
     #[tokio::test]

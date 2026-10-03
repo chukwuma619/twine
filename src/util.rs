@@ -123,10 +123,6 @@ pub fn i64_from_shannons(value: u128) -> Result<i64> {
     i64::try_from(value).context("trade amount does not fit sqlite integer")
 }
 
-pub fn shannons_from_i64(value: i64) -> u128 {
-    u128::try_from(value).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,8 +193,9 @@ pub(crate) mod support {
             let url = env::var("TWINE_RPC").unwrap_or_else(|_| DEFAULT_RPC.to_string());
             let network = env::var("FIBER_NETWORK").unwrap_or_else(|_| "testnet".to_string());
             let currency = invoice_currency(&network).expect("FIBER_NETWORK");
+            let token = env::var("TWINE_RPC_TOKEN").unwrap_or_else(|_| "test-token".to_string());
             Self {
-                rpc: Arc::new(HttpFiber::new(url, currency)),
+                rpc: Arc::new(HttpFiber::new(url, currency, token).expect("TWINE_RPC_TOKEN")),
             }
         }
 

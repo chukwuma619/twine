@@ -152,9 +152,10 @@ pub fn apply_cancel(phase: Phase, actor: Actor, invoice: Option<InvoiceStatus>) 
                     Decision::Reject("hold is locked; wait for the timelock")
                 }
                 Some(InvoiceStatus::Expired) => Decision::Ok(Phase::Expired),
-                Some(InvoiceStatus::Open) | Some(InvoiceStatus::Cancelled) | None => {
+                Some(InvoiceStatus::Open) | Some(InvoiceStatus::Cancelled) => {
                     Decision::Ok(Phase::Canceled)
                 }
+                None => Decision::Reject("unknown hold invoice status"),
             }
         }
         Phase::WaitingFiat
@@ -271,11 +272,15 @@ mod tests {
     }
 
     #[test]
-    fn cancel_waiting_hold_requires_open_or_unknown_invoice() {
+    fn cancel_waiting_hold_requires_an_open_invoice() {
         assert_eq!(
             apply_cancel(Phase::WaitingHold, taker(), Some(InvoiceStatus::Open)),
             Decision::Ok(Phase::Canceled)
         );
+        assert!(matches!(
+            apply_cancel(Phase::WaitingHold, taker(), None),
+            Decision::Reject(_)
+        ));
         assert_eq!(
             apply_cancel(Phase::WaitingHold, maker(), Some(InvoiceStatus::Received)),
             Decision::Reject("hold is locked; wait for the timelock")

@@ -9,6 +9,7 @@ pub struct Config {
     pub nostr_secret: String,
     pub relays: Vec<String>,
     pub rpc_url: String,
+    pub rpc_token: String,
     pub db_path: PathBuf,
     pub solver: Option<String>,
 }
@@ -27,6 +28,13 @@ impl Config {
             bail!("TWINE_RELAYS must list at least one relay");
         }
         let rpc_url = std::env::var("TWINE_RPC").context("TWINE_RPC is required")?;
+        let rpc_token = std::env::var("TWINE_RPC_TOKEN")
+            .context("TWINE_RPC_TOKEN is required")?
+            .trim()
+            .to_string();
+        if rpc_token.is_empty() {
+            bail!("TWINE_RPC_TOKEN is required");
+        }
         let db_path = std::env::var("TWINE_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_DB_PATH));
@@ -43,6 +51,7 @@ impl Config {
             nostr_secret,
             relays,
             rpc_url,
+            rpc_token,
             db_path,
             solver,
         })

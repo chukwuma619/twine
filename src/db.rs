@@ -1,5 +1,5 @@
-use crate::{Order, Phase, Trade, i64_from_shannons, shannons_from_i64};
-use anyhow::{Context, Result};
+use crate::{Order, OrderStatus, Phase, Trade, i64_from_shannons};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -45,6 +45,7 @@ impl Db {
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db");
+        conn.execute("PRAGMA foreign_keys = ON", [])?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS orders (
@@ -80,6 +81,10 @@ impl Db {
             );
             CREATE TABLE IF NOT EXISTS processed_events (
                 event_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS fiber_node (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                pubkey TEXT NOT NULL
             );
             ",
         )?;
@@ -139,7 +144,7 @@ impl Db {
                     id: row.get(0)?,
                     maker_nostr: row.get(1)?,
                     maker_fiber: row.get(2)?,
-                    available_shannons: shannons_from_i64(row.get(3)?),
+                    available_shannons: read_shannons(row.get(3)?, 3)?,
                     fiat_currency_code: row.get(4)?,
                     price_per_ckb: row.get(5)?,
                     min: row.get(6)?,
@@ -152,22 +157,125 @@ impl Db {
         Ok(order)
     }
 
-    pub fn set_available(&self, id: &str, available: u128) -> Result<()> {
+    /// Debit the order, insert the trade, and store the hold preimage together.
+    pub fn commit_take(&self, trade: &Trade, preimage: &str) -> Result<()> {
+        let hash = trade
+            .hold_payment_hash
+            .as_deref()
+            .context("take is missing a hold hash")?;
+        let shannons = i64_from_shannons(trade.shannons)?;
         let conn = self.conn.lock().expect("db");
-        conn.execute(
-            "UPDATE orders SET available_shannons = ?1 WHERE id = ?2",
-            params![i64_from_shannons(available)?, id],
+        let tx = conn.unchecked_transaction()?;
+        if open_trades_for(&tx, &trade.order_id)? > 0 {
+            bail!("order already has an open trade");
+        }
+        let updated = tx.execute(
+            "UPDATE orders SET available_shannons = available_shannons - ?1
+             WHERE id = ?2 AND status = ?3 AND available_shannons >= ?1",
+            params![shannons, trade.order_id, OrderStatus::Open.as_str()],
         )?;
+        if updated != 1 {
+            bail!("order cannot fund this take");
+        }
+        tx.execute(
+            "INSERT INTO trades (
+                id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state,
+                hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash,
+                hold_received_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                trade.id,
+                trade.order_id,
+                trade.taker_nostr,
+                trade.taker_fiber,
+                trade.fiat_amount,
+                shannons,
+                trade.state,
+                hash,
+                trade.hold_invoice,
+                trade.payout_invoice,
+                trade.payout_payment_hash,
+                trade.hold_received_at,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO preimages (payment_hash, preimage) VALUES (?1, ?2)",
+            params![hash, preimage],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn set_order_status(&self, id: &str, status: &str) -> Result<()> {
+    pub fn rollback_take(
+        &self,
+        order_id: &str,
+        trade_id: &str,
+        payment_hash: &str,
+        shannons: u128,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("db");
-        conn.execute(
-            "UPDATE orders SET status = ?1 WHERE id = ?2",
-            params![status, id],
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM preimages WHERE payment_hash = ?1",
+            params![payment_hash],
         )?;
+        tx.execute("DELETE FROM trades WHERE id = ?1", params![trade_id])?;
+        add_available(&tx, order_id, shannons)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Close a trade. When `restore` is set, add that slice back to the order.
+    pub fn finish_trade(
+        &self,
+        order_id: &str,
+        trade_id: &str,
+        state: &str,
+        restore: Option<u128>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let tx = conn.unchecked_transaction()?;
+        let updated = tx.execute(
+            "UPDATE trades SET state = ?1 WHERE id = ?2",
+            params![state, trade_id],
+        )?;
+        if updated != 1 {
+            bail!("trade {trade_id} not found");
+        }
+        if let Some(shannons) = restore {
+            add_available(&tx, order_id, shannons)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark an order canceled only while it has no open trade, and clear the book.
+    pub fn cancel_order(&self, id: &str) -> Result<()> {
+        let states = watched_states();
+        let marks = vec!["?"; states.len()].join(",");
+        let sql = format!(
+            "UPDATE orders SET status = ?, available_shannons = 0
+             WHERE id = ? AND status = ?
+             AND NOT EXISTS (
+                 SELECT 1 FROM trades
+                 WHERE trades.order_id = orders.id AND trades.state IN ({marks})
+             )"
+        );
+        let canceled = OrderStatus::Canceled.as_str();
+        let open = OrderStatus::Open.as_str();
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&canceled, &id, &open];
+        for state in &states {
+            values.push(&*state);
+        }
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(&sql, rusqlite::params_from_iter(values.iter().copied()))?;
+        if updated == 1 {
+            return Ok(());
+        }
+        if open_trades_for(&conn, id)? > 0 {
+            bail!("order has an open trade");
+        }
+        bail!("order is not open");
     }
 
     pub fn insert_trade(&self, trade: &Trade) -> Result<()> {
@@ -243,6 +351,18 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_hold_received(&self, id: &str, state: &str, at: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET state = ?1, hold_received_at = ?2 WHERE id = ?3",
+            params![state, at, id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
     pub fn set_hold(&self, id: &str, payment_hash: &str, invoice: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute(
@@ -291,11 +411,83 @@ impl Db {
         Ok(())
     }
 
+    pub fn fiber_pubkey(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db");
+        let value = conn
+            .query_row("SELECT pubkey FROM fiber_node WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(value)
+    }
+
+    pub fn set_fiber_pubkey(&self, pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        conn.execute(
+            "INSERT INTO fiber_node (id, pubkey) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET pubkey = excluded.pubkey",
+            params![pubkey],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_trade(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute("DELETE FROM trades WHERE id = ?1", params![id])?;
         Ok(())
     }
+}
+
+fn watched_states() -> Vec<&'static str> {
+    Phase::watched_phases()
+        .iter()
+        .map(|phase| phase.as_str())
+        .collect()
+}
+
+fn open_trades_for(conn: &Connection, order_id: &str) -> Result<i64> {
+    let states = watched_states();
+    let marks = vec!["?"; states.len()].join(",");
+    let sql = format!("SELECT COUNT(*) FROM trades WHERE order_id = ? AND state IN ({marks})");
+    let mut values: Vec<&dyn rusqlite::ToSql> = vec![&order_id];
+    for state in &states {
+        values.push(&*state);
+    }
+    let count = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(values.iter().copied()),
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+fn add_available(conn: &Connection, order_id: &str, shannons: u128) -> Result<()> {
+    let shannons = i64_from_shannons(shannons)?;
+    let current: i64 = conn
+        .query_row(
+            "SELECT available_shannons FROM orders WHERE id = ?1",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("order {order_id} not found"))?;
+    let restored = current
+        .checked_add(shannons)
+        .context("order available balance overflow")?;
+    conn.execute(
+        "UPDATE orders SET available_shannons = ?1 WHERE id = ?2",
+        params![restored, order_id],
+    )?;
+    Ok(())
+}
+
+fn read_shannons(value: i64, column: usize) -> rusqlite::Result<u128> {
+    u128::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
 }
 
 fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
@@ -305,7 +497,7 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         taker_nostr: row.get(2)?,
         taker_fiber: row.get(3)?,
         fiat_amount: row.get(4)?,
-        shannons: shannons_from_i64(row.get(5)?),
+        shannons: read_shannons(row.get(5)?, 5)?,
         state: row.get(6)?,
         hold_payment_hash: row.get(7)?,
         hold_invoice: row.get(8)?,
@@ -313,4 +505,97 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         payout_payment_hash: row.get(10)?,
         hold_received_at: row.get(11)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_order(available: u128) -> Order {
+        Order {
+            id: "order".into(),
+            maker_nostr: "maker".into(),
+            maker_fiber: "fiber".into(),
+            available_shannons: available,
+            fiat_currency_code: "NGN".into(),
+            price_per_ckb: "1000".into(),
+            min: "1000".into(),
+            max: "10000".into(),
+            payment_method: "bank".into(),
+            status: OrderStatus::Open.as_str().into(),
+        }
+    }
+
+    fn sample_trade(shannons: u128) -> Trade {
+        Trade {
+            id: "trade".into(),
+            order_id: "order".into(),
+            taker_nostr: "taker".into(),
+            taker_fiber: "fiber-taker".into(),
+            fiat_amount: "1000".into(),
+            shannons,
+            state: Phase::WaitingHold.as_str().into(),
+            hold_payment_hash: Some("0xhash".into()),
+            hold_invoice: None,
+            payout_invoice: None,
+            payout_payment_hash: None,
+            hold_received_at: None,
+        }
+    }
+
+    #[test]
+    fn take_debits_once_and_rollback_restores_the_slice() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_order(&sample_order(200_000_000)).unwrap();
+        let trade = sample_trade(100_000_000);
+        db.commit_take(&trade, "preimage").unwrap();
+        assert_eq!(
+            db.get_order("order").unwrap().unwrap().available_shannons,
+            100_000_000
+        );
+        assert!(db.get_preimage("0xhash").unwrap().is_some());
+        assert!(db.commit_take(&trade, "preimage").is_err());
+        assert_eq!(
+            db.get_order("order").unwrap().unwrap().available_shannons,
+            100_000_000
+        );
+        db.rollback_take("order", "trade", "0xhash", 100_000_000)
+            .unwrap();
+        assert_eq!(
+            db.get_order("order").unwrap().unwrap().available_shannons,
+            200_000_000
+        );
+        assert!(db.get_trade("trade").unwrap().is_none());
+        assert!(db.get_preimage("0xhash").unwrap().is_none());
+    }
+
+    #[test]
+    fn cancel_order_refuses_an_open_trade_and_clears_a_free_book() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_order(&sample_order(200_000_000)).unwrap();
+        db.commit_take(&sample_trade(100_000_000), "preimage")
+            .unwrap();
+        assert!(db.cancel_order("order").is_err());
+        db.finish_trade("order", "trade", Phase::Settled.as_str(), None)
+            .unwrap();
+        db.cancel_order("order").unwrap();
+        let order = db.get_order("order").unwrap().unwrap();
+        assert_eq!(order.status, OrderStatus::Canceled.as_str());
+        assert_eq!(order.available_shannons, 0);
+    }
+
+    #[test]
+    fn a_negative_balance_is_not_read_as_zero() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_order(&sample_order(1)).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE orders SET available_shannons = -1 WHERE id = 'order'",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_order("order").is_err());
+    }
 }
