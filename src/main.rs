@@ -1,3 +1,114 @@
-fn main() {
-    println!("Hello, world!");
+use anyhow::Result;
+use nostr_sdk::prelude::*;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use tracing::{info, warn};
+use twine_daemon::db::Db;
+use twine_daemon::engine::{Engine, PollKind};
+use twine_daemon::fiber::HttpFiber;
+use twine_daemon::nostr::{action_filter, connect, decrypt_action, publish_outbounds, sender_hex};
+use twine_daemon::types::Outbound;
+use twine_daemon::{CANT_DO, ClientAction, Config, KIND_ACTION};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::from_env()?;
+    let keys = Keys::parse(&config.nostr_secret)?;
+    info!(pubkey = %keys.public_key(), "twine daemon");
+
+    let db = Arc::new(Db::open(&config.db_path)?);
+    info!(network = %config.network, currency = %config.invoice_currency, "fiber");
+    let fiber = Arc::new(HttpFiber::new(&config.rpc_url, &config.invoice_currency));
+    let engine = Engine::new(db, fiber);
+    let client = connect(&config.relays).await?;
+
+    let polling = Arc::new(Mutex::new(HashSet::new()));
+    let (holds, payouts) = engine.resume_trade_ids()?;
+    for trade_id in holds {
+        engine.spawn_poll(
+            PollKind::Hold,
+            client.clone(),
+            keys.clone(),
+            trade_id,
+            polling.clone(),
+        );
+    }
+    for trade_id in payouts {
+        engine.spawn_poll(
+            PollKind::Payout,
+            client.clone(),
+            keys.clone(),
+            trade_id,
+            polling.clone(),
+        );
+    }
+
+    client.subscribe(action_filter(keys.public_key())).await?;
+    let mut notifications = client.notifications();
+
+    while let Some(notification) = notifications.next().await {
+        let ClientNotification::Event { event, .. } = notification else {
+            continue;
+        };
+        if event.kind != Kind::from(KIND_ACTION) {
+            continue;
+        }
+        if !event
+            .tags
+            .public_keys()
+            .any(|pubkey| pubkey == keys.public_key())
+        {
+            continue;
+        }
+        if !engine.db.mark_event(&event.id.to_hex())? {
+            continue;
+        }
+        let envelope = match decrypt_action(&keys, &event) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                warn!(%error, "rejecting event");
+                continue;
+            }
+        };
+        let sender = sender_hex(&event);
+        let action = envelope.client_action();
+        let trade_id = envelope.trade_id.clone();
+        match engine.handle(&sender, envelope).await {
+            Ok(outbound) => {
+                if let Err(error) = publish_outbounds(&client, &keys, &outbound).await {
+                    warn!(%error, "publish failed");
+                }
+                let rejected = outbound.iter().any(|item| match item {
+                    Outbound::Reply { envelope, .. } => envelope.action == CANT_DO,
+                    _ => false,
+                });
+                match (action, trade_id, rejected) {
+                    (Some(ClientAction::Locked), Some(trade_id), false) => engine.spawn_poll(
+                        PollKind::Hold,
+                        client.clone(),
+                        keys.clone(),
+                        trade_id,
+                        polling.clone(),
+                    ),
+                    (Some(ClientAction::Release), Some(trade_id), false) => engine.spawn_poll(
+                        PollKind::Payout,
+                        client.clone(),
+                        keys.clone(),
+                        trade_id,
+                        polling.clone(),
+                    ),
+                    _ => {}
+                }
+            }
+            Err(error) => warn!(%error, "handle failed"),
+        }
+    }
+    Ok(())
 }
