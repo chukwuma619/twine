@@ -213,7 +213,7 @@ impl Envelope {
 pub struct NewOrderPayload {
     pub fiber_pubkey: String,
     pub available_ckb: String,
-    pub fiat_currency: String,
+    pub fiat_currency_code: String,
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
@@ -262,7 +262,7 @@ pub struct PublicOrder {
     pub maker_nostr_pubkey: String,
     pub maker_fiber_pubkey: String,
     pub available_ckb: String,
-    pub fiat_currency: String,
+    pub fiat_currency_code: String,
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
@@ -274,7 +274,7 @@ pub struct Order {
     pub maker_nostr: String,
     pub maker_fiber: String,
     pub available_shannons: u128,
-    pub fiat_currency: String,
+    pub fiat_currency_code: String,
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
@@ -289,7 +289,7 @@ impl Order {
             maker_nostr_pubkey: self.maker_nostr.clone(),
             maker_fiber_pubkey: self.maker_fiber.clone(),
             available_ckb: shannons_to_ckb_string(self.available_shannons),
-            fiat_currency: self.fiat_currency.clone(),
+            fiat_currency_code: self.fiat_currency_code.clone(),
             price_per_ckb: self.price_per_ckb.clone(),
             min: self.min.clone(),
             max: self.max.clone(),
@@ -332,7 +332,7 @@ mod tests {
             .with_payload(NewOrderPayload {
                 fiber_pubkey: "pk".into(),
                 available_ckb: "10".into(),
-                fiat_currency: "NGN".into(),
+                fiat_currency_code: "NGN".into(),
                 price_per_ckb: "1500".into(),
                 min: "1000".into(),
                 max: "5000".into(),
@@ -343,6 +343,6 @@ mod tests {
         let parsed: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.client_action(), Some(ClientAction::NewOrder));
         let payload: NewOrderPayload = parsed.decode_payload().unwrap();
-        assert_eq!(payload.fiat_currency, "NGN");
+        assert_eq!(payload.fiat_currency_code, "NGN");
     }
 }

@@ -87,7 +87,7 @@ impl<F: FiberRpc> Engine<F> {
             &payload.price_per_ckb,
             &payload.min,
             &payload.max,
-            &payload.fiat_currency,
+            &payload.fiat_currency_code,
             &payload.payment_method,
             &payload.fiber_pubkey,
         ) {
@@ -99,7 +99,7 @@ impl<F: FiberRpc> Engine<F> {
             maker_nostr: sender.to_string(),
             maker_fiber: payload.fiber_pubkey,
             available_shannons: available,
-            fiat_currency: payload.fiat_currency,
+            fiat_currency_code: payload.fiat_currency_code,
             price_per_ckb: payload.price_per_ckb,
             min: payload.min,
             max: payload.max,

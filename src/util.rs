@@ -235,7 +235,7 @@ pub(crate) mod support {
                     .with_payload(NewOrderPayload {
                         fiber_pubkey: fiber_pubkey.into(),
                         available_ckb: "10".into(),
-                        fiat_currency: "NGN".into(),
+                        fiat_currency_code: "NGN".into(),
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
