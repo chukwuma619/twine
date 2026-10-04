@@ -188,7 +188,7 @@ pub(crate) mod support {
     use crate::db::Db;
     use crate::engine::Engine;
     use crate::env::invoice_currency;
-    use crate::fiber::{FiberRpc, HttpFiber, InvoiceInfo};
+    use crate::fiber::{HttpFiber, InvoiceInfo, InvoiceRpc, NodeRpc};
     use crate::{
         CANT_DO, Envelope, FIAT_SENT, FiatSentPayload, NEW_ORDER, NewOrderPayload, Outbound,
         PAY_INVOICE, PayInvoicePayload, TAKE, TakePayload,

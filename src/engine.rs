@@ -1,26 +1,19 @@
 use crate::db::Db;
 use crate::fiber::{FiberRpc, ParsedInvoice};
 use crate::nostr::publish_outbounds;
-use crate::types::{Order, OrderStatus, Trade};
+use crate::types::{Order, Trade};
 use crate::{
-    Actor, CANCELED, CANT_DO, CancelPayload, CantDoPayload, ClientAction, DISPUTED, Decision,
-    DisputePayload, EXPIRED, Envelope, FIAT_SENT_OK, FIBER_POLL_SECS, FiatSentPayload,
-    InvoiceStatus, NEW_INVOICE, NewInvoicePayload, NewOrderPayload, Outbound, PAY_INVOICE,
-    PayInvoicePayload, Phase, REFUNDING, ResolvePayload, SETTLED, Side, TakePayload, WAITING_FIAT,
-    actor_of, apply_cancel, apply_clock, apply_dispute, apply_expired, apply_fiat_sent,
-    apply_hold_received, apply_release, apply_release_failed, apply_release_succeeded,
-    apply_resolve, apply_take, hex_bytes, parse_winner, trade_actor, validate_hold_hours,
-    validate_new_order, validate_take,
+    Actor, CANCELED, CANT_DO, CantDoPayload, ClientAction, Decision, EXPIRED, Envelope,
+    FIBER_POLL_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound, Phase, REFUNDING,
+    SETTLED, WAITING_FIAT, apply_clock, apply_expired, apply_hold_received, apply_release_failed,
+    apply_release_succeeded, trade_actor,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
-use rand::RngCore;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
-use uuid::Uuid;
 
 #[derive(Clone, Copy)]
 pub enum PollKind {
@@ -37,8 +30,8 @@ struct PollHub {
 
 pub struct Engine<F> {
     pub db: Arc<Db>,
-    fiber: Arc<F>,
-    solver: Option<String>,
+    pub(crate) fiber: Arc<F>,
+    pub(crate) solver: Option<String>,
     polls: Arc<Mutex<Option<PollHub>>>,
 }
 
@@ -154,191 +147,31 @@ impl<F: FiberRpc + 'static> Engine<F> {
 
     pub async fn handle(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
         match envelope.client_action() {
-            Some(ClientAction::NewOrder) => self.on_new_order(sender, envelope).await,
-            Some(ClientAction::Take) => self.on_take(sender, envelope).await,
-            Some(ClientAction::FiatSent) => self.on_fiat_sent(sender, envelope).await,
-            Some(ClientAction::Release) => self.on_release(sender, envelope).await,
-            Some(ClientAction::Cancel) => self.on_cancel(sender, envelope).await,
-            Some(ClientAction::Dispute) => self.on_dispute(sender, envelope).await,
-            Some(ClientAction::Resolve) => self.on_resolve(sender, envelope).await,
+            Some(ClientAction::NewOrder) => {
+                crate::app::new_order::on_new_order(self, sender, envelope).await
+            }
+            Some(ClientAction::Take) => crate::app::take::on_take(self, sender, envelope).await,
+            Some(ClientAction::FiatSent) => {
+                crate::app::fiat_sent::on_fiat_sent(self, sender, envelope).await
+            }
+            Some(ClientAction::Release) => {
+                crate::app::release::on_release(self, sender, envelope).await
+            }
+            Some(ClientAction::Cancel) => {
+                crate::app::cancel::on_cancel(self, sender, envelope).await
+            }
+            Some(ClientAction::Dispute) => {
+                crate::app::dispute::on_dispute(self, sender, envelope).await
+            }
+            Some(ClientAction::Resolve) => {
+                crate::app::resolve::on_resolve(self, sender, envelope).await
+            }
             None => Ok(vec![cant_do(
                 sender,
                 envelope.trade_id.clone(),
                 "unknown action",
             )]),
         }
-    }
-
-    async fn on_new_order(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
-        let payload: NewOrderPayload = match envelope.decode_payload() {
-            Ok(payload) => payload,
-            Err(_) => return Ok(vec![cant_do(sender, None, "invalid new-order payload")]),
-        };
-        let available = match validate_new_order(
-            &payload.available_ckb,
-            &payload.price_per_ckb,
-            &payload.min,
-            &payload.max,
-            &payload.fiat_currency,
-            &payload.payment_method,
-            &payload.fiber_pubkey,
-        ) {
-            Ok(value) => value,
-            Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
-        };
-        let Some(side) = Side::parse(payload.side.trim()) else {
-            return Ok(vec![cant_do(sender, None, "side must be buy or sell")]);
-        };
-        let hold_secs = match validate_hold_hours(payload.hold_hours) {
-            Ok(value) => value,
-            Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
-        };
-        let order = Order {
-            id: Uuid::new_v4().to_string(),
-            side: side.as_str().to_string(),
-            maker_nostr: sender.to_string(),
-            maker_fiber: payload.fiber_pubkey,
-            available_shannons: available,
-            fiat_currency: payload.fiat_currency,
-            price_per_ckb: payload.price_per_ckb,
-            min: payload.min,
-            max: payload.max,
-            payment_method: payload.payment_method,
-            status: OrderStatus::Open.as_str().into(),
-            hold_secs,
-        };
-        self.db.insert_order(&order)?;
-        Ok(vec![Outbound::PublicOrder(order.public())])
-    }
-
-    async fn on_take(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
-        let payload: TakePayload = match envelope.decode_payload() {
-            Ok(payload) => payload,
-            Err(_) => return Ok(vec![cant_do(sender, None, "invalid take payload")]),
-        };
-        let Some(order) = self.db.get_order(&payload.order_id)? else {
-            return Ok(vec![cant_do(sender, None, "order not found")]);
-        };
-        if !order.is_open() {
-            return Ok(vec![cant_do(sender, None, "order is not open")]);
-        }
-        if sender == order.maker_nostr {
-            return Ok(vec![cant_do(
-                sender,
-                None,
-                "maker cannot take their own order",
-            )]);
-        }
-        let has_open = self.db.open_trade_for_order(&order.id)?.is_some();
-        match apply_take(Phase::Pending, has_open) {
-            Decision::Ok(Phase::WaitingHold) => {}
-            Decision::Reject(reason) => return Ok(vec![cant_do(sender, None, reason)]),
-            _ => return Ok(vec![cant_do(sender, None, "cannot take this order")]),
-        }
-        let shannons = match validate_take(
-            &payload.fiat_amount,
-            &order.min,
-            &order.max,
-            &order.price_per_ckb,
-            order.available_shannons,
-        ) {
-            Ok(value) => value,
-            Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
-        };
-        if payload.taker_fiber_pubkey.trim().is_empty() {
-            return Ok(vec![cant_do(
-                sender,
-                None,
-                "taker fiber pubkey is required",
-            )]);
-        }
-
-        let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
-        let hash = Sha256::digest(secret);
-        let preimage = hex_bytes(&secret);
-        let payment_hash = hex_bytes(hash.as_slice());
-        let trade_id = Uuid::new_v4().to_string();
-
-        let trade = Trade {
-            id: trade_id.clone(),
-            order_id: order.id.clone(),
-            taker_nostr: sender.to_string(),
-            taker_fiber: payload.taker_fiber_pubkey,
-            fiat_amount: payload.fiat_amount,
-            shannons,
-            state: Phase::WaitingHold.as_str().into(),
-            hold_payment_hash: Some(payment_hash.clone()),
-            hold_invoice: None,
-            payout_invoice: None,
-            payout_payment_hash: None,
-            hold_received_at: None,
-        };
-        if let Err(error) = self.db.commit_take(&trade, &preimage) {
-            return Ok(vec![cant_do(sender, None, &error.to_string())]);
-        }
-
-        let created = match self
-            .fiber
-            .new_hold_invoice(
-                shannons,
-                &payment_hash,
-                &format!("twine {trade_id}"),
-                order.hold_secs * 1_000,
-            )
-            .await
-        {
-            Ok(created) => created,
-            Err(error) => {
-                self.rollback_take(&trade, &payment_hash)?;
-                return Ok(vec![cant_do(
-                    sender,
-                    Some(trade_id),
-                    &format!("hold invoice failed: {error}"),
-                )]);
-            }
-        };
-        if let Err(error) = self.fiber.create_preimage(&payment_hash, &preimage).await {
-            let _ = self.fiber.cancel_invoice(&payment_hash).await;
-            let _ = self.fiber.remove_preimage(&payment_hash).await;
-            self.rollback_take(&trade, &payment_hash)?;
-            return Ok(vec![cant_do(
-                sender,
-                Some(trade_id),
-                &format!("watchtower preimage failed: {error}"),
-            )]);
-        }
-        self.db
-            .set_hold(&trade_id, &payment_hash, &created.invoice)?;
-        self.watch(&trade_id)?;
-
-        let order = self
-            .db
-            .get_order(&order.id)?
-            .ok_or_else(|| anyhow!("order missing after take"))?;
-        let pay = Envelope::new(PAY_INVOICE)
-            .with_trade(&trade_id)
-            .with_payload(PayInvoicePayload {
-                invoice: created.invoice,
-                amount_shannons: shannons.to_string(),
-                order_id: order.id.clone(),
-            })?;
-        Ok(vec![
-            Outbound::PublicOrder(order.public()),
-            Outbound::Reply {
-                to: order.maker_nostr.clone(),
-                envelope: pay.clone(),
-            },
-            Outbound::Reply {
-                to: sender.to_string(),
-                envelope: pay,
-            },
-        ])
-    }
-
-    fn rollback_take(&self, trade: &Trade, payment_hash: &str) -> Result<()> {
-        self.db
-            .rollback_take(&trade.order_id, &trade.id, payment_hash, trade.shannons)
     }
 
     pub async fn on_hold_status(&self, trade_id: &str) -> Result<Vec<Outbound>> {
@@ -393,7 +226,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         self.refund_if_due(&order, &trade).await
     }
 
-    async fn expire_trade(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
+    pub(crate) async fn expire_trade(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
         match apply_expired(trade.phase()?) {
             Decision::Ok(_) => {
                 // Stop claiming before the slice goes back on the book. Refunding is
@@ -430,7 +263,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
     }
 
-    async fn begin_refund(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
+    pub(crate) async fn begin_refund(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
         self.db
             .set_trade_state(&trade.id, Phase::Refunding.as_str())?;
         self.drop_preimage(trade).await?;
@@ -441,88 +274,13 @@ impl<F: FiberRpc + 'static> Engine<F> {
         ))
     }
 
-    async fn drop_preimage(&self, trade: &Trade) -> Result<()> {
+    pub(crate) async fn drop_preimage(&self, trade: &Trade) -> Result<()> {
         let Some(hash) = trade.hold_payment_hash.as_deref() else {
             return Ok(());
         };
         self.fiber.remove_preimage(hash).await?;
         self.db.delete_preimage(hash)?;
         Ok(())
-    }
-
-    async fn on_fiat_sent(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
-        let Some(trade_id) = envelope.trade_id.clone() else {
-            return Ok(vec![cant_do(sender, None, "trade_id is required")]);
-        };
-        let payload: FiatSentPayload = match envelope.decode_payload() {
-            Ok(payload) => payload,
-            Err(_) => {
-                return Ok(vec![cant_do(
-                    sender,
-                    Some(trade_id),
-                    "invalid fiat-sent payload",
-                )]);
-            }
-        };
-        if payload.invoice.trim().is_empty() {
-            return Ok(vec![cant_do(
-                sender,
-                Some(trade_id),
-                "payout invoice is required",
-            )]);
-        }
-        let Some(trade) = self.db.get_trade(&trade_id)? else {
-            return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
-        };
-        let order = self.require_order(&trade.order_id)?;
-        if let Some(outbound) = self.refund_due_outbound(&order, &trade).await? {
-            return Ok(outbound);
-        }
-        let actor = self.trade_actor(&order, &trade, sender)?;
-        match apply_fiat_sent(trade.phase()?, actor) {
-            Decision::Ok(phase) => {
-                self.db.set_payout(&trade.id, &payload.invoice, None)?;
-                self.db.set_trade_state(&trade.id, phase.as_str())?;
-                self.watch(&trade.id)?;
-                if phase == Phase::Releasing {
-                    return Ok(Vec::new());
-                }
-                Ok(party_replies(
-                    &order,
-                    &trade,
-                    Envelope::new(FIAT_SENT_OK).with_trade(&trade.id),
-                ))
-            }
-            Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
-            Decision::NoOp => Ok(Vec::new()),
-        }
-    }
-
-    async fn on_release(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
-        let Some(trade_id) = envelope.trade_id.clone() else {
-            return Ok(vec![cant_do(sender, None, "trade_id is required")]);
-        };
-        let Some(trade) = self.db.get_trade(&trade_id)? else {
-            return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
-        };
-        let order = self.require_order(&trade.order_id)?;
-        if let Some(outbound) = self.refund_due_outbound(&order, &trade).await? {
-            return Ok(outbound);
-        }
-        let actor = self.trade_actor(&order, &trade, sender)?;
-        let has_invoice = trade
-            .payout_invoice
-            .as_deref()
-            .is_some_and(|invoice| !invoice.trim().is_empty());
-        match apply_release(trade.phase()?, actor, has_invoice) {
-            Decision::Ok(phase) => {
-                self.db.set_trade_state(&trade.id, phase.as_str())?;
-                self.watch(&trade.id)?;
-                Ok(Vec::new())
-            }
-            Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
-            Decision::NoOp => Ok(Vec::new()),
-        }
     }
 
     pub async fn on_payout_status(&self, trade_id: &str) -> Result<Vec<Outbound>> {
@@ -637,185 +395,11 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
     }
 
-    async fn on_dispute(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
-        let Some(trade_id) = envelope.trade_id.clone() else {
-            return Ok(vec![cant_do(sender, None, "trade_id is required")]);
-        };
-        if self.solver.is_none() {
-            return Ok(vec![cant_do(
-                sender,
-                Some(trade_id),
-                "solver is not configured",
-            )]);
-        }
-        let Some(trade) = self.db.get_trade(&trade_id)? else {
-            return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
-        };
-        let order = self.require_order(&trade.order_id)?;
-        if let Some(outbound) = self.refund_due_outbound(&order, &trade).await? {
-            return Ok(outbound);
-        }
-        let actor = self.trade_actor(&order, &trade, sender)?;
-        match apply_dispute(trade.phase()?, actor) {
-            Decision::Ok(phase) => {
-                let payload: DisputePayload = envelope.decode_payload().unwrap_or_default();
-                if actor == Actor::Buyer
-                    && let Some(invoice) = payload
-                        .invoice
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|invoice| !invoice.is_empty())
-                {
-                    self.db.set_payout(&trade.id, invoice, None)?;
-                }
-                self.db.set_trade_state(&trade.id, phase.as_str())?;
-                self.watch(&trade.id)?;
-                Ok(self.with_solver(
-                    &order,
-                    &trade,
-                    Envelope::new(DISPUTED).with_trade(&trade.id),
-                ))
-            }
-            Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
-            Decision::NoOp => Ok(Vec::new()),
-        }
-    }
-
-    async fn on_resolve(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
-        let Some(trade_id) = envelope.trade_id.clone() else {
-            return Ok(vec![cant_do(sender, None, "trade_id is required")]);
-        };
-        let payload: ResolvePayload = match envelope.decode_payload() {
-            Ok(payload) => payload,
-            Err(_) => {
-                return Ok(vec![cant_do(
-                    sender,
-                    Some(trade_id),
-                    "invalid resolve payload",
-                )]);
-            }
-        };
-        let Some(winner) = parse_winner(&payload.winner) else {
-            return Ok(vec![cant_do(
-                sender,
-                Some(trade_id),
-                "winner must be buyer or seller",
-            )]);
-        };
-        let Some(trade) = self.db.get_trade(&trade_id)? else {
-            return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
-        };
-        let order = self.require_order(&trade.order_id)?;
-        if let Some(outbound) = self.refund_due_outbound(&order, &trade).await? {
-            return Ok(outbound);
-        }
-        let supplied = payload
-            .invoice
-            .as_deref()
-            .map(str::trim)
-            .filter(|invoice| !invoice.is_empty())
-            .map(ToOwned::to_owned);
-        let has_invoice = supplied.is_some()
-            || trade
-                .payout_invoice
-                .as_deref()
-                .is_some_and(|invoice| !invoice.trim().is_empty());
-        let actor = self.trade_actor(&order, &trade, sender)?;
-        match apply_resolve(trade.phase()?, actor, winner, has_invoice) {
-            Decision::Ok(Phase::Refunding) => self.begin_refund(&order, &trade).await,
-            Decision::Ok(Phase::Releasing) => {
-                if let Some(invoice) = &supplied {
-                    self.db.set_payout(&trade.id, invoice, None)?;
-                }
-                self.db
-                    .set_trade_state(&trade.id, Phase::Releasing.as_str())?;
-                self.watch(&trade.id)?;
-                Ok(Vec::new())
-            }
-            Decision::Ok(_) => Ok(Vec::new()),
-            Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
-            Decision::NoOp => Ok(Vec::new()),
-        }
-    }
-
-    async fn on_cancel(&self, sender: &str, envelope: Envelope) -> Result<Vec<Outbound>> {
-        if let Some(trade_id) = envelope.trade_id.clone() {
-            return self.cancel_trade(sender, &trade_id).await;
-        }
-        let payload: CancelPayload = envelope
-            .decode_payload()
-            .unwrap_or(CancelPayload { order_id: None });
-        let Some(order_id) = payload.order_id else {
-            return Ok(vec![cant_do(
-                sender,
-                None,
-                "order_id or trade_id is required",
-            )]);
-        };
-        let Some(order) = self.db.get_order(&order_id)? else {
-            return Ok(vec![cant_do(sender, None, "order not found")]);
-        };
-        if self.db.open_trade_for_order(&order.id)?.is_some() {
-            return Ok(vec![cant_do(sender, None, "order has an open trade")]);
-        }
-        let actor = self.order_actor(&order.maker_nostr, sender);
-        match apply_cancel(Phase::Pending, actor, None) {
-            Decision::Ok(Phase::Canceled) => {
-                if let Err(error) = self.db.cancel_order(&order.id) {
-                    return Ok(vec![cant_do(sender, None, &error.to_string())]);
-                }
-                let order = self.require_order(&order.id)?;
-                Ok(vec![
-                    Outbound::PublicOrder(order.public()),
-                    Outbound::Reply {
-                        to: sender.to_string(),
-                        envelope: Envelope::new(CANCELED),
-                    },
-                ])
-            }
-            Decision::Reject(reason) => Ok(vec![cant_do(sender, None, reason)]),
-            _ => Ok(vec![cant_do(sender, None, "cannot cancel order")]),
-        }
-    }
-
-    async fn cancel_trade(&self, sender: &str, trade_id: &str) -> Result<Vec<Outbound>> {
-        let Some(trade) = self.db.get_trade(trade_id)? else {
-            return Ok(vec![cant_do(
-                sender,
-                Some(trade_id.to_string()),
-                "trade not found",
-            )]);
-        };
-        let order = self.require_order(&trade.order_id)?;
-        let actor = self.trade_actor(&order, &trade, sender)?;
-        let invoice_status = if let Some(hash) = trade.hold_payment_hash.as_deref() {
-            let invoice = self.fiber.get_invoice(hash).await?;
-            InvoiceStatus::parse(&invoice.status)
-        } else {
-            Some(InvoiceStatus::Open)
-        };
-        match apply_cancel(trade.phase()?, actor, invoice_status) {
-            Decision::Ok(Phase::Canceled) => {
-                if invoice_status == Some(InvoiceStatus::Open) {
-                    if let Some(hash) = trade.hold_payment_hash.as_deref() {
-                        self.fiber.cancel_invoice(hash).await?;
-                    }
-                }
-                self.complete_cancel(&order, &trade).await
-            }
-            Decision::Ok(Phase::Expired) => self.expire_trade(&order, &trade).await,
-            Decision::Reject(reason) => {
-                Ok(vec![cant_do(sender, Some(trade_id.to_string()), reason)])
-            }
-            _ => Ok(vec![cant_do(
-                sender,
-                Some(trade_id.to_string()),
-                "cannot cancel",
-            )]),
-        }
-    }
-
-    async fn complete_cancel(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
+    pub(crate) async fn complete_cancel(
+        &self,
+        order: &Order,
+        trade: &Trade,
+    ) -> Result<Vec<Outbound>> {
         self.finish_terminal(order, trade, Phase::Canceled)?;
         if let Err(error) = self.drop_preimage(trade).await {
             warn!(%error, trade_id = %trade.id, "remove preimage");
@@ -834,13 +418,13 @@ impl<F: FiberRpc + 'static> Engine<F> {
         Ok(self.db.get_preimage(hash)?.is_some())
     }
 
-    fn finish_terminal(&self, order: &Order, trade: &Trade, phase: Phase) -> Result<()> {
+    pub(crate) fn finish_terminal(&self, order: &Order, trade: &Trade, phase: Phase) -> Result<()> {
         let restore = phase.returns_slice().then_some(trade.shannons);
         self.db
             .finish_trade(&order.id, &trade.id, phase.as_str(), restore)
     }
 
-    async fn refund_due_outbound(
+    pub(crate) async fn refund_due_outbound(
         &self,
         order: &Order,
         trade: &Trade,
@@ -853,11 +437,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
     }
 
-    fn order_actor(&self, maker: &str, sender: &str) -> Actor {
-        actor_of(maker, self.solver.as_deref(), sender)
-    }
-
-    fn trade_actor(&self, order: &Order, trade: &Trade, sender: &str) -> Result<Actor> {
+    pub(crate) fn trade_actor(&self, order: &Order, trade: &Trade, sender: &str) -> Result<Actor> {
         Ok(trade_actor(
             order.seller_nostr(trade)?,
             order.buyer_nostr(trade)?,
@@ -866,7 +446,12 @@ impl<F: FiberRpc + 'static> Engine<F> {
         ))
     }
 
-    fn with_solver(&self, order: &Order, trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
+    pub(crate) fn with_solver(
+        &self,
+        order: &Order,
+        trade: &Trade,
+        envelope: Envelope,
+    ) -> Vec<Outbound> {
         let mut outbound = party_replies(order, trade, envelope.clone());
         if let Some(solver) = &self.solver {
             outbound.push(Outbound::Reply {
@@ -877,7 +462,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         outbound
     }
 
-    fn require_order(&self, id: &str) -> Result<Order> {
+    pub(crate) fn require_order(&self, id: &str) -> Result<Order> {
         self.db
             .get_order(id)?
             .ok_or_else(|| anyhow!("order {id} not found"))
@@ -945,7 +530,7 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-fn party_replies(order: &Order, trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
+pub(crate) fn party_replies(order: &Order, trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
     vec![
         Outbound::Reply {
             to: order.maker_nostr.clone(),
@@ -958,7 +543,7 @@ fn party_replies(order: &Order, trade: &Trade, envelope: Envelope) -> Vec<Outbou
     ]
 }
 
-fn cant_do(to: &str, trade_id: Option<String>, reason: &str) -> Outbound {
+pub(crate) fn cant_do(to: &str, trade_id: Option<String>, reason: &str) -> Outbound {
     let mut envelope = Envelope::new(CANT_DO);
     envelope.trade_id = trade_id;
     envelope.payload = serde_json::to_value(CantDoPayload {
@@ -993,7 +578,10 @@ fn payout_invoice_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fiber::{InvoiceCreated, InvoiceInfo, ParsedInvoice, PaymentInfo};
+    use crate::fiber::{
+        FiberRpc, InvoiceCreated, InvoiceInfo, InvoiceRpc, NodeRpc, ParsedInvoice, PaymentInfo,
+        PaymentRpc, WatchtowerRpc,
+    };
     use crate::util::support::{
         TestContext, cant_do_reason, fiat_sent, open_order, outbound_replies, replies_contain,
         take, wait_invoice_status,
@@ -1016,7 +604,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl FiberRpc for FakeFiber {
+    impl InvoiceRpc for FakeFiber {
         async fn new_hold_invoice(
             &self,
             _: u128,
@@ -1045,6 +633,17 @@ mod tests {
         async fn settle_invoice(&self, _: &str, _: &str) -> Result<()> {
             Ok(())
         }
+        async fn parse_invoice(&self, _: &str) -> Result<ParsedInvoice> {
+            Ok(ParsedInvoice {
+                payment_hash: "parsed".into(),
+                currency: "Fibt".into(),
+                amount: Some(*self.parsed_amount.lock().expect("amount")),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl WatchtowerRpc for FakeFiber {
         async fn create_preimage(&self, payment_hash: &str, _: &str) -> Result<()> {
             self.preimages
                 .lock()
@@ -1060,6 +659,10 @@ mod tests {
             *self.removed.lock().expect("removed") = true;
             Ok(())
         }
+    }
+
+    #[async_trait]
+    impl PaymentRpc for FakeFiber {
         async fn send_payment(&self, _: &str) -> Result<PaymentInfo> {
             bail!("unused")
         }
@@ -1069,16 +672,16 @@ mod tests {
                 status: self.payment_status.lock().expect("payment").clone(),
             })
         }
-        async fn parse_invoice(&self, _: &str) -> Result<ParsedInvoice> {
-            Ok(ParsedInvoice {
-                payment_hash: "parsed".into(),
-                currency: "Fibt".into(),
-                amount: Some(*self.parsed_amount.lock().expect("amount")),
-            })
-        }
+    }
+
+    #[async_trait]
+    impl NodeRpc for FakeFiber {
         async fn node_pubkey(&self) -> Result<String> {
             bail!("unused")
         }
+    }
+
+    impl FiberRpc for FakeFiber {
         fn currency(&self) -> &str {
             "Fibt"
         }

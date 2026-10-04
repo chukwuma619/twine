@@ -56,10 +56,6 @@ impl Phase {
         }
     }
 
-    pub fn is_open_trade(self) -> bool {
-        self.watched()
-    }
-
     /// Hold is still locked, or the daemon is still waiting on that hold.
     pub fn watched(self) -> bool {
         matches!(

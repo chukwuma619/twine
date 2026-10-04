@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
-use twine_daemon::fiber::{FiberRpc, HttpFiber, accept_node_pubkey};
+use twine_daemon::fiber::{HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{action_filter, connect, decrypt_action, publish_outbounds, sender_hex};
 use twine_daemon::{Config, KIND_ACTION, Phase};
 

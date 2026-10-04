@@ -1,3 +1,4 @@
+pub mod app;
 pub mod constant;
 pub mod db;
 pub mod engine;
