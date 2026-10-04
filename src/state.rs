@@ -1,9 +1,10 @@
 use crate::constant::{DISPUTE_WINDOW_SECS, FIAT_WINDOW_SECS, SAFETY_SECS};
 use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
-pub fn actor_of(maker: &str, solver: Option<&str>, sender: &str) -> Actor {
-    if sender == maker {
-        Actor::Maker
+/// The seller posted the order. Only they can cancel it before a buyer takes it.
+pub fn order_actor(seller: &str, solver: Option<&str>, sender: &str) -> Actor {
+    if sender == seller {
+        Actor::Seller
     } else if solver == Some(sender) {
         Actor::Solver
     } else {
@@ -148,13 +149,10 @@ pub fn apply_resolve(phase: Phase, actor: Actor, winner: Winner, has_invoice: bo
 
 pub fn apply_cancel(phase: Phase, actor: Actor, invoice: Option<InvoiceStatus>) -> Decision {
     match phase {
-        Phase::Pending => {
-            if actor == Actor::Maker {
-                Decision::Ok(Phase::Canceled)
-            } else {
-                Decision::Reject("only the maker can cancel a pending order")
-            }
-        }
+        Phase::Pending => match actor {
+            Actor::Seller => Decision::Ok(Phase::Canceled),
+            _ => Decision::Reject("only the seller can cancel an open order"),
+        },
         Phase::WaitingHold => {
             if !matches!(actor, Actor::Seller | Actor::Buyer) {
                 return Decision::Reject("only a party to the trade can cancel");
@@ -192,10 +190,6 @@ pub fn apply_expired(phase: Phase) -> Decision {
 mod tests {
     use super::*;
     use crate::types::{Actor, Decision, InvoiceStatus, Phase};
-
-    fn maker() -> Actor {
-        Actor::Maker
-    }
 
     fn seller() -> Actor {
         Actor::Seller
@@ -282,11 +276,15 @@ mod tests {
     }
 
     #[test]
-    fn cancel_pending_is_maker_only() {
+    fn cancel_pending_is_the_seller() {
         assert_eq!(
-            apply_cancel(Phase::Pending, maker(), None),
+            apply_cancel(Phase::Pending, seller(), None),
             Decision::Ok(Phase::Canceled)
         );
+        assert!(matches!(
+            apply_cancel(Phase::Pending, buyer(), None),
+            Decision::Reject(_)
+        ));
         assert!(matches!(
             apply_cancel(Phase::Pending, Actor::Other, None),
             Decision::Reject(_)
@@ -324,31 +322,32 @@ mod tests {
     }
 
     #[test]
-    fn actor_of_matches_maker_and_solver() {
-        assert_eq!(actor_of("m", Some("s"), "m"), Actor::Maker);
-        assert_eq!(actor_of("m", Some("s"), "s"), Actor::Solver);
-        assert_eq!(actor_of("m", Some("s"), "x"), Actor::Other);
+    fn order_actor_is_the_seller() {
+        assert_eq!(
+            order_actor("seller", Some("solver"), "seller"),
+            Actor::Seller
+        );
+        assert_eq!(
+            order_actor("seller", Some("solver"), "solver"),
+            Actor::Solver
+        );
+        assert_eq!(order_actor("seller", Some("solver"), "buyer"), Actor::Other);
     }
 
     #[test]
     fn trade_actor_names_seller_and_buyer() {
         assert_eq!(
-            trade_actor("maker", "taker", Some("s"), "maker"),
+            trade_actor("seller", "buyer", Some("s"), "seller"),
             Actor::Seller
         );
         assert_eq!(
-            trade_actor("maker", "taker", Some("s"), "taker"),
+            trade_actor("seller", "buyer", Some("s"), "buyer"),
             Actor::Buyer
         );
         assert_eq!(
-            trade_actor("taker", "maker", Some("s"), "taker"),
-            Actor::Seller
+            trade_actor("seller", "buyer", Some("s"), "s"),
+            Actor::Solver
         );
-        assert_eq!(
-            trade_actor("taker", "maker", Some("s"), "maker"),
-            Actor::Buyer
-        );
-        assert_eq!(trade_actor("taker", "maker", Some("s"), "s"), Actor::Solver);
     }
 
     #[test]

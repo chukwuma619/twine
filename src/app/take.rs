@@ -25,11 +25,11 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     if !order.is_open() {
         return Ok(vec![cant_do(sender, None, "order is not open")]);
     }
-    if sender == order.maker_nostr {
+    if sender == order.seller_nostr {
         return Ok(vec![cant_do(
             sender,
             None,
-            "maker cannot take their own order",
+            "you cannot take your own order",
         )]);
     }
     let has_open = engine.db.open_trade_for_order(&order.id)?.is_some();
@@ -48,14 +48,9 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         Ok(value) => value,
         Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
     };
-    if payload.taker_fiber_pubkey.trim().is_empty() {
-        return Ok(vec![cant_do(
-            sender,
-            None,
-            "taker fiber pubkey is required",
-        )]);
+    if payload.fiber_pubkey.trim().is_empty() {
+        return Ok(vec![cant_do(sender, None, "fiber pubkey is required")]);
     }
-
     let mut secret = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut secret);
     let hash = Sha256::digest(secret);
@@ -66,8 +61,10 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     let trade = Trade {
         id: trade_id.clone(),
         order_id: order.id.clone(),
-        taker_nostr: sender.to_string(),
-        taker_fiber: payload.taker_fiber_pubkey,
+        seller_nostr: order.seller_nostr.clone(),
+        seller_fiber: order.seller_fiber.clone(),
+        buyer_nostr: sender.to_string(),
+        buyer_fiber: payload.fiber_pubkey,
         fiat_amount: payload.fiat_amount,
         shannons,
         state: Phase::WaitingHold.as_str().into(),
@@ -134,11 +131,11 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     Ok(vec![
         Outbound::PublicOrder(order.public()),
         Outbound::Reply {
-            to: order.maker_nostr.clone(),
+            to: trade.seller_nostr.clone(),
             envelope: pay.clone(),
         },
         Outbound::Reply {
-            to: sender.to_string(),
+            to: trade.buyer_nostr,
             envelope: pay,
         },
     ])

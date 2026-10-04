@@ -202,7 +202,6 @@ impl<F: FiberRpc + 'static> Engine<F> {
                     self.db
                         .set_hold_received(&trade.id, next.as_str(), unix_now())?;
                     Ok(party_replies(
-                        &order,
                         &trade,
                         Envelope::new(WAITING_FIAT).with_trade(&trade.id),
                     ))
@@ -218,7 +217,6 @@ impl<F: FiberRpc + 'static> Engine<F> {
         if phase == Phase::Refunding && self.preimage_pending(&trade)? {
             self.drop_preimage(&trade).await?;
             return Ok(party_replies(
-                &order,
                 &trade,
                 Envelope::new(REFUNDING).with_trade(&trade.id),
             ));
@@ -241,7 +239,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 self.finish_terminal(order, trade, Phase::Expired)?;
                 let order = self.require_order(&order.id)?;
                 let mut outbound =
-                    party_replies(&order, trade, Envelope::new(EXPIRED).with_trade(&trade.id));
+                    party_replies(trade, Envelope::new(EXPIRED).with_trade(&trade.id));
                 outbound.insert(0, Outbound::PublicOrder(order.public()));
                 Ok(outbound)
             }
@@ -257,18 +255,17 @@ impl<F: FiberRpc + 'static> Engine<F> {
             trade.hold_received_at,
             order.hold_secs,
         ) {
-            Decision::Ok(Phase::Refunding) => self.begin_refund(order, trade).await,
+            Decision::Ok(Phase::Refunding) => self.begin_refund(trade).await,
             Decision::NoOp => Ok(Vec::new()),
             other => bail!("invalid clock: {other:?}"),
         }
     }
 
-    pub(crate) async fn begin_refund(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
+    pub(crate) async fn begin_refund(&self, trade: &Trade) -> Result<Vec<Outbound>> {
         self.db
             .set_trade_state(&trade.id, Phase::Refunding.as_str())?;
         self.drop_preimage(trade).await?;
         Ok(party_replies(
-            order,
             trade,
             Envelope::new(REFUNDING).with_trade(&trade.id),
         ))
@@ -304,41 +301,37 @@ impl<F: FiberRpc + 'static> Engine<F> {
             let parsed = match self.fiber.parse_invoice(&invoice).await {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    return self.fail_payout(
-                        &order,
-                        &trade,
-                        &format!("payout invoice rejected: {error}"),
-                    );
+                    return self.fail_payout(&trade, &format!("payout invoice rejected: {error}"));
                 }
             };
             if let Err(reason) = payout_invoice_ok(&parsed, self.fiber.currency(), trade.shannons) {
-                return self.fail_payout(&order, &trade, reason);
+                return self.fail_payout(&trade, reason);
             }
             let payment = match self.fiber.send_payment(&invoice).await {
                 Ok(payment) => payment,
-                Err(error) => return self.fail_payout(&order, &trade, &sender_reason(&error)),
+                Err(error) => return self.fail_payout(&trade, &sender_reason(&error)),
             };
             self.db
                 .set_payout(&trade.id, &invoice, Some(&payment.payment_hash))?;
             trade.payout_payment_hash = Some(payment.payment_hash.clone());
             if payment.status == "Failed" {
-                return self.fail_payout(&order, &trade, "taker payout failed");
+                return self.fail_payout(&trade, "buyer payout failed");
             }
             if payment.status == "Success" {
-                return self.settle_hold(&order, &trade).await;
+                return self.settle_hold(&trade).await;
             }
             return Ok(Vec::new());
         }
         let payment_hash = trade.payout_payment_hash.as_deref().unwrap();
         let payment = self.fiber.get_payment(payment_hash).await?;
         match payment.status.as_str() {
-            "Success" => self.settle_hold(&order, &trade).await,
-            "Failed" => self.fail_payout(&order, &trade, "taker payout failed"),
+            "Success" => self.settle_hold(&trade).await,
+            "Failed" => self.fail_payout(&trade, "buyer payout failed"),
             _ => Ok(Vec::new()),
         }
     }
 
-    async fn settle_hold(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
+    async fn settle_hold(&self, trade: &Trade) -> Result<Vec<Outbound>> {
         let Some(current) = self.db.get_trade(&trade.id)? else {
             return Ok(Vec::new());
         };
@@ -368,7 +361,6 @@ impl<F: FiberRpc + 'static> Engine<F> {
                     warn!(%error, trade_id = %trade.id, "delete preimage after settle");
                 }
                 Ok(party_replies(
-                    order,
                     trade,
                     Envelope::new(SETTLED).with_trade(&trade.id),
                 ))
@@ -377,7 +369,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
     }
 
-    fn fail_payout(&self, order: &Order, trade: &Trade, reason: &str) -> Result<Vec<Outbound>> {
+    fn fail_payout(&self, trade: &Trade, reason: &str) -> Result<Vec<Outbound>> {
         match apply_release_failed(Phase::Releasing) {
             Decision::Ok(phase) => {
                 if let Some(invoice) = &trade.payout_invoice {
@@ -389,7 +381,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
                     .with_payload(NewInvoicePayload {
                         reason: reason.to_string(),
                     })?;
-                Ok(party_replies(order, trade, envelope))
+                Ok(party_replies(trade, envelope))
             }
             other => bail!("invalid payout fail: {other:?}"),
         }
@@ -405,8 +397,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             warn!(%error, trade_id = %trade.id, "remove preimage");
         }
         let order = self.require_order(&order.id)?;
-        let mut outbound =
-            party_replies(&order, trade, Envelope::new(CANCELED).with_trade(&trade.id));
+        let mut outbound = party_replies(trade, Envelope::new(CANCELED).with_trade(&trade.id));
         outbound.insert(0, Outbound::PublicOrder(order.public()));
         Ok(outbound)
     }
@@ -437,22 +428,17 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
     }
 
-    pub(crate) fn trade_actor(&self, order: &Order, trade: &Trade, sender: &str) -> Result<Actor> {
-        Ok(trade_actor(
-            order.seller_nostr(trade)?,
-            order.buyer_nostr(trade)?,
+    pub(crate) fn trade_actor(&self, trade: &Trade, sender: &str) -> Actor {
+        trade_actor(
+            &trade.seller_nostr,
+            &trade.buyer_nostr,
             self.solver.as_deref(),
             sender,
-        ))
+        )
     }
 
-    pub(crate) fn with_solver(
-        &self,
-        order: &Order,
-        trade: &Trade,
-        envelope: Envelope,
-    ) -> Vec<Outbound> {
-        let mut outbound = party_replies(order, trade, envelope.clone());
+    pub(crate) fn with_solver(&self, trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
+        let mut outbound = party_replies(trade, envelope.clone());
         if let Some(solver) = &self.solver {
             outbound.push(Outbound::Reply {
                 to: solver.clone(),
@@ -530,14 +516,14 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-pub(crate) fn party_replies(order: &Order, trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
+pub(crate) fn party_replies(trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
     vec![
         Outbound::Reply {
-            to: order.maker_nostr.clone(),
+            to: trade.seller_nostr.clone(),
             envelope: envelope.clone(),
         },
         Outbound::Reply {
-            to: trade.taker_nostr.clone(),
+            to: trade.buyer_nostr.clone(),
             envelope,
         },
     ]
@@ -698,9 +684,8 @@ mod tests {
         let db = Arc::new(Db::open_in_memory().unwrap());
         db.insert_order(&Order {
             id: "order".into(),
-            side: "sell".into(),
-            maker_nostr: "seller".into(),
-            maker_fiber: "fiber-seller".into(),
+            seller_nostr: "seller".into(),
+            seller_fiber: "fiber-seller".into(),
             available_shannons: 1_000_000_000,
             fiat_currency: "NGN".into(),
             price_per_ckb: "1000".into(),
@@ -714,8 +699,10 @@ mod tests {
         db.insert_trade(&Trade {
             id: "trade".into(),
             order_id: "order".into(),
-            taker_nostr: "buyer".into(),
-            taker_fiber: "fiber-buyer".into(),
+            seller_nostr: "seller".into(),
+            seller_fiber: "fiber-seller".into(),
+            buyer_nostr: "buyer".into(),
+            buyer_fiber: "fiber-buyer".into(),
             fiat_amount: "1000".into(),
             shannons: 100_000_000,
             state: Phase::WaitingHold.as_str().into(),
@@ -917,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buy_ad_locks_from_the_taker_and_fiat_comes_from_the_maker() {
+    async fn the_buyer_buys_the_sellers_offer() {
         let fiber = Arc::new(FakeFiber {
             status: StdMutex::new("Open".into()),
             removed: StdMutex::new(false),
@@ -928,11 +915,10 @@ mod tests {
         let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber.clone(), None);
         let posted = engine
             .handle(
-                "maker",
+                "seller",
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
-                        side: "buy".into(),
-                        fiber_pubkey: "fiber-maker".into(),
+                        fiber_pubkey: "fiber-seller".into(),
                         available_ckb: "10".into(),
                         fiat_currency: "NGN".into(),
                         price_per_ckb: "1000".into(),
@@ -948,24 +934,26 @@ mod tests {
         let Outbound::PublicOrder(public) = &posted[0] else {
             panic!("expected a public order");
         };
-        assert_eq!(public.side, "buy");
         assert_eq!(public.hold_hours, 36);
+        assert_eq!(public.seller_nostr_pubkey, "seller");
+        assert_eq!(public.seller_fiber_pubkey, "fiber-seller");
         let order_id = public.order_id.clone();
 
         let taken = engine
             .handle(
-                "taker",
+                "buyer",
                 Envelope::new(TAKE)
                     .with_payload(TakePayload {
                         order_id,
                         fiat_amount: "1000".into(),
-                        taker_fiber_pubkey: "fiber-taker".into(),
+                        fiber_pubkey: "fiber-buyer".into(),
                     })
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert!(reply_to(&taken, "taker", PAY_INVOICE));
+        assert!(reply_to(&taken, "seller", PAY_INVOICE));
+        assert!(reply_to(&taken, "buyer", PAY_INVOICE));
         let trade_id = taken
             .iter()
             .find_map(|item| match item {
@@ -980,7 +968,7 @@ mod tests {
 
         let seller_fiat = engine
             .handle(
-                "taker",
+                "seller",
                 Envelope::new(FIAT_SENT)
                     .with_trade(&trade_id)
                     .with_payload(FiatSentPayload {
@@ -994,7 +982,7 @@ mod tests {
 
         let fiat = engine
             .handle(
-                "maker",
+                "buyer",
                 Envelope::new(FIAT_SENT)
                     .with_trade(&trade_id)
                     .with_payload(FiatSentPayload {
@@ -1007,12 +995,12 @@ mod tests {
         assert!(replies_contain(&fiat, FIAT_SENT_OK));
 
         let buyer_release = engine
-            .handle("maker", Envelope::new(RELEASE).with_trade(&trade_id))
+            .handle("buyer", Envelope::new(RELEASE).with_trade(&trade_id))
             .await
             .unwrap();
         assert!(cant_do_reason(&buyer_release).contains("seller"));
         engine
-            .handle("taker", Envelope::new(RELEASE).with_trade(&trade_id))
+            .handle("seller", Envelope::new(RELEASE).with_trade(&trade_id))
             .await
             .unwrap();
         assert_eq!(
@@ -1033,8 +1021,8 @@ mod tests {
     async fn take_creates_hold_and_registers_preimage() {
         let ctx = TestContext::new().await;
         let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "maker", &twine_pk).await;
-        let (trade_id, invoice, amount) = take(&ctx.engine, "taker", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
+        let (trade_id, invoice, amount) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
         assert!(!invoice.is_empty());
         assert_eq!(amount, "100000000");
         let trade = ctx.engine.db.get_trade(&trade_id).unwrap().unwrap();
@@ -1049,16 +1037,16 @@ mod tests {
     async fn pay_invoice_never_includes_preimage() {
         let ctx = TestContext::new().await;
         let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "maker", &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
         let outbound = ctx
             .engine
             .handle(
-                "taker",
+                "buyer",
                 Envelope::new(TAKE)
                     .with_payload(TakePayload {
                         order_id,
                         fiat_amount: "1000".into(),
-                        taker_fiber_pubkey: twine_pk,
+                        fiber_pubkey: twine_pk,
                     })
                     .unwrap(),
             )
@@ -1075,8 +1063,8 @@ mod tests {
     async fn cancel_open_hold() {
         let ctx = TestContext::new().await;
         let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "maker", &twine_pk).await;
-        let (trade_id, _, _) = take(&ctx.engine, "taker", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
+        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
         let hash = ctx
             .engine
             .db
@@ -1087,7 +1075,7 @@ mod tests {
             .unwrap();
         let canceled = ctx
             .engine
-            .handle("maker", Envelope::new(CANCEL).with_trade(&trade_id))
+            .handle("seller", Envelope::new(CANCEL).with_trade(&trade_id))
             .await
             .unwrap();
         assert!(replies_contain(&canceled, CANCELED));
@@ -1149,11 +1137,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a running Fiber node (TWINE_RPC)"]
-    async fn lock_poll_and_release_pay_taker_first() {
+    async fn lock_poll_and_release_pay_the_buyer_first() {
         let ctx = TestContext::new().await;
         let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "maker", &twine_pk).await;
-        let (trade_id, _, _) = take(&ctx.engine, "taker", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
+        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
         let hash = ctx
             .engine
             .db
@@ -1170,13 +1158,13 @@ mod tests {
 
         let payout = ctx
             .fiber
-            .new_payout_invoice(100_000_000, "twine taker")
+            .new_payout_invoice(100_000_000, "twine buyer")
             .await
             .unwrap();
-        fiat_sent(&ctx.engine, "taker", &trade_id, &payout.invoice).await;
+        fiat_sent(&ctx.engine, "buyer", &trade_id, &payout.invoice).await;
 
         ctx.engine
-            .handle("maker", Envelope::new(RELEASE).with_trade(&trade_id))
+            .handle("seller", Envelope::new(RELEASE).with_trade(&trade_id))
             .await
             .unwrap();
         let settled = ctx.engine.on_payout_status(&trade_id).await.unwrap();
@@ -1193,8 +1181,8 @@ mod tests {
     async fn reject_cancel_after_hold_received() {
         let ctx = TestContext::new().await;
         let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "maker", &twine_pk).await;
-        let (trade_id, _, _) = take(&ctx.engine, "taker", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
+        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
         let hash = ctx
             .engine
             .db
@@ -1207,7 +1195,7 @@ mod tests {
         ctx.engine.on_hold_status(&trade_id).await.unwrap();
         let rejected = ctx
             .engine
-            .handle("maker", Envelope::new(CANCEL).with_trade(&trade_id))
+            .handle("seller", Envelope::new(CANCEL).with_trade(&trade_id))
             .await
             .unwrap();
         assert!(cant_do_reason(&rejected).contains("timelock"));

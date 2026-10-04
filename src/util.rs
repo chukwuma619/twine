@@ -239,13 +239,16 @@ pub(crate) mod support {
         }
     }
 
-    pub async fn open_order(engine: &Engine<HttpFiber>, maker: &str, fiber_pubkey: &str) -> String {
+    pub async fn open_order(
+        engine: &Engine<HttpFiber>,
+        seller: &str,
+        fiber_pubkey: &str,
+    ) -> String {
         let outbound = engine
             .handle(
-                maker,
+                seller,
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
-                        side: "sell".into(),
                         fiber_pubkey: fiber_pubkey.into(),
                         available_ckb: "10".into(),
                         fiat_currency: "NGN".into(),
@@ -267,18 +270,18 @@ pub(crate) mod support {
 
     pub async fn take(
         engine: &Engine<HttpFiber>,
-        taker: &str,
+        buyer: &str,
         order_id: &str,
-        taker_fiber_pubkey: &str,
+        fiber_pubkey: &str,
     ) -> (String, String, String) {
         let outbound = engine
             .handle(
-                taker,
+                buyer,
                 Envelope::new(TAKE)
                     .with_payload(TakePayload {
                         order_id: order_id.into(),
                         fiat_amount: "1000".into(),
-                        taker_fiber_pubkey: taker_fiber_pubkey.into(),
+                        fiber_pubkey: fiber_pubkey.into(),
                     })
                     .unwrap(),
             )
@@ -301,10 +304,10 @@ pub(crate) mod support {
         )
     }
 
-    pub async fn fiat_sent(engine: &Engine<HttpFiber>, taker: &str, trade_id: &str, invoice: &str) {
+    pub async fn fiat_sent(engine: &Engine<HttpFiber>, buyer: &str, trade_id: &str, invoice: &str) {
         engine
             .handle(
-                taker,
+                buyer,
                 Envelope::new(FIAT_SENT)
                     .with_trade(trade_id)
                     .with_payload(FiatSentPayload {

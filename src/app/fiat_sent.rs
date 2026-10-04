@@ -36,7 +36,7 @@ pub(crate) async fn on_fiat_sent<F: FiberRpc + 'static>(
     if let Some(outbound) = engine.refund_due_outbound(&order, &trade).await? {
         return Ok(outbound);
     }
-    let actor = engine.trade_actor(&order, &trade, sender)?;
+    let actor = engine.trade_actor(&trade, sender);
     match apply_fiat_sent(trade.phase()?, actor) {
         crate::Decision::Ok(phase) => {
             engine.db.set_payout(&trade.id, &payload.invoice, None)?;
@@ -46,7 +46,6 @@ pub(crate) async fn on_fiat_sent<F: FiberRpc + 'static>(
                 return Ok(Vec::new());
             }
             Ok(party_replies(
-                &order,
                 &trade,
                 Envelope::new(FIAT_SENT_OK).with_trade(&trade.id),
             ))

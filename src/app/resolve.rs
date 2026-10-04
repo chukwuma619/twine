@@ -47,9 +47,9 @@ pub(crate) async fn on_resolve<F: FiberRpc + 'static>(
             .payout_invoice
             .as_deref()
             .is_some_and(|invoice| !invoice.trim().is_empty());
-    let actor = engine.trade_actor(&order, &trade, sender)?;
+    let actor = engine.trade_actor(&trade, sender);
     match apply_resolve(trade.phase()?, actor, winner, has_invoice) {
-        crate::Decision::Ok(Phase::Refunding) => engine.begin_refund(&order, &trade).await,
+        crate::Decision::Ok(Phase::Refunding) => engine.begin_refund(&trade).await,
         crate::Decision::Ok(Phase::Releasing) => {
             if let Some(invoice) = &supplied {
                 engine.db.set_payout(&trade.id, invoice, None)?;

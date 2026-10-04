@@ -1,7 +1,7 @@
 use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::Outbound;
-use crate::{CANCELED, CancelPayload, Envelope, InvoiceStatus, Phase, actor_of, apply_cancel};
+use crate::{CANCELED, CancelPayload, Envelope, InvoiceStatus, Phase, apply_cancel, order_actor};
 use anyhow::Result;
 
 pub(crate) async fn on_cancel<F: FiberRpc + 'static>(
@@ -28,7 +28,7 @@ pub(crate) async fn on_cancel<F: FiberRpc + 'static>(
     if engine.db.open_trade_for_order(&order.id)?.is_some() {
         return Ok(vec![cant_do(sender, None, "order has an open trade")]);
     }
-    let actor = actor_of(&order.maker_nostr, engine.solver.as_deref(), sender);
+    let actor = order_actor(&order.seller_nostr, engine.solver.as_deref(), sender);
     match apply_cancel(Phase::Pending, actor, None) {
         crate::Decision::Ok(Phase::Canceled) => {
             if let Err(error) = engine.db.cancel_order(&order.id) {
@@ -61,7 +61,7 @@ async fn cancel_trade<F: FiberRpc + 'static>(
         )]);
     };
     let order = engine.require_order(&trade.order_id)?;
-    let actor = engine.trade_actor(&order, &trade, sender)?;
+    let actor = engine.trade_actor(&trade, sender);
     let invoice_status = if let Some(hash) = trade.hold_payment_hash.as_deref() {
         let invoice = engine.fiber.get_invoice(hash).await?;
         InvoiceStatus::parse(&invoice.status)

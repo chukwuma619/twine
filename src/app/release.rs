@@ -19,7 +19,7 @@ pub(crate) async fn on_release<F: FiberRpc + 'static>(
     if let Some(outbound) = engine.refund_due_outbound(&order, &trade).await? {
         return Ok(outbound);
     }
-    let actor = engine.trade_actor(&order, &trade, sender)?;
+    let actor = engine.trade_actor(&trade, sender);
     let has_invoice = trade
         .payout_invoice
         .as_deref()

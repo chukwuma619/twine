@@ -4,8 +4,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 
-const TRADE_COLUMNS: &str = "id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state, \
-     hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash, hold_received_at";
+const TRADE_COLUMNS: &str = "id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber, \
+     fiat_amount, shannons, state, hold_payment_hash, hold_invoice, payout_invoice, \
+     payout_payment_hash, hold_received_at";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -50,8 +51,8 @@ impl Db {
             "
             CREATE TABLE IF NOT EXISTS orders (
                 id TEXT PRIMARY KEY,
-                maker_nostr TEXT NOT NULL,
-                maker_fiber TEXT NOT NULL,
+                seller_nostr TEXT NOT NULL,
+                seller_fiber TEXT NOT NULL,
                 available_shannons INTEGER NOT NULL,
                 fiat_currency TEXT NOT NULL,
                 price_per_ckb TEXT NOT NULL,
@@ -59,14 +60,15 @@ impl Db {
                 max TEXT NOT NULL,
                 payment_method TEXT NOT NULL,
                 status TEXT NOT NULL,
-                side TEXT NOT NULL DEFAULT 'sell',
                 hold_secs INTEGER NOT NULL DEFAULT 129600
             );
             CREATE TABLE IF NOT EXISTS trades (
                 id TEXT PRIMARY KEY,
                 order_id TEXT NOT NULL,
-                taker_nostr TEXT NOT NULL,
-                taker_fiber TEXT NOT NULL,
+                seller_nostr TEXT NOT NULL,
+                seller_fiber TEXT NOT NULL,
+                buyer_nostr TEXT NOT NULL,
+                buyer_fiber TEXT NOT NULL,
                 fiat_amount TEXT NOT NULL,
                 shannons INTEGER NOT NULL,
                 state TEXT NOT NULL,
@@ -99,14 +101,6 @@ impl Db {
             }
         }
         if let Err(error) = conn.execute(
-            "ALTER TABLE orders ADD COLUMN side TEXT NOT NULL DEFAULT 'sell'",
-            [],
-        ) {
-            if !error.to_string().contains("duplicate column") {
-                return Err(error.into());
-            }
-        }
-        if let Err(error) = conn.execute(
             "ALTER TABLE orders ADD COLUMN hold_secs INTEGER NOT NULL DEFAULT 129600",
             [],
         ) {
@@ -130,13 +124,14 @@ impl Db {
         let conn = self.conn.lock().expect("db");
         conn.execute(
             "INSERT INTO orders (
-                id, maker_nostr, maker_fiber, available_shannons, fiat_currency,
-                price_per_ckb, min, max, payment_method, status, side, hold_secs
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                id, seller_nostr, seller_fiber,
+                available_shannons, fiat_currency, price_per_ckb, min, max,
+                payment_method, status, hold_secs
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 order.id,
-                order.maker_nostr,
-                order.maker_fiber,
+                order.seller_nostr,
+                order.seller_fiber,
                 i64_from_shannons(order.available_shannons)?,
                 order.fiat_currency,
                 order.price_per_ckb,
@@ -144,7 +139,6 @@ impl Db {
                 order.max,
                 order.payment_method,
                 order.status,
-                order.side,
                 i64::try_from(order.hold_secs).context("hold does not fit sqlite integer")?,
             ],
         )?;
@@ -154,16 +148,17 @@ impl Db {
     pub fn get_order(&self, id: &str) -> Result<Option<Order>> {
         let conn = self.conn.lock().expect("db");
         let mut stmt = conn.prepare(
-            "SELECT id, maker_nostr, maker_fiber, available_shannons, fiat_currency,
-                    price_per_ckb, min, max, payment_method, status, side, hold_secs
+            "SELECT id, seller_nostr, seller_fiber,
+                    available_shannons, fiat_currency, price_per_ckb, min, max,
+                    payment_method, status, hold_secs
              FROM orders WHERE id = ?1",
         )?;
         let order = stmt
             .query_row(params![id], |row| {
                 Ok(Order {
                     id: row.get(0)?,
-                    maker_nostr: row.get(1)?,
-                    maker_fiber: row.get(2)?,
+                    seller_nostr: row.get(1)?,
+                    seller_fiber: row.get(2)?,
                     available_shannons: read_shannons(row.get(3)?, 3)?,
                     fiat_currency: row.get(4)?,
                     price_per_ckb: row.get(5)?,
@@ -171,8 +166,7 @@ impl Db {
                     max: row.get(7)?,
                     payment_method: row.get(8)?,
                     status: row.get(9)?,
-                    side: row.get(10)?,
-                    hold_secs: read_u64(row.get(11)?, 11)?,
+                    hold_secs: read_u64(row.get(10)?, 10)?,
                 })
             })
             .optional()?;
@@ -201,15 +195,17 @@ impl Db {
         }
         tx.execute(
             "INSERT INTO trades (
-                id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state,
-                hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash,
-                hold_received_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
+                fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
+                payout_invoice, payout_payment_hash, hold_received_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 trade.id,
                 trade.order_id,
-                trade.taker_nostr,
-                trade.taker_fiber,
+                trade.seller_nostr,
+                trade.seller_fiber,
+                trade.buyer_nostr,
+                trade.buyer_fiber,
                 trade.fiat_amount,
                 shannons,
                 trade.state,
@@ -304,15 +300,17 @@ impl Db {
         let conn = self.conn.lock().expect("db");
         conn.execute(
             "INSERT INTO trades (
-                id, order_id, taker_nostr, taker_fiber, fiat_amount, shannons, state,
-                hold_payment_hash, hold_invoice, payout_invoice, payout_payment_hash,
-                hold_received_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
+                fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
+                payout_invoice, payout_payment_hash, hold_received_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 trade.id,
                 trade.order_id,
-                trade.taker_nostr,
-                trade.taker_fiber,
+                trade.seller_nostr,
+                trade.seller_fiber,
+                trade.buyer_nostr,
+                trade.buyer_fiber,
                 trade.fiat_amount,
                 i64_from_shannons(trade.shannons)?,
                 trade.state,
@@ -526,16 +524,18 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
     Ok(Trade {
         id: row.get(0)?,
         order_id: row.get(1)?,
-        taker_nostr: row.get(2)?,
-        taker_fiber: row.get(3)?,
-        fiat_amount: row.get(4)?,
-        shannons: read_shannons(row.get(5)?, 5)?,
-        state: row.get(6)?,
-        hold_payment_hash: row.get(7)?,
-        hold_invoice: row.get(8)?,
-        payout_invoice: row.get(9)?,
-        payout_payment_hash: row.get(10)?,
-        hold_received_at: row.get(11)?,
+        seller_nostr: row.get(2)?,
+        seller_fiber: row.get(3)?,
+        buyer_nostr: row.get(4)?,
+        buyer_fiber: row.get(5)?,
+        fiat_amount: row.get(6)?,
+        shannons: read_shannons(row.get(7)?, 7)?,
+        state: row.get(8)?,
+        hold_payment_hash: row.get(9)?,
+        hold_invoice: row.get(10)?,
+        payout_invoice: row.get(11)?,
+        payout_payment_hash: row.get(12)?,
+        hold_received_at: row.get(13)?,
     })
 }
 
@@ -546,9 +546,8 @@ mod tests {
     fn sample_order(available: u128) -> Order {
         Order {
             id: "order".into(),
-            side: "sell".into(),
-            maker_nostr: "maker".into(),
-            maker_fiber: "fiber".into(),
+            seller_nostr: "seller".into(),
+            seller_fiber: "fiber".into(),
             available_shannons: available,
             fiat_currency: "NGN".into(),
             price_per_ckb: "1000".into(),
@@ -564,8 +563,10 @@ mod tests {
         Trade {
             id: "trade".into(),
             order_id: "order".into(),
-            taker_nostr: "taker".into(),
-            taker_fiber: "fiber-taker".into(),
+            seller_nostr: "seller".into(),
+            seller_fiber: "fiber-seller".into(),
+            buyer_nostr: "buyer".into(),
+            buyer_fiber: "fiber-buyer".into(),
             fiat_amount: "1000".into(),
             shannons,
             state: Phase::WaitingHold.as_str().into(),
@@ -578,21 +579,21 @@ mod tests {
     }
 
     #[test]
-    fn an_order_without_a_side_is_a_sell() {
+    fn an_order_defaults_the_hold() {
         let db = Db::open_in_memory().unwrap();
         db.conn
             .lock()
             .unwrap()
             .execute(
                 "INSERT INTO orders (
-                    id, maker_nostr, maker_fiber, available_shannons, fiat_currency,
+                    id, seller_nostr, seller_fiber, available_shannons, fiat_currency,
                     price_per_ckb, min, max, payment_method, status
-                ) VALUES ('order', 'maker', 'fiber', 1, 'NGN', '1', '1', '2', 'bank', 'open')",
+                ) VALUES ('order', 'seller', 'fiber', 1, 'NGN', '1', '1', '2', 'bank', 'open')",
                 [],
             )
             .unwrap();
         let order = db.get_order("order").unwrap().unwrap();
-        assert_eq!(order.side, "sell");
+        assert_eq!(order.seller_nostr, "seller");
         assert_eq!(order.hold_secs, 36 * 3_600);
     }
 

@@ -111,43 +111,13 @@ impl OrderStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Who is allowed to move a trade. `Maker` is only the order owner, for canceling
-/// an ad that has no trade yet. Once a trade exists, actions follow `Seller` and
-/// `Buyer`, which swap with the order side.
+/// Who is allowed to move an order or a trade.
+/// The seller posts the offer. The buyer takes it.
 pub enum Actor {
-    Maker,
     Seller,
     Buyer,
     Solver,
     Other,
-}
-
-/// A sell offers CKB. A buy offers fiat and asks for CKB.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-impl Side {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Buy => "buy",
-            Self::Sell => "sell",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "buy" => Some(Self::Buy),
-            "sell" => Some(Self::Sell),
-            _ => None,
-        }
-    }
-}
-
-fn default_order_side() -> String {
-    Side::Sell.as_str().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,9 +241,6 @@ impl Envelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewOrderPayload {
-    /// `buy` or `sell`. Omitted means `sell`.
-    #[serde(default = "default_order_side")]
-    pub side: String,
     pub fiber_pubkey: String,
     pub available_ckb: String,
     pub fiat_currency: String,
@@ -285,11 +252,11 @@ pub struct NewOrderPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Works for a buy or a sell. The order's `side` decides who locks.
+/// The buyer joining a seller's offer. `fiber_pubkey` is the buyer's Fiber key.
 pub struct TakePayload {
     pub order_id: String,
     pub fiat_amount: String,
-    pub taker_fiber_pubkey: String,
+    pub fiber_pubkey: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,9 +309,8 @@ pub enum Outbound {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicOrder {
     pub order_id: String,
-    pub side: String,
-    pub maker_nostr_pubkey: String,
-    pub maker_fiber_pubkey: String,
+    pub seller_nostr_pubkey: String,
+    pub seller_fiber_pubkey: String,
     pub available_ckb: String,
     pub fiat_currency: String,
     pub price_per_ckb: String,
@@ -356,9 +322,8 @@ pub struct PublicOrder {
 
 pub struct Order {
     pub id: String,
-    pub side: String,
-    pub maker_nostr: String,
-    pub maker_fiber: String,
+    pub seller_nostr: String,
+    pub seller_fiber: String,
     pub available_shannons: u128,
     pub fiat_currency: String,
     pub price_per_ckb: String,
@@ -370,32 +335,11 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn order_side(&self) -> Result<Side> {
-        Side::parse(&self.side).ok_or_else(|| anyhow!("unknown order side {}", self.side))
-    }
-
-    /// Nostr key that pays the hold invoice and may release it.
-    pub fn seller_nostr<'a>(&'a self, trade: &'a Trade) -> Result<&'a str> {
-        match self.order_side()? {
-            Side::Sell => Ok(self.maker_nostr.as_str()),
-            Side::Buy => Ok(trade.taker_nostr.as_str()),
-        }
-    }
-
-    /// Nostr key that pays fiat and submits the payout invoice.
-    pub fn buyer_nostr<'a>(&'a self, trade: &'a Trade) -> Result<&'a str> {
-        match self.order_side()? {
-            Side::Sell => Ok(trade.taker_nostr.as_str()),
-            Side::Buy => Ok(self.maker_nostr.as_str()),
-        }
-    }
-
     pub fn public(&self) -> PublicOrder {
         PublicOrder {
             order_id: self.id.clone(),
-            side: self.side.clone(),
-            maker_nostr_pubkey: self.maker_nostr.clone(),
-            maker_fiber_pubkey: self.maker_fiber.clone(),
+            seller_nostr_pubkey: self.seller_nostr.clone(),
+            seller_fiber_pubkey: self.seller_fiber.clone(),
             available_ckb: shannons_to_ckb_string(self.available_shannons),
             fiat_currency: self.fiat_currency.clone(),
             price_per_ckb: self.price_per_ckb.clone(),
@@ -414,8 +358,10 @@ impl Order {
 pub struct Trade {
     pub id: String,
     pub order_id: String,
-    pub taker_nostr: String,
-    pub taker_fiber: String,
+    pub seller_nostr: String,
+    pub seller_fiber: String,
+    pub buyer_nostr: String,
+    pub buyer_fiber: String,
     pub fiat_amount: String,
     pub shannons: u128,
     pub state: String,
@@ -441,7 +387,6 @@ mod tests {
     fn envelope_roundtrip() {
         let env = Envelope::new(NEW_ORDER)
             .with_payload(NewOrderPayload {
-                side: "sell".into(),
                 fiber_pubkey: "pk".into(),
                 available_ckb: "10".into(),
                 fiat_currency: "NGN".into(),
@@ -460,20 +405,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_side_is_a_sell_and_a_buy_locks_from_the_taker() {
-        let parsed: Envelope = serde_json::from_str(
-            r#"{"action":"new-order","payload":{"fiber_pubkey":"pk","available_ckb":"10","fiat_currency":"NGN","price_per_ckb":"1500","min":"1000","max":"5000","payment_method":"bank","hold_hours":16}}"#,
-        )
-        .unwrap();
-        let payload: NewOrderPayload = parsed.decode_payload().unwrap();
-        assert_eq!(payload.side, "sell");
-        assert_eq!(payload.hold_hours, 16);
-
+    fn an_order_is_the_sellers_offer() {
         let order = Order {
             id: "order".into(),
-            side: "buy".into(),
-            maker_nostr: "maker".into(),
-            maker_fiber: "fiber-maker".into(),
+            seller_nostr: "seller".into(),
+            seller_fiber: "fiber-seller".into(),
             available_shannons: 1,
             fiat_currency: "NGN".into(),
             price_per_ckb: "1".into(),
@@ -483,23 +419,7 @@ mod tests {
             status: "open".into(),
             hold_secs: 16 * 3_600,
         };
-        let trade = Trade {
-            id: "trade".into(),
-            order_id: "order".into(),
-            taker_nostr: "taker".into(),
-            taker_fiber: "fiber-taker".into(),
-            fiat_amount: "1".into(),
-            shannons: 1,
-            state: "waiting-hold".into(),
-            hold_payment_hash: None,
-            hold_invoice: None,
-            payout_invoice: None,
-            payout_payment_hash: None,
-            hold_received_at: None,
-        };
-        assert_eq!(order.seller_nostr(&trade).unwrap(), "taker");
-        assert_eq!(order.buyer_nostr(&trade).unwrap(), "maker");
-        assert_eq!(order.public().side, "buy");
+        assert_eq!(order.public().seller_nostr_pubkey, "seller");
         assert_eq!(order.public().hold_hours, 16);
     }
 }

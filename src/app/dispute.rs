@@ -26,7 +26,7 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
     if let Some(outbound) = engine.refund_due_outbound(&order, &trade).await? {
         return Ok(outbound);
     }
-    let actor = engine.trade_actor(&order, &trade, sender)?;
+    let actor = engine.trade_actor(&trade, sender);
     match apply_dispute(trade.phase()?, actor) {
         crate::Decision::Ok(phase) => {
             let payload: DisputePayload = envelope.decode_payload().unwrap_or_default();
@@ -41,11 +41,7 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
             engine.watch(&trade.id)?;
-            Ok(engine.with_solver(
-                &order,
-                &trade,
-                Envelope::new(DISPUTED).with_trade(&trade.id),
-            ))
+            Ok(engine.with_solver(&trade, Envelope::new(DISPUTED).with_trade(&trade.id)))
         }
         crate::Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
         crate::Decision::NoOp => Ok(Vec::new()),
