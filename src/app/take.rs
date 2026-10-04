@@ -54,6 +54,20 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     if payload.fiber_pubkey.trim().is_empty() {
         return Ok(vec![cant_do(sender, None, "fiber pubkey is required")]);
     }
+    let Some(method) = order
+        .payment_methods
+        .iter()
+        .find(|method| method.id == payload.payment_method_id)
+    else {
+        return Ok(vec![cant_do(sender, None, "unknown payment method")]);
+    };
+    if method.currency != order.fiat_currency.trim() {
+        return Ok(vec![cant_do(
+            sender,
+            None,
+            "payment method does not match this currency",
+        )]);
+    }
     let mut secret = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut secret);
     let hash = Sha256::digest(secret);
@@ -91,6 +105,10 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         payout_invoice: None,
         payout_payment_hash: None,
         hold_received_at: None,
+        payment_method_id: method.id.clone(),
+        payment_kind: method.kind.clone(),
+        payment_label: method.label.clone(),
+        payment_currency: method.currency.clone(),
     };
     if let Err(error) = engine.db.commit_take(&trade, &preimage) {
         return Ok(vec![cant_do(sender, None, &error.to_string())]);

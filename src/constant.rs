@@ -1,3 +1,5 @@
+use crate::types::ConfiguredPaymentMethod;
+
 /// 1 CKB = 100_000_000 shannons.
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
@@ -14,6 +16,27 @@ pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 
 /// How long the buyer has to pay after the seller locks.
 pub const PAYMENT_WINDOW_SECS: u64 = 15 * 60;
+
+/// Accounts on one post. Each one must be a method in `SUPPORTED_PAYMENT_METHODS`.
+pub const MAX_PAYMENT_METHODS: usize = 5;
+
+/// The catalog. This daemon ships with one NGN method and one USD method.
+/// A post can use a method only when that method's currency is the post's
+/// fiat currency. It does not accept a method that is not listed here.
+pub const SUPPORTED_PAYMENT_METHODS: &[ConfiguredPaymentMethod] = &[
+    ConfiguredPaymentMethod {
+        id: "gtbank",
+        kind: "bank",
+        label: "GTBank",
+        currency: "NGN",
+    },
+    ConfiguredPaymentMethod {
+        id: "zelle",
+        kind: "wallet",
+        label: "Zelle",
+        currency: "USD",
+    },
+];
 
 /// How long an unpaid hold invoice stays open for the seller to lock.
 pub const INVOICE_EXPIRY_SECS: u64 = 60 * 60;

@@ -1,7 +1,9 @@
-use crate::constant::SHANNONS_PER_CKB;
+use crate::constant::{MAX_PAYMENT_METHODS, SHANNONS_PER_CKB};
+use crate::{PaymentKind, PaymentMethod, PaymentMethodInput, SupportedPaymentMethod};
 use anyhow::{Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
+use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -51,14 +53,10 @@ pub fn validate_new_order(
     min: &str,
     max: &str,
     fiat_currency: &str,
-    payment_method: &str,
     fiber_pubkey: &str,
 ) -> Result<u128, AmountError> {
     if fiat_currency.trim().is_empty() {
         return Err(AmountError::Invalid("fiat_currency"));
-    }
-    if payment_method.trim().is_empty() {
-        return Err(AmountError::Invalid("payment_method"));
     }
     if fiber_pubkey.trim().is_empty() {
         return Err(AmountError::Invalid("fiber_pubkey"));
@@ -81,6 +79,49 @@ pub fn validate_new_order(
         return Err(AmountError::Invalid("available_ckb"));
     }
     Ok(shannons)
+}
+
+const PAYMENT_TEXT_MAX: usize = 64;
+
+pub fn payment_methods_for_order(
+    fiat_currency: &str,
+    inputs: &[PaymentMethodInput],
+    catalog: &[SupportedPaymentMethod],
+) -> Result<Vec<PaymentMethod>, AmountError> {
+    if inputs.is_empty() || inputs.len() > MAX_PAYMENT_METHODS {
+        return Err(AmountError::Invalid("payment_methods"));
+    }
+    let currency = fiat_currency.trim();
+    let mut seen = HashSet::new();
+    let mut methods = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let method_id = payment_text(&input.method_id, "payment_method")?;
+        if !seen.insert(method_id.clone()) {
+            return Err(AmountError::Invalid("payment_methods"));
+        }
+        let Some(supported) = catalog.iter().find(|method| method.id == method_id) else {
+            return Err(AmountError::Invalid("payment_method"));
+        };
+        if supported.currency != currency {
+            return Err(AmountError::Invalid("payment_method"));
+        }
+        let kind = PaymentKind::parse(&supported.kind).ok_or(AmountError::Invalid("kind"))?;
+        methods.push(PaymentMethod {
+            id: supported.id.clone(),
+            kind: kind.as_str().to_string(),
+            label: supported.label.clone(),
+            currency: supported.currency.clone(),
+        });
+    }
+    Ok(methods)
+}
+
+fn payment_text(value: &str, field: &'static str) -> Result<String, AmountError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > PAYMENT_TEXT_MAX {
+        return Err(AmountError::Invalid(field));
+    }
+    Ok(value.to_string())
 }
 
 pub fn validate_take(
@@ -126,6 +167,7 @@ pub fn i64_from_shannons(value: u128) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{PaymentMethodInput, SupportedPaymentMethod};
 
     #[test]
     fn converts_whole_ckb() {
@@ -161,9 +203,43 @@ mod tests {
 
     #[test]
     fn new_order_requires_positive_book() {
-        assert!(validate_new_order("10", "1500", "1000", "9000", "NGN", "bank", "pk").is_ok());
-        assert!(validate_new_order("0", "1500", "1000", "9000", "NGN", "bank", "pk").is_err());
-        assert!(validate_new_order("10", "1500", "9000", "1000", "NGN", "bank", "pk").is_err());
+        assert!(validate_new_order("10", "1500", "1000", "9000", "NGN", "pk").is_ok());
+        assert!(validate_new_order("0", "1500", "1000", "9000", "NGN", "pk").is_err());
+        assert!(validate_new_order("10", "1500", "9000", "1000", "NGN", "pk").is_err());
+    }
+
+    fn catalog() -> Vec<SupportedPaymentMethod> {
+        vec![
+            SupportedPaymentMethod {
+                id: "gtbank".into(),
+                kind: "bank".into(),
+                label: "GTBank".into(),
+                currency: "NGN".into(),
+            },
+            SupportedPaymentMethod {
+                id: "zelle".into(),
+                kind: "wallet".into(),
+                label: "Zelle".into(),
+                currency: "USD".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_post_accepts_only_methods_in_its_currency() {
+        let catalog = catalog();
+        let bank = PaymentMethodInput::new("gtbank");
+        let sell = payment_methods_for_order("NGN", &[bank], &catalog).unwrap();
+        assert_eq!(sell[0].label, "GTBank");
+        assert_eq!(sell[0].currency, "NGN");
+        let wallet = PaymentMethodInput::new("zelle");
+        let buy = payment_methods_for_order("USD", &[wallet], &catalog).unwrap();
+        assert_eq!(buy[0].kind, "wallet");
+        assert_eq!(buy[0].currency, "USD");
+        let wrong_currency = PaymentMethodInput::new("zelle");
+        assert!(payment_methods_for_order("NGN", &[wrong_currency], &catalog).is_err());
+        let unknown = PaymentMethodInput::new("paypal");
+        assert!(payment_methods_for_order("USD", &[unknown], &catalog).is_err());
     }
 }
 
@@ -176,7 +252,7 @@ pub(crate) mod support {
     use crate::fiber::{HttpFiber, InvoiceInfo, InvoiceRpc, NodeRpc};
     use crate::{
         CANT_DO, Envelope, FIAT_SENT, FiatSentPayload, NEW_ORDER, NewOrderPayload, Outbound,
-        PAY_INVOICE, PayInvoicePayload, TAKE, TakePayload,
+        PAY_INVOICE, PayInvoicePayload, PaymentMethodInput, TAKE, TakePayload,
     };
     use std::env;
     use std::sync::Arc;
@@ -241,7 +317,7 @@ pub(crate) mod support {
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_method: "bank".into(),
+                        payment_methods: vec![PaymentMethodInput::new("gtbank")],
                     })
                     .unwrap(),
             )
@@ -259,6 +335,14 @@ pub(crate) mod support {
         order_id: &str,
         fiber_pubkey: &str,
     ) -> (String, String, String) {
+        let method_id = engine
+            .db
+            .get_order(order_id)
+            .unwrap()
+            .unwrap()
+            .payment_methods[0]
+            .id
+            .clone();
         let outbound = engine
             .handle(
                 buyer,
@@ -267,6 +351,7 @@ pub(crate) mod support {
                         order_id: order_id.into(),
                         fiat_amount: "1000".into(),
                         fiber_pubkey: fiber_pubkey.into(),
+                        payment_method_id: method_id,
                     })
                     .unwrap(),
             )

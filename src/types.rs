@@ -116,6 +116,29 @@ pub enum Side {
     Buy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentKind {
+    Bank,
+    Wallet,
+}
+
+impl PaymentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bank => "bank",
+            Self::Wallet => "wallet",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bank" => Some(Self::Bank),
+            "wallet" => Some(Self::Wallet),
+            _ => None,
+        }
+    }
+}
+
 impl Side {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -273,16 +296,70 @@ pub struct NewOrderPayload {
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
-    pub payment_method: String,
+    /// Ids from the daemon catalog. A sell post and a buy post both name methods.
+    /// Account details are shared in the client chat.
+    pub payment_methods: Vec<PaymentMethodInput>,
+}
+
+/// A payment method this daemon accepts. The coordinator adds or removes
+/// entries in `SUPPORTED_PAYMENT_METHODS`. `id` is stable. `kind` is `bank`
+/// or `wallet`. `currency` is an ISO 4217 code, such as `NGN` or `USD`.
+pub struct ConfiguredPaymentMethod {
+    pub id: &'static str,
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub currency: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedPaymentMethod {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentMethodInput {
+    pub method_id: String,
+}
+
+impl PaymentMethodInput {
+    pub fn new(method_id: &str) -> Self {
+        Self {
+            method_id: method_id.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentMethod {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub currency: String,
+}
+
+impl PaymentMethod {
+    pub fn public(&self) -> PublicPaymentMethod {
+        PublicPaymentMethod {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            label: self.label.clone(),
+            currency: self.currency.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Someone joining a post. `fiber_pubkey` is the taker's Fiber key.
 /// On a sell post the taker buys CKB. On a buy post the taker sells CKB.
+/// `payment_method_id` is one method named on the post.
 pub struct TakePayload {
     pub order_id: String,
     pub fiat_amount: String,
     pub fiber_pubkey: String,
+    pub payment_method_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +410,14 @@ pub enum Outbound {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicPaymentMethod {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicOrder {
     pub order_id: String,
     pub side: String,
@@ -343,8 +428,31 @@ pub struct PublicOrder {
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
-    pub payment_method: String,
+    pub payment_methods: Vec<PublicPaymentMethod>,
     pub hold_hours: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingFiatPayload {
+    pub fiat_amount: String,
+    pub fiat_currency: String,
+    pub reference: String,
+    pub kind: String,
+    pub label: String,
+    pub currency: String,
+}
+
+impl WaitingFiatPayload {
+    pub fn from_trade(trade: &Trade, fiat_currency: &str) -> Self {
+        Self {
+            fiat_amount: trade.fiat_amount.clone(),
+            fiat_currency: fiat_currency.to_string(),
+            reference: trade.id.clone(),
+            kind: trade.payment_kind.clone(),
+            label: trade.payment_label.clone(),
+            currency: trade.payment_currency.clone(),
+        }
+    }
 }
 
 pub struct Order {
@@ -357,7 +465,7 @@ pub struct Order {
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
-    pub payment_method: String,
+    pub payment_methods: Vec<PaymentMethod>,
     pub status: String,
     pub hold_secs: u64,
 }
@@ -374,7 +482,12 @@ impl Order {
             price_per_ckb: self.price_per_ckb.clone(),
             min: self.min.clone(),
             max: self.max.clone(),
-            payment_method: self.payment_method.clone(),
+            payment_methods: self
+                .payment_methods
+                .iter()
+                .filter(|method| method.currency == self.fiat_currency.trim())
+                .map(PaymentMethod::public)
+                .collect(),
             hold_hours: self.hold_secs / 3_600,
         }
     }
@@ -400,6 +513,10 @@ pub struct Trade {
     pub payout_payment_hash: Option<String>,
     /// Unix seconds when the hold invoice became `Received`.
     pub hold_received_at: Option<i64>,
+    pub payment_method_id: String,
+    pub payment_kind: String,
+    pub payment_label: String,
+    pub payment_currency: String,
 }
 
 impl Trade {
@@ -423,7 +540,7 @@ mod tests {
                 price_per_ckb: "1500".into(),
                 min: "1000".into(),
                 max: "5000".into(),
-                payment_method: "bank".into(),
+                payment_methods: vec![PaymentMethodInput::new("gtbank")],
             })
             .unwrap();
         let json = serde_json::to_string(&env).unwrap();
@@ -440,6 +557,9 @@ mod tests {
         assert_eq!(sell.public().maker_nostr_pubkey, "seller");
         assert_eq!(sell.public().maker_fiber_pubkey, "fiber-seller");
         assert_eq!(sell.public().hold_hours, 16);
+        let published = serde_json::to_string(&sell.public()).unwrap();
+        assert!(published.contains("GTBank"));
+        assert!(published.contains("NGN"));
         let buy = sample_order("buy", "buyer", "fiber-buyer");
         assert_eq!(buy.public().side, "buy");
         assert_eq!(buy.public().maker_nostr_pubkey, "buyer");
@@ -459,7 +579,12 @@ mod tests {
             price_per_ckb: "1".into(),
             min: "1".into(),
             max: "2".into(),
-            payment_method: "bank".into(),
+            payment_methods: vec![PaymentMethod {
+                id: "gtbank".into(),
+                kind: "bank".into(),
+                label: "GTBank".into(),
+                currency: "NGN".into(),
+            }],
             status: "open".into(),
             hold_secs: 16 * 3_600,
         }

@@ -5,8 +5,8 @@ use crate::types::{Order, Trade};
 use crate::{
     Actor, CANCELED, CANT_DO, CantDoPayload, ClientAction, Decision, EXPIRED, Envelope,
     FIBER_POLL_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound, Phase, REFUNDING,
-    SETTLED, WAITING_FIAT, apply_clock, apply_expired, apply_hold_received, apply_release_failed,
-    apply_release_succeeded, trade_actor,
+    SETTLED, WAITING_FIAT, WaitingFiatPayload, apply_clock, apply_expired, apply_hold_received,
+    apply_release_failed, apply_release_succeeded, trade_actor,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
@@ -203,7 +203,12 @@ impl<F: FiberRpc + 'static> Engine<F> {
                         .set_hold_received(&trade.id, next.as_str(), unix_now())?;
                     Ok(party_replies(
                         &trade,
-                        Envelope::new(WAITING_FIAT).with_trade(&trade.id),
+                        Envelope::new(WAITING_FIAT)
+                            .with_trade(&trade.id)
+                            .with_payload(WaitingFiatPayload::from_trade(
+                                &trade,
+                                &order.fiat_currency,
+                            ))?,
                     ))
                 }
                 other => bail!("invalid hold received: {other:?}"),
@@ -575,8 +580,8 @@ mod tests {
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
         FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus, PAY_INVOICE,
-        PAYMENT_WINDOW_SECS, REFUNDING, RELEASE, RESOLVE, ResolvePayload, SETTLED, TAKE,
-        TakePayload, WAITING_FIAT,
+        PAYMENT_WINDOW_SECS, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE, RESOLVE,
+        ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
@@ -693,7 +698,12 @@ mod tests {
             price_per_ckb: "1000".into(),
             min: "1000".into(),
             max: "10000".into(),
-            payment_method: "bank".into(),
+            payment_methods: vec![PaymentMethod {
+                id: "gtbank".into(),
+                kind: "bank".into(),
+                label: "GTBank".into(),
+                currency: "NGN".into(),
+            }],
             status: OrderStatus::Open.as_str().into(),
             hold_secs: crate::HOLD_SECS,
         })
@@ -713,6 +723,10 @@ mod tests {
             payout_invoice: None,
             payout_payment_hash: None,
             hold_received_at: None,
+            payment_method_id: "gtbank".into(),
+            payment_kind: "bank".into(),
+            payment_label: "GTBank".into(),
+            payment_currency: "NGN".into(),
         })
         .unwrap();
         db.insert_preimage("hash", "preimage").unwrap();
@@ -725,6 +739,18 @@ mod tests {
         let (engine, fiber) = fake_engine("Received");
         let waiting = engine.on_hold_status("trade").await.unwrap();
         assert!(replies_contain(&waiting, WAITING_FIAT));
+        let details: WaitingFiatPayload = waiting
+            .iter()
+            .find_map(|item| match item {
+                Outbound::Reply { envelope, .. } if envelope.action == WAITING_FIAT => {
+                    Some(envelope.decode_payload().unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(details.label, "GTBank");
+        assert_eq!(details.currency, "NGN");
+        assert_eq!(details.reference, "trade");
         let trade = engine.db.get_trade("trade").unwrap().unwrap();
         assert!(trade.hold_received_at.is_some());
         engine
@@ -927,7 +953,7 @@ mod tests {
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_method: "bank".into(),
+                        payment_methods: vec![PaymentMethodInput::new("gtbank")],
                     })
                     .unwrap(),
             )
@@ -940,7 +966,12 @@ mod tests {
         assert_eq!(public.side, "sell");
         assert_eq!(public.maker_nostr_pubkey, "seller");
         assert_eq!(public.maker_fiber_pubkey, "fiber-seller");
+        let published = serde_json::to_string(public).unwrap();
+        assert!(published.contains("GTBank"));
+        assert_eq!(public.payment_methods[0].label, "GTBank");
+        assert_eq!(public.payment_methods[0].currency, "NGN");
         let order_id = public.order_id.clone();
+        let method_id = public.payment_methods[0].id.clone();
 
         let own = engine
             .handle(
@@ -950,6 +981,7 @@ mod tests {
                         order_id: order_id.clone(),
                         fiat_amount: "1000".into(),
                         fiber_pubkey: "fiber-seller".into(),
+                        payment_method_id: method_id.clone(),
                     })
                     .unwrap(),
             )
@@ -965,6 +997,7 @@ mod tests {
                         order_id,
                         fiat_amount: "1000".into(),
                         fiber_pubkey: "fiber-buyer".into(),
+                        payment_method_id: method_id,
                     })
                     .unwrap(),
             )
@@ -983,6 +1016,19 @@ mod tests {
         *fiber.status.lock().unwrap() = "Received".into();
         let waiting = engine.on_hold_status(&trade_id).await.unwrap();
         assert!(replies_contain(&waiting, WAITING_FIAT));
+        let details: WaitingFiatPayload = waiting
+            .iter()
+            .find_map(|item| match item {
+                Outbound::Reply { envelope, .. } if envelope.action == WAITING_FIAT => {
+                    Some(envelope.decode_payload().unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(details.reference, trade_id);
+        assert_eq!(details.kind, "bank");
+        assert_eq!(details.label, "GTBank");
+        assert_eq!(details.currency, "NGN");
 
         let seller_fiat = engine
             .handle(
@@ -1045,11 +1091,11 @@ mod tests {
                         side: "buy".into(),
                         fiber_pubkey: "fiber-buyer".into(),
                         available_ckb: "10".into(),
-                        fiat_currency: "NGN".into(),
+                        fiat_currency: "USD".into(),
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_method: "bank".into(),
+                        payment_methods: vec![PaymentMethodInput::new("zelle")],
                     })
                     .unwrap(),
             )
@@ -1060,7 +1106,10 @@ mod tests {
         };
         assert_eq!(public.side, "buy");
         assert_eq!(public.maker_nostr_pubkey, "buyer");
+        assert_eq!(public.payment_methods[0].kind, "wallet");
+        assert_eq!(public.payment_methods[0].currency, "USD");
         let order_id = public.order_id.clone();
+        let method_id = public.payment_methods[0].id.clone();
 
         let own = engine
             .handle(
@@ -1070,6 +1119,7 @@ mod tests {
                         order_id: order_id.clone(),
                         fiat_amount: "1000".into(),
                         fiber_pubkey: "fiber-buyer".into(),
+                        payment_method_id: method_id.clone(),
                     })
                     .unwrap(),
             )
@@ -1085,6 +1135,7 @@ mod tests {
                         order_id,
                         fiat_amount: "1000".into(),
                         fiber_pubkey: "fiber-seller".into(),
+                        payment_method_id: method_id,
                     })
                     .unwrap(),
             )
@@ -1104,10 +1155,23 @@ mod tests {
         assert_eq!(trade.seller_fiber, "fiber-seller");
         assert_eq!(trade.buyer_nostr, "buyer");
         assert_eq!(trade.buyer_fiber, "fiber-buyer");
+        assert_eq!(trade.payment_method_id, "zelle");
 
         *fiber.status.lock().unwrap() = "Received".into();
         let waiting = engine.on_hold_status(&trade_id).await.unwrap();
         assert!(replies_contain(&waiting, WAITING_FIAT));
+        let details: WaitingFiatPayload = waiting
+            .iter()
+            .find_map(|item| match item {
+                Outbound::Reply { envelope, .. } if envelope.action == WAITING_FIAT => {
+                    Some(envelope.decode_payload().unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(details.kind, "wallet");
+        assert_eq!(details.label, "Zelle");
+        assert_eq!(details.currency, "USD");
 
         let seller_fiat = engine
             .handle(
@@ -1174,7 +1238,7 @@ mod tests {
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_method: "bank".into(),
+                        payment_methods: vec![PaymentMethodInput::new("gtbank")],
                     })
                     .unwrap(),
             )
@@ -1201,11 +1265,11 @@ mod tests {
                         side: "buy".into(),
                         fiber_pubkey: "fiber-buyer".into(),
                         available_ckb: "10".into(),
-                        fiat_currency: "NGN".into(),
+                        fiat_currency: "USD".into(),
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_method: "bank".into(),
+                        payment_methods: vec![PaymentMethodInput::new("zelle")],
                     })
                     .unwrap(),
             )
@@ -1270,6 +1334,15 @@ mod tests {
         let ctx = TestContext::new().await;
         let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
         let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
+        let method_id = ctx
+            .engine
+            .db
+            .get_order(&order_id)
+            .unwrap()
+            .unwrap()
+            .payment_methods[0]
+            .id
+            .clone();
         let outbound = ctx
             .engine
             .handle(
@@ -1279,6 +1352,7 @@ mod tests {
                         order_id,
                         fiat_amount: "1000".into(),
                         fiber_pubkey: twine_pk,
+                        payment_method_id: method_id,
                     })
                     .unwrap(),
             )
