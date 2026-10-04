@@ -51,8 +51,9 @@ impl Db {
             "
             CREATE TABLE IF NOT EXISTS orders (
                 id TEXT PRIMARY KEY,
-                seller_nostr TEXT NOT NULL,
-                seller_fiber TEXT NOT NULL,
+                side TEXT NOT NULL,
+                maker_nostr TEXT NOT NULL,
+                maker_fiber TEXT NOT NULL,
                 available_shannons INTEGER NOT NULL,
                 fiat_currency TEXT NOT NULL,
                 price_per_ckb TEXT NOT NULL,
@@ -108,14 +109,15 @@ impl Db {
         let conn = self.conn.lock().expect("db");
         conn.execute(
             "INSERT INTO orders (
-                id, seller_nostr, seller_fiber,
+                id, side, maker_nostr, maker_fiber,
                 available_shannons, fiat_currency, price_per_ckb, min, max,
                 payment_method, status, hold_secs
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 order.id,
-                order.seller_nostr,
-                order.seller_fiber,
+                order.side,
+                order.maker_nostr,
+                order.maker_fiber,
                 i64_from_shannons(order.available_shannons)?,
                 order.fiat_currency,
                 order.price_per_ckb,
@@ -132,7 +134,7 @@ impl Db {
     pub fn get_order(&self, id: &str) -> Result<Option<Order>> {
         let conn = self.conn.lock().expect("db");
         let mut stmt = conn.prepare(
-            "SELECT id, seller_nostr, seller_fiber,
+            "SELECT id, side, maker_nostr, maker_fiber,
                     available_shannons, fiat_currency, price_per_ckb, min, max,
                     payment_method, status, hold_secs
              FROM orders WHERE id = ?1",
@@ -141,16 +143,17 @@ impl Db {
             .query_row(params![id], |row| {
                 Ok(Order {
                     id: row.get(0)?,
-                    seller_nostr: row.get(1)?,
-                    seller_fiber: row.get(2)?,
-                    available_shannons: read_shannons(row.get(3)?, 3)?,
-                    fiat_currency: row.get(4)?,
-                    price_per_ckb: row.get(5)?,
-                    min: row.get(6)?,
-                    max: row.get(7)?,
-                    payment_method: row.get(8)?,
-                    status: row.get(9)?,
-                    hold_secs: read_u64(row.get(10)?, 10)?,
+                    side: row.get(1)?,
+                    maker_nostr: row.get(2)?,
+                    maker_fiber: row.get(3)?,
+                    available_shannons: read_shannons(row.get(4)?, 4)?,
+                    fiat_currency: row.get(5)?,
+                    price_per_ckb: row.get(6)?,
+                    min: row.get(7)?,
+                    max: row.get(8)?,
+                    payment_method: row.get(9)?,
+                    status: row.get(10)?,
+                    hold_secs: read_u64(row.get(11)?, 11)?,
                 })
             })
             .optional()?;
@@ -530,8 +533,9 @@ mod tests {
     fn sample_order(available: u128) -> Order {
         Order {
             id: "order".into(),
-            seller_nostr: "seller".into(),
-            seller_fiber: "fiber".into(),
+            side: "sell".into(),
+            maker_nostr: "seller".into(),
+            maker_fiber: "fiber".into(),
             available_shannons: available,
             fiat_currency: "NGN".into(),
             price_per_ckb: "1000".into(),

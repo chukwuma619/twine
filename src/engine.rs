@@ -573,7 +573,7 @@ mod tests {
         take, wait_invoice_status,
     };
     use crate::{
-        CANCEL, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
+        CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
         FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus, PAY_INVOICE,
         PAYMENT_WINDOW_SECS, REFUNDING, RELEASE, RESOLVE, ResolvePayload, SETTLED, TAKE,
         TakePayload, WAITING_FIAT,
@@ -685,8 +685,9 @@ mod tests {
         let db = Arc::new(Db::open_in_memory().unwrap());
         db.insert_order(&Order {
             id: "order".into(),
-            seller_nostr: "seller".into(),
-            seller_fiber: "fiber-seller".into(),
+            side: "sell".into(),
+            maker_nostr: "seller".into(),
+            maker_fiber: "fiber-seller".into(),
             available_shannons: 1_000_000_000,
             fiat_currency: "NGN".into(),
             price_per_ckb: "1000".into(),
@@ -919,6 +920,7 @@ mod tests {
                 "seller",
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
+                        side: "sell".into(),
                         fiber_pubkey: "fiber-seller".into(),
                         available_ckb: "10".into(),
                         fiat_currency: "NGN".into(),
@@ -935,9 +937,25 @@ mod tests {
             panic!("expected a public order");
         };
         assert_eq!(public.hold_hours, 36);
-        assert_eq!(public.seller_nostr_pubkey, "seller");
-        assert_eq!(public.seller_fiber_pubkey, "fiber-seller");
+        assert_eq!(public.side, "sell");
+        assert_eq!(public.maker_nostr_pubkey, "seller");
+        assert_eq!(public.maker_fiber_pubkey, "fiber-seller");
         let order_id = public.order_id.clone();
+
+        let own = engine
+            .handle(
+                "seller",
+                Envelope::new(TAKE)
+                    .with_payload(TakePayload {
+                        order_id: order_id.clone(),
+                        fiat_amount: "1000".into(),
+                        fiber_pubkey: "fiber-seller".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&own).contains("your own order"));
 
         let taken = engine
             .handle(
@@ -1007,6 +1025,220 @@ mod tests {
             engine.db.get_trade(&trade_id).unwrap().unwrap().state,
             Phase::Releasing.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn the_seller_fills_a_buy_post() {
+        let fiber = Arc::new(FakeFiber {
+            status: StdMutex::new("Open".into()),
+            removed: StdMutex::new(false),
+            preimages: StdMutex::new(HashSet::new()),
+            payment_status: StdMutex::new("Inflight".into()),
+            parsed_amount: StdMutex::new(100_000_000),
+        });
+        let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber.clone(), None);
+        let posted = engine
+            .handle(
+                "buyer",
+                Envelope::new(NEW_ORDER)
+                    .with_payload(NewOrderPayload {
+                        side: "buy".into(),
+                        fiber_pubkey: "fiber-buyer".into(),
+                        available_ckb: "10".into(),
+                        fiat_currency: "NGN".into(),
+                        price_per_ckb: "1000".into(),
+                        min: "1000".into(),
+                        max: "10000".into(),
+                        payment_method: "bank".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let Outbound::PublicOrder(public) = &posted[0] else {
+            panic!("expected a public order");
+        };
+        assert_eq!(public.side, "buy");
+        assert_eq!(public.maker_nostr_pubkey, "buyer");
+        let order_id = public.order_id.clone();
+
+        let own = engine
+            .handle(
+                "buyer",
+                Envelope::new(TAKE)
+                    .with_payload(TakePayload {
+                        order_id: order_id.clone(),
+                        fiat_amount: "1000".into(),
+                        fiber_pubkey: "fiber-buyer".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&own).contains("your own order"));
+
+        let taken = engine
+            .handle(
+                "seller",
+                Envelope::new(TAKE)
+                    .with_payload(TakePayload {
+                        order_id,
+                        fiat_amount: "1000".into(),
+                        fiber_pubkey: "fiber-seller".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(reply_to(&taken, "seller", PAY_INVOICE));
+        assert!(reply_to(&taken, "buyer", PAY_INVOICE));
+        let trade_id = taken
+            .iter()
+            .find_map(|item| match item {
+                Outbound::Reply { envelope, .. } => envelope.trade_id.clone(),
+                _ => None,
+            })
+            .unwrap();
+        let trade = engine.db.get_trade(&trade_id).unwrap().unwrap();
+        assert_eq!(trade.seller_nostr, "seller");
+        assert_eq!(trade.seller_fiber, "fiber-seller");
+        assert_eq!(trade.buyer_nostr, "buyer");
+        assert_eq!(trade.buyer_fiber, "fiber-buyer");
+
+        *fiber.status.lock().unwrap() = "Received".into();
+        let waiting = engine.on_hold_status(&trade_id).await.unwrap();
+        assert!(replies_contain(&waiting, WAITING_FIAT));
+
+        let seller_fiat = engine
+            .handle(
+                "seller",
+                Envelope::new(FIAT_SENT)
+                    .with_trade(&trade_id)
+                    .with_payload(FiatSentPayload {
+                        invoice: "seller-invoice".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&seller_fiat).contains("buyer"));
+
+        let fiat = engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade(&trade_id)
+                    .with_payload(FiatSentPayload {
+                        invoice: "buyer-invoice".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(replies_contain(&fiat, FIAT_SENT_OK));
+
+        let buyer_release = engine
+            .handle("buyer", Envelope::new(RELEASE).with_trade(&trade_id))
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&buyer_release).contains("seller"));
+        engine
+            .handle("seller", Envelope::new(RELEASE).with_trade(&trade_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.db.get_trade(&trade_id).unwrap().unwrap().state,
+            Phase::Releasing.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_must_be_sell_or_buy() {
+        let fiber = Arc::new(FakeFiber {
+            status: StdMutex::new("Open".into()),
+            removed: StdMutex::new(false),
+            preimages: StdMutex::new(HashSet::new()),
+            payment_status: StdMutex::new("Inflight".into()),
+            parsed_amount: StdMutex::new(0),
+        });
+        let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber, None);
+        let rejected = engine
+            .handle(
+                "maker",
+                Envelope::new(NEW_ORDER)
+                    .with_payload(NewOrderPayload {
+                        side: "swap".into(),
+                        fiber_pubkey: "fiber".into(),
+                        available_ckb: "10".into(),
+                        fiat_currency: "NGN".into(),
+                        price_per_ckb: "1000".into(),
+                        min: "1000".into(),
+                        max: "10000".into(),
+                        payment_method: "bank".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&rejected).contains("sell or buy"));
+    }
+
+    #[tokio::test]
+    async fn only_the_poster_can_cancel_an_open_post() {
+        let fiber = Arc::new(FakeFiber {
+            status: StdMutex::new("Open".into()),
+            removed: StdMutex::new(false),
+            preimages: StdMutex::new(HashSet::new()),
+            payment_status: StdMutex::new("Inflight".into()),
+            parsed_amount: StdMutex::new(0),
+        });
+        let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber, None);
+        let posted = engine
+            .handle(
+                "buyer",
+                Envelope::new(NEW_ORDER)
+                    .with_payload(NewOrderPayload {
+                        side: "buy".into(),
+                        fiber_pubkey: "fiber-buyer".into(),
+                        available_ckb: "10".into(),
+                        fiat_currency: "NGN".into(),
+                        price_per_ckb: "1000".into(),
+                        min: "1000".into(),
+                        max: "10000".into(),
+                        payment_method: "bank".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let Outbound::PublicOrder(public) = &posted[0] else {
+            panic!("expected a public order");
+        };
+        let order_id = public.order_id.clone();
+        let stranger = engine
+            .handle(
+                "seller",
+                Envelope::new(CANCEL)
+                    .with_payload(crate::CancelPayload {
+                        order_id: Some(order_id.clone()),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&stranger).contains("poster"));
+        let canceled = engine
+            .handle(
+                "buyer",
+                Envelope::new(CANCEL)
+                    .with_payload(crate::CancelPayload {
+                        order_id: Some(order_id),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(replies_contain(&canceled, CANCELED));
     }
 
     fn reply_to(out: &[Outbound], to: &str, action: &str) -> bool {

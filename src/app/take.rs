@@ -2,7 +2,7 @@ use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Outbound, Trade};
 use crate::{
-    Envelope, PAY_INVOICE, PayInvoicePayload, Phase, TakePayload, apply_take, hex_bytes,
+    Envelope, PAY_INVOICE, PayInvoicePayload, Phase, Side, TakePayload, apply_take, hex_bytes,
     validate_take,
 };
 use anyhow::{Result, anyhow};
@@ -25,13 +25,16 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     if !order.is_open() {
         return Ok(vec![cant_do(sender, None, "order is not open")]);
     }
-    if sender == order.seller_nostr {
+    if sender == order.maker_nostr {
         return Ok(vec![cant_do(
             sender,
             None,
             "you cannot take your own order",
         )]);
     }
+    let Some(side) = Side::parse(&order.side) else {
+        return Ok(vec![cant_do(sender, None, "order side is invalid")]);
+    };
     let has_open = engine.db.open_trade_for_order(&order.id)?.is_some();
     match apply_take(Phase::Pending, has_open) {
         crate::Decision::Ok(Phase::WaitingHold) => {}
@@ -58,13 +61,28 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     let payment_hash = hex_bytes(hash.as_slice());
     let trade_id = Uuid::new_v4().to_string();
 
+    // A sell post offers CKB, so the poster locks. A buy post bids for CKB, so the taker locks.
+    let (seller_nostr, seller_fiber, buyer_nostr, buyer_fiber) = match side {
+        Side::Sell => (
+            order.maker_nostr.clone(),
+            order.maker_fiber.clone(),
+            sender.to_string(),
+            payload.fiber_pubkey,
+        ),
+        Side::Buy => (
+            sender.to_string(),
+            payload.fiber_pubkey,
+            order.maker_nostr.clone(),
+            order.maker_fiber.clone(),
+        ),
+    };
     let trade = Trade {
         id: trade_id.clone(),
         order_id: order.id.clone(),
-        seller_nostr: order.seller_nostr.clone(),
-        seller_fiber: order.seller_fiber.clone(),
-        buyer_nostr: sender.to_string(),
-        buyer_fiber: payload.fiber_pubkey,
+        seller_nostr,
+        seller_fiber,
+        buyer_nostr,
+        buyer_fiber,
         fiat_amount: payload.fiat_amount,
         shannons,
         state: Phase::WaitingHold.as_str().into(),

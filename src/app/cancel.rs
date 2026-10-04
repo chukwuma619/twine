@@ -28,7 +28,7 @@ pub(crate) async fn on_cancel<F: FiberRpc + 'static>(
     if engine.db.open_trade_for_order(&order.id)?.is_some() {
         return Ok(vec![cant_do(sender, None, "order has an open trade")]);
     }
-    let actor = order_actor(&order.seller_nostr, engine.solver.as_deref(), sender);
+    let actor = order_actor(&order.maker_nostr, engine.solver.as_deref(), sender);
     match apply_cancel(Phase::Pending, actor, None) {
         crate::Decision::Ok(Phase::Canceled) => {
             if let Err(error) = engine.db.cancel_order(&order.id) {

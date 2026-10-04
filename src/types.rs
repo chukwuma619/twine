@@ -111,9 +111,33 @@ impl OrderStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Sell,
+    Buy,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sell => "sell",
+            Self::Buy => "buy",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sell" => Some(Self::Sell),
+            "buy" => Some(Self::Buy),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Who is allowed to move an order or a trade.
-/// The seller posts the offer. The buyer takes it.
+/// The maker posted it. On a trade, seller and buyer are the CKB sides.
 pub enum Actor {
+    Maker,
     Seller,
     Buyer,
     Solver,
@@ -241,6 +265,8 @@ impl Envelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewOrderPayload {
+    /// `sell` or `buy`. A sell post offers CKB. A buy post bids for CKB.
+    pub side: String,
     pub fiber_pubkey: String,
     pub available_ckb: String,
     pub fiat_currency: String,
@@ -251,7 +277,8 @@ pub struct NewOrderPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// The buyer joining a seller's offer. `fiber_pubkey` is the buyer's Fiber key.
+/// Someone joining a post. `fiber_pubkey` is the taker's Fiber key.
+/// On a sell post the taker buys CKB. On a buy post the taker sells CKB.
 pub struct TakePayload {
     pub order_id: String,
     pub fiat_amount: String,
@@ -308,8 +335,9 @@ pub enum Outbound {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicOrder {
     pub order_id: String,
-    pub seller_nostr_pubkey: String,
-    pub seller_fiber_pubkey: String,
+    pub side: String,
+    pub maker_nostr_pubkey: String,
+    pub maker_fiber_pubkey: String,
     pub available_ckb: String,
     pub fiat_currency: String,
     pub price_per_ckb: String,
@@ -321,8 +349,9 @@ pub struct PublicOrder {
 
 pub struct Order {
     pub id: String,
-    pub seller_nostr: String,
-    pub seller_fiber: String,
+    pub side: String,
+    pub maker_nostr: String,
+    pub maker_fiber: String,
     pub available_shannons: u128,
     pub fiat_currency: String,
     pub price_per_ckb: String,
@@ -337,8 +366,9 @@ impl Order {
     pub fn public(&self) -> PublicOrder {
         PublicOrder {
             order_id: self.id.clone(),
-            seller_nostr_pubkey: self.seller_nostr.clone(),
-            seller_fiber_pubkey: self.seller_fiber.clone(),
+            side: self.side.clone(),
+            maker_nostr_pubkey: self.maker_nostr.clone(),
+            maker_fiber_pubkey: self.maker_fiber.clone(),
             available_ckb: shannons_to_ckb_string(self.available_shannons),
             fiat_currency: self.fiat_currency.clone(),
             price_per_ckb: self.price_per_ckb.clone(),
@@ -386,6 +416,7 @@ mod tests {
     fn envelope_roundtrip() {
         let env = Envelope::new(NEW_ORDER)
             .with_payload(NewOrderPayload {
+                side: "sell".into(),
                 fiber_pubkey: "pk".into(),
                 available_ckb: "10".into(),
                 fiat_currency: "NGN".into(),
@@ -403,11 +434,26 @@ mod tests {
     }
 
     #[test]
-    fn an_order_is_the_sellers_offer() {
-        let order = Order {
+    fn a_post_names_its_side_and_maker() {
+        let sell = sample_order("sell", "seller", "fiber-seller");
+        assert_eq!(sell.public().side, "sell");
+        assert_eq!(sell.public().maker_nostr_pubkey, "seller");
+        assert_eq!(sell.public().maker_fiber_pubkey, "fiber-seller");
+        assert_eq!(sell.public().hold_hours, 16);
+        let buy = sample_order("buy", "buyer", "fiber-buyer");
+        assert_eq!(buy.public().side, "buy");
+        assert_eq!(buy.public().maker_nostr_pubkey, "buyer");
+        assert_eq!(Side::parse("sell"), Some(Side::Sell));
+        assert_eq!(Side::parse("buy"), Some(Side::Buy));
+        assert_eq!(Side::parse("ask"), None);
+    }
+
+    fn sample_order(side: &str, maker: &str, fiber: &str) -> Order {
+        Order {
             id: "order".into(),
-            seller_nostr: "seller".into(),
-            seller_fiber: "fiber-seller".into(),
+            side: side.into(),
+            maker_nostr: maker.into(),
+            maker_fiber: fiber.into(),
             available_shannons: 1,
             fiat_currency: "NGN".into(),
             price_per_ckb: "1".into(),
@@ -416,8 +462,6 @@ mod tests {
             payment_method: "bank".into(),
             status: "open".into(),
             hold_secs: 16 * 3_600,
-        };
-        assert_eq!(order.public().seller_nostr_pubkey, "seller");
-        assert_eq!(order.public().hold_hours, 16);
+        }
     }
 }

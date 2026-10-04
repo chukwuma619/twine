@@ -1,10 +1,10 @@
 use crate::constant::{PAYMENT_WINDOW_SECS, SAFETY_SECS};
 use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
-/// The seller posted the order. Only they can cancel it before a buyer takes it.
-pub fn order_actor(seller: &str, solver: Option<&str>, sender: &str) -> Actor {
-    if sender == seller {
-        Actor::Seller
+/// The poster owns the order. Only they can cancel it before someone takes it.
+pub fn order_actor(maker: &str, solver: Option<&str>, sender: &str) -> Actor {
+    if sender == maker {
+        Actor::Maker
     } else if solver == Some(sender) {
         Actor::Solver
     } else {
@@ -148,8 +148,8 @@ pub fn apply_resolve(phase: Phase, actor: Actor, winner: Winner, has_invoice: bo
 pub fn apply_cancel(phase: Phase, actor: Actor, invoice: Option<InvoiceStatus>) -> Decision {
     match phase {
         Phase::Pending => match actor {
-            Actor::Seller => Decision::Ok(Phase::Canceled),
-            _ => Decision::Reject("only the seller can cancel an open order"),
+            Actor::Maker => Decision::Ok(Phase::Canceled),
+            _ => Decision::Reject("only the poster can cancel an open order"),
         },
         Phase::WaitingHold => {
             if !matches!(actor, Actor::Seller | Actor::Buyer) {
@@ -275,11 +275,15 @@ mod tests {
     }
 
     #[test]
-    fn cancel_pending_is_the_seller() {
+    fn cancel_pending_is_the_poster() {
         assert_eq!(
-            apply_cancel(Phase::Pending, seller(), None),
+            apply_cancel(Phase::Pending, Actor::Maker, None),
             Decision::Ok(Phase::Canceled)
         );
+        assert!(matches!(
+            apply_cancel(Phase::Pending, seller(), None),
+            Decision::Reject(_)
+        ));
         assert!(matches!(
             apply_cancel(Phase::Pending, buyer(), None),
             Decision::Reject(_)
@@ -321,16 +325,16 @@ mod tests {
     }
 
     #[test]
-    fn order_actor_is_the_seller() {
+    fn order_actor_is_the_poster() {
         assert_eq!(
-            order_actor("seller", Some("solver"), "seller"),
-            Actor::Seller
+            order_actor("poster", Some("solver"), "poster"),
+            Actor::Maker
         );
         assert_eq!(
-            order_actor("seller", Some("solver"), "solver"),
+            order_actor("poster", Some("solver"), "solver"),
             Actor::Solver
         );
-        assert_eq!(order_actor("seller", Some("solver"), "buyer"), Actor::Other);
+        assert_eq!(order_actor("poster", Some("solver"), "other"), Actor::Other);
     }
 
     #[test]

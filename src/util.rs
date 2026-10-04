@@ -234,6 +234,7 @@ pub(crate) mod support {
                 seller,
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
+                        side: "sell".into(),
                         fiber_pubkey: fiber_pubkey.into(),
                         available_ckb: "10".into(),
                         fiat_currency: "NGN".into(),
