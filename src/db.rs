@@ -32,7 +32,7 @@ impl Db {
         let db = Self {
             conn: Mutex::new(conn),
         };
-        db.migrate()?;
+        db.create()?;
         Ok(db)
     }
 
@@ -40,11 +40,11 @@ impl Db {
         let db = Self {
             conn: Mutex::new(Connection::open_in_memory()?),
         };
-        db.migrate()?;
+        db.create()?;
         Ok(db)
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn create(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute("PRAGMA foreign_keys = ON", [])?;
         conn.execute_batch(
@@ -60,7 +60,7 @@ impl Db {
                 max TEXT NOT NULL,
                 payment_method TEXT NOT NULL,
                 status TEXT NOT NULL,
-                hold_secs INTEGER NOT NULL DEFAULT 129600
+                hold_secs INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS trades (
                 id TEXT PRIMARY KEY,
@@ -92,22 +92,6 @@ impl Db {
             );
             ",
         )?;
-        // Databases created before hold_received_at existed.
-        if let Err(error) =
-            conn.execute("ALTER TABLE trades ADD COLUMN hold_received_at INTEGER", [])
-        {
-            if !error.to_string().contains("duplicate column") {
-                return Err(error.into());
-            }
-        }
-        if let Err(error) = conn.execute(
-            "ALTER TABLE orders ADD COLUMN hold_secs INTEGER NOT NULL DEFAULT 129600",
-            [],
-        ) {
-            if !error.to_string().contains("duplicate column") {
-                return Err(error.into());
-            }
-        }
         Ok(())
     }
 
@@ -576,25 +560,6 @@ mod tests {
             payout_payment_hash: None,
             hold_received_at: None,
         }
-    }
-
-    #[test]
-    fn an_order_defaults_the_hold() {
-        let db = Db::open_in_memory().unwrap();
-        db.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO orders (
-                    id, seller_nostr, seller_fiber, available_shannons, fiat_currency,
-                    price_per_ckb, min, max, payment_method, status
-                ) VALUES ('order', 'seller', 'fiber', 1, 'NGN', '1', '1', '2', 'bank', 'open')",
-                [],
-            )
-            .unwrap();
-        let order = db.get_order("order").unwrap().unwrap();
-        assert_eq!(order.seller_nostr, "seller");
-        assert_eq!(order.hold_secs, 36 * 3_600);
     }
 
     #[test]

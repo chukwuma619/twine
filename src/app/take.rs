@@ -85,6 +85,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
             &payment_hash,
             &format!("twine {trade_id}"),
             order.hold_secs * 1_000,
+            crate::INVOICE_EXPIRY_SECS,
         )
         .await
     {

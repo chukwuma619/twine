@@ -1,5 +1,5 @@
 use super::{HttpFiber, InvoiceCreated, InvoiceInfo, ParsedInvoice};
-use crate::{FINAL_EXPIRY_DELTA_MS, HASH_ALGORITHM, INVOICE_EXPIRY_SECS, hex_u64, hex_u128};
+use crate::{HASH_ALGORITHM, hex_u64, hex_u128};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::json;
@@ -12,8 +12,14 @@ pub trait InvoiceRpc: Send + Sync {
         payment_hash: &str,
         description: &str,
         final_expiry_delta_ms: u64,
+        expiry_secs: u64,
     ) -> Result<InvoiceCreated>;
-    async fn new_payout_invoice(&self, amount: u128, description: &str) -> Result<InvoiceCreated>;
+    async fn new_payout_invoice(
+        &self,
+        amount: u128,
+        description: &str,
+        final_expiry_delta_ms: u64,
+    ) -> Result<InvoiceCreated>;
     async fn get_invoice(&self, payment_hash: &str) -> Result<InvoiceInfo>;
     async fn cancel_invoice(&self, payment_hash: &str) -> Result<InvoiceInfo>;
     async fn settle_invoice(&self, payment_hash: &str, preimage: &str) -> Result<()>;
@@ -28,6 +34,7 @@ impl InvoiceRpc for HttpFiber {
         payment_hash: &str,
         description: &str,
         final_expiry_delta_ms: u64,
+        expiry_secs: u64,
     ) -> Result<InvoiceCreated> {
         let result = self
             .call(
@@ -38,7 +45,7 @@ impl InvoiceRpc for HttpFiber {
                     "payment_hash": payment_hash,
                     "hash_algorithm": HASH_ALGORITHM,
                     "final_expiry_delta": hex_u64(final_expiry_delta_ms),
-                    "expiry": hex_u64(INVOICE_EXPIRY_SECS),
+                    "expiry": hex_u64(expiry_secs),
                     "description": description,
                 })),
             )
@@ -62,14 +69,19 @@ impl InvoiceRpc for HttpFiber {
         })
     }
 
-    async fn new_payout_invoice(&self, amount: u128, description: &str) -> Result<InvoiceCreated> {
+    async fn new_payout_invoice(
+        &self,
+        amount: u128,
+        description: &str,
+        final_expiry_delta_ms: u64,
+    ) -> Result<InvoiceCreated> {
         let result = self
             .call(
                 "new_invoice",
                 Some(json!({
                     "amount": hex_u128(amount),
                     "currency": self.currency,
-                    "final_expiry_delta": hex_u64(FINAL_EXPIRY_DELTA_MS),
+                    "final_expiry_delta": hex_u64(final_expiry_delta_ms),
                     "description": description,
                 })),
             )

@@ -1,7 +1,7 @@
 use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Order, Outbound};
-use crate::{Envelope, NewOrderPayload, OrderStatus, validate_hold_hours, validate_new_order};
+use crate::{Envelope, NewOrderPayload, OrderStatus, validate_new_order};
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -26,10 +26,6 @@ pub(crate) async fn on_new_order<F: FiberRpc + 'static>(
         Ok(value) => value,
         Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
     };
-    let hold_secs = match validate_hold_hours(payload.hold_hours) {
-        Ok(value) => value,
-        Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
-    };
     let order = Order {
         id: Uuid::new_v4().to_string(),
         seller_nostr: sender.to_string(),
@@ -41,7 +37,7 @@ pub(crate) async fn on_new_order<F: FiberRpc + 'static>(
         max: payload.max,
         payment_method: payload.payment_method,
         status: OrderStatus::Open.as_str().into(),
-        hold_secs,
+        hold_secs: crate::HOLD_SECS,
     };
     engine.db.insert_order(&order)?;
     Ok(vec![Outbound::PublicOrder(order.public())])

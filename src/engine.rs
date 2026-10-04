@@ -574,9 +574,9 @@ mod tests {
     };
     use crate::{
         CANCEL, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
-        FIAT_WINDOW_SECS, FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus,
-        PAY_INVOICE, REFUNDING, RELEASE, RESOLVE, ResolvePayload, SETTLED, TAKE, TakePayload,
-        WAITING_FIAT,
+        FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus, PAY_INVOICE,
+        PAYMENT_WINDOW_SECS, REFUNDING, RELEASE, RESOLVE, ResolvePayload, SETTLED, TAKE,
+        TakePayload, WAITING_FIAT,
     };
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
@@ -597,13 +597,14 @@ mod tests {
             payment_hash: &str,
             _: &str,
             _: u64,
+            _: u64,
         ) -> Result<InvoiceCreated> {
             Ok(InvoiceCreated {
                 invoice: format!("hold-{payment_hash}"),
                 payment_hash: payment_hash.to_string(),
             })
         }
-        async fn new_payout_invoice(&self, _: u128, _: &str) -> Result<InvoiceCreated> {
+        async fn new_payout_invoice(&self, _: u128, _: &str, _: u64) -> Result<InvoiceCreated> {
             bail!("unused")
         }
         async fn get_invoice(&self, payment_hash: &str) -> Result<InvoiceInfo> {
@@ -693,7 +694,7 @@ mod tests {
             max: "10000".into(),
             payment_method: "bank".into(),
             status: OrderStatus::Open.as_str().into(),
-            hold_secs: 36 * 3_600,
+            hold_secs: crate::HOLD_SECS,
         })
         .unwrap();
         db.insert_trade(&Trade {
@@ -727,7 +728,7 @@ mod tests {
         assert!(trade.hold_received_at.is_some());
         engine
             .db
-            .set_hold_received_at("trade", unix_now() - (FIAT_WINDOW_SECS as i64) - 1)
+            .set_hold_received_at("trade", unix_now() - (PAYMENT_WINDOW_SECS as i64) - 1)
             .unwrap();
         let refunding = engine.on_hold_status("trade").await.unwrap();
         assert!(replies_contain(&refunding, REFUNDING));
@@ -925,7 +926,6 @@ mod tests {
                         min: "1000".into(),
                         max: "10000".into(),
                         payment_method: "bank".into(),
-                        hold_hours: 36,
                     })
                     .unwrap(),
             )
@@ -1158,7 +1158,7 @@ mod tests {
 
         let payout = ctx
             .fiber
-            .new_payout_invoice(100_000_000, "twine buyer")
+            .new_payout_invoice(100_000_000, "twine buyer", crate::HOLD_SECS * 1_000)
             .await
             .unwrap();
         fiat_sent(&ctx.engine, "buyer", &trade_id, &payout.invoice).await;

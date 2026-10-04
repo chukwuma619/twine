@@ -1,35 +1,24 @@
 /// 1 CKB = 100_000_000 shannons.
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
-/// Shortest hold Fiber will create.
-pub const MIN_HOLD_HOURS: u64 = 16;
-
-/// Longest hold an order may set.
-/// A received hold cannot be canceled, so this is the longest a seller's coins
-/// can sit if the buyer never pays. 48 hours covers the 2-hour fiat window,
-/// the 18-hour dispute window, and a failed payout retry.
-pub const MAX_HOLD_HOURS: u64 = 48;
-
-/// Hold stored on orders created before the field existed.
-/// Also the TLC expiry on a payout invoice this node creates.
-pub const DEFAULT_HOLD_HOURS: u64 = 36;
+/// How long the seller's coins stay in the Fiber hold.
+/// Fiber accepts 16 to 48 hours. A received hold cannot be canceled, so this
+/// is also how long the coins can sit if the trade never finishes.
+pub const HOLD_HOURS: u64 = 36;
 
 pub const fn hold_secs(hours: u64) -> u64 {
     hours * 3_600
 }
 
-pub const FINAL_EXPIRY_DELTA_MS: u64 = hold_secs(DEFAULT_HOLD_HOURS) * 1_000;
+pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 
-/// Seconds the seller has to pay the hold invoice while it is still `Open`.
-pub const INVOICE_EXPIRY_SECS: u64 = 3_600;
+/// How long the buyer has to pay after the seller locks.
+pub const PAYMENT_WINDOW_SECS: u64 = 15 * 60;
 
-/// Seconds the buyer has to mark fiat sent after the hold is received.
-pub const FIAT_WINDOW_SECS: u64 = 2 * 3_600;
+/// How long an unpaid hold invoice stays open for the seller to lock.
+pub const INVOICE_EXPIRY_SECS: u64 = 60 * 60;
 
-/// Seconds the solver has to resolve a dispute after the fiat window closes.
-pub const DISPUTE_WINDOW_SECS: u64 = 18 * 3_600;
-
-/// Stop starting a payout this long before the Fiber timelock.
+/// Do not start a payout this close to the Fiber timelock.
 pub const SAFETY_SECS: u64 = 30 * 60;
 
 /// Routing-fee cap on `send_payment`, per thousand. Fiber's default is 5.

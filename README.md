@@ -1,6 +1,6 @@
 # Twine
 
-Peer-to-peer CKB market settled on Fiber. Fiat moves outside the protocol. The seller's coins sit in a Fiber hold invoice until the seller releases them, or until that hold expires and Fiber refunds the seller. Each order chooses the hold, from 16 hours to 48 hours.
+Peer-to-peer CKB market settled on Fiber. Fiat moves outside the protocol. The seller's coins sit in a Fiber hold invoice until the seller releases them, or until that hold expires and Fiber refunds the seller. After the seller locks, the buyer has 15 minutes to pay. A dispute stays open until the hold must be refunded.
 
 Twine coordinates the trade over Nostr. It never holds a user's Fiber key. Each trader runs their own `fnn`. The operator runs this daemon and one Twine Fiber node.
 

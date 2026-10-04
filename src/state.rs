@@ -1,4 +1,4 @@
-use crate::constant::{DISPUTE_WINDOW_SECS, FIAT_WINDOW_SECS, SAFETY_SECS};
+use crate::constant::{PAYMENT_WINDOW_SECS, SAFETY_SECS};
 use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
 /// The seller posted the order. Only they can cancel it before a buyer takes it.
@@ -26,21 +26,19 @@ pub fn trade_actor(seller: &str, buyer: &str, solver: Option<&str>, sender: &str
 }
 
 /// Last moment a payout or a buyer-wins resolution may start.
-/// A short hold ends the window before the dispute allowance does.
+/// After that the Fiber hold is too close to expiry, so the seller is refunded.
 pub fn action_deadline(received_at: i64, hold_secs: u64) -> i64 {
-    let fiber = received_at + hold_secs as i64 - SAFETY_SECS as i64;
-    let dispute = received_at + FIAT_WINDOW_SECS as i64 + DISPUTE_WINDOW_SECS as i64;
-    fiber.min(dispute)
+    received_at + hold_secs as i64 - SAFETY_SECS as i64
 }
 
 pub fn apply_clock(phase: Phase, now: i64, received_at: Option<i64>, hold_secs: u64) -> Decision {
     let Some(received_at) = received_at else {
         return Decision::NoOp;
     };
-    let fiat_end = received_at + FIAT_WINDOW_SECS as i64;
+    let payment_end = received_at + PAYMENT_WINDOW_SECS as i64;
     let action_end = action_deadline(received_at, hold_secs);
     match phase {
-        Phase::WaitingFiat if now >= fiat_end => Decision::Ok(Phase::Refunding),
+        Phase::WaitingFiat if now >= payment_end => Decision::Ok(Phase::Refunding),
         Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed if now >= action_end => {
             Decision::Ok(Phase::Refunding)
         }
@@ -189,6 +187,7 @@ pub fn apply_expired(phase: Phase) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constant::PAYMENT_WINDOW_SECS;
     use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
     fn seller() -> Actor {
@@ -351,15 +350,25 @@ mod tests {
     }
 
     #[test]
-    fn fiat_window_and_dispute_window_refund_without_settling() {
+    fn payment_window_and_hold_refund_without_settling() {
         let received = 1_000;
         let hold = 36 * 3_600;
         assert_eq!(
-            apply_clock(Phase::WaitingFiat, received + 7_199, Some(received), hold),
+            apply_clock(
+                Phase::WaitingFiat,
+                received + PAYMENT_WINDOW_SECS as i64 - 1,
+                Some(received),
+                hold
+            ),
             Decision::NoOp
         );
         assert_eq!(
-            apply_clock(Phase::WaitingFiat, received + 7_200, Some(received), hold),
+            apply_clock(
+                Phase::WaitingFiat,
+                received + PAYMENT_WINDOW_SECS as i64,
+                Some(received),
+                hold
+            ),
             Decision::Ok(Phase::Refunding)
         );
         let deadline = action_deadline(received, hold);

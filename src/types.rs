@@ -248,7 +248,6 @@ pub struct NewOrderPayload {
     pub min: String,
     pub max: String,
     pub payment_method: String,
-    pub hold_hours: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,7 +393,6 @@ mod tests {
                 min: "1000".into(),
                 max: "5000".into(),
                 payment_method: "bank".into(),
-                hold_hours: 36,
             })
             .unwrap();
         let json = serde_json::to_string(&env).unwrap();
