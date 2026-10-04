@@ -1,9 +1,24 @@
 /// 1 CKB = 100_000_000 shannons.
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
-/// Hold-invoice final TLC expiry. Fiber's minimum is 16 hours.
-/// 36 hours covers the fiat window, the dispute window, and a safety margin.
-pub const FINAL_EXPIRY_DELTA_MS: u64 = 36 * 3_600 * 1_000;
+/// Shortest hold Fiber will create.
+pub const MIN_HOLD_HOURS: u64 = 16;
+
+/// Longest hold an order may set.
+/// A received hold cannot be canceled, so this is the longest a seller's coins
+/// can sit if the buyer never pays. 48 hours covers the 2-hour fiat window,
+/// the 18-hour dispute window, and a failed payout retry.
+pub const MAX_HOLD_HOURS: u64 = 48;
+
+/// Hold stored on orders created before the field existed.
+/// Also the TLC expiry on a payout invoice this node creates.
+pub const DEFAULT_HOLD_HOURS: u64 = 36;
+
+pub const fn hold_secs(hours: u64) -> u64 {
+    hours * 3_600
+}
+
+pub const FINAL_EXPIRY_DELTA_MS: u64 = hold_secs(DEFAULT_HOLD_HOURS) * 1_000;
 
 /// Seconds the seller has to pay the hold invoice while it is still `Open`.
 pub const INVOICE_EXPIRY_SECS: u64 = 3_600;
@@ -38,12 +53,11 @@ pub const DEFAULT_DB_PATH: &str = "./twine.db";
 /// NIP-44 encrypted action or reply. The `p` tag is the recipient. Not a NIP.
 pub const KIND_ACTION: u16 = 4242;
 
-/// Public addressable sell order. The `d` tag is the order id. Not a NIP.
+/// Public addressable order. The `d` tag is the order id. Not a NIP.
 pub const KIND_ORDER: u16 = 31420;
 
 pub const NEW_ORDER: &str = "new-order";
-pub const TAKE_SELL: &str = "take-sell";
-pub const LOCKED: &str = "locked";
+pub const TAKE: &str = "take";
 pub const FIAT_SENT: &str = "fiat-sent";
 pub const RELEASE: &str = "release";
 pub const CANCEL: &str = "cancel";

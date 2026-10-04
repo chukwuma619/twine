@@ -4,11 +4,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use twine_daemon::db::Db;
-use twine_daemon::engine::{Engine, PollKind};
+use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{FiberRpc, HttpFiber, accept_node_pubkey};
 use twine_daemon::nostr::{action_filter, connect, decrypt_action, publish_outbounds, sender_hex};
-use twine_daemon::types::Outbound;
-use twine_daemon::{CANT_DO, ClientAction, Config, KIND_ACTION, Phase};
+use twine_daemon::{Config, KIND_ACTION, Phase};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,24 +35,10 @@ async fn main() -> Result<()> {
     let client = connect(&config.relays).await?;
 
     let polling = Arc::new(Mutex::new(HashSet::new()));
+    engine.bind_polls(client.clone(), keys.clone(), polling);
     let (holds, payouts) = engine.resume_trade_ids()?;
-    for trade_id in holds {
-        engine.spawn_poll(
-            PollKind::Hold,
-            client.clone(),
-            keys.clone(),
-            trade_id,
-            polling.clone(),
-        );
-    }
-    for trade_id in payouts {
-        engine.spawn_poll(
-            PollKind::Payout,
-            client.clone(),
-            keys.clone(),
-            trade_id,
-            polling.clone(),
-        );
+    for trade_id in holds.into_iter().chain(payouts) {
+        engine.watch(&trade_id)?;
     }
 
     client.subscribe(action_filter(keys.public_key())).await?;
@@ -84,45 +69,10 @@ async fn main() -> Result<()> {
             }
         };
         let sender = sender_hex(&event);
-        let action = envelope.client_action();
-        let trade_id = envelope.trade_id.clone();
         match engine.handle(&sender, envelope).await {
             Ok(outbound) => {
                 if let Err(error) = publish_outbounds(&client, &keys, &outbound).await {
                     warn!(%error, "publish failed");
-                }
-                let rejected = outbound.iter().any(|item| match item {
-                    Outbound::Reply { envelope, .. } => envelope.action == CANT_DO,
-                    _ => false,
-                });
-                match (action, trade_id, rejected) {
-                    (
-                        Some(
-                            ClientAction::Locked
-                            | ClientAction::FiatSent
-                            | ClientAction::Release
-                            | ClientAction::Dispute
-                            | ClientAction::Resolve,
-                        ),
-                        Some(trade_id),
-                        false,
-                    ) => {
-                        engine.spawn_poll(
-                            PollKind::Hold,
-                            client.clone(),
-                            keys.clone(),
-                            trade_id.clone(),
-                            polling.clone(),
-                        );
-                        engine.spawn_poll(
-                            PollKind::Payout,
-                            client.clone(),
-                            keys.clone(),
-                            trade_id,
-                            polling.clone(),
-                        );
-                    }
-                    _ => {}
                 }
             }
             Err(error) => warn!(%error, "handle failed"),

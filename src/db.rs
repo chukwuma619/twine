@@ -58,7 +58,9 @@ impl Db {
                 min TEXT NOT NULL,
                 max TEXT NOT NULL,
                 payment_method TEXT NOT NULL,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'sell',
+                hold_secs INTEGER NOT NULL DEFAULT 129600
             );
             CREATE TABLE IF NOT EXISTS trades (
                 id TEXT PRIMARY KEY,
@@ -96,6 +98,22 @@ impl Db {
                 return Err(error.into());
             }
         }
+        if let Err(error) = conn.execute(
+            "ALTER TABLE orders ADD COLUMN side TEXT NOT NULL DEFAULT 'sell'",
+            [],
+        ) {
+            if !error.to_string().contains("duplicate column") {
+                return Err(error.into());
+            }
+        }
+        if let Err(error) = conn.execute(
+            "ALTER TABLE orders ADD COLUMN hold_secs INTEGER NOT NULL DEFAULT 129600",
+            [],
+        ) {
+            if !error.to_string().contains("duplicate column") {
+                return Err(error.into());
+            }
+        }
         Ok(())
     }
 
@@ -113,19 +131,21 @@ impl Db {
         conn.execute(
             "INSERT INTO orders (
                 id, maker_nostr, maker_fiber, available_shannons, fiat_currency,
-                price_per_ckb, min, max, payment_method, status
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                price_per_ckb, min, max, payment_method, status, side, hold_secs
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 order.id,
                 order.maker_nostr,
                 order.maker_fiber,
                 i64_from_shannons(order.available_shannons)?,
-                order.fiat_currency_code,
+                order.fiat_currency,
                 order.price_per_ckb,
                 order.min,
                 order.max,
                 order.payment_method,
                 order.status,
+                order.side,
+                i64::try_from(order.hold_secs).context("hold does not fit sqlite integer")?,
             ],
         )?;
         Ok(())
@@ -135,7 +155,7 @@ impl Db {
         let conn = self.conn.lock().expect("db");
         let mut stmt = conn.prepare(
             "SELECT id, maker_nostr, maker_fiber, available_shannons, fiat_currency,
-                    price_per_ckb, min, max, payment_method, status
+                    price_per_ckb, min, max, payment_method, status, side, hold_secs
              FROM orders WHERE id = ?1",
         )?;
         let order = stmt
@@ -145,12 +165,14 @@ impl Db {
                     maker_nostr: row.get(1)?,
                     maker_fiber: row.get(2)?,
                     available_shannons: read_shannons(row.get(3)?, 3)?,
-                    fiat_currency_code: row.get(4)?,
+                    fiat_currency: row.get(4)?,
                     price_per_ckb: row.get(5)?,
                     min: row.get(6)?,
                     max: row.get(7)?,
                     payment_method: row.get(8)?,
                     status: row.get(9)?,
+                    side: row.get(10)?,
+                    hold_secs: read_u64(row.get(11)?, 11)?,
                 })
             })
             .optional()?;
@@ -480,6 +502,16 @@ fn add_available(conn: &Connection, order_id: &str, shannons: u128) -> Result<()
     Ok(())
 }
 
+fn read_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 fn read_shannons(value: i64, column: usize) -> rusqlite::Result<u128> {
     u128::try_from(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -514,15 +546,17 @@ mod tests {
     fn sample_order(available: u128) -> Order {
         Order {
             id: "order".into(),
+            side: "sell".into(),
             maker_nostr: "maker".into(),
             maker_fiber: "fiber".into(),
             available_shannons: available,
-            fiat_currency_code: "NGN".into(),
+            fiat_currency: "NGN".into(),
             price_per_ckb: "1000".into(),
             min: "1000".into(),
             max: "10000".into(),
             payment_method: "bank".into(),
             status: OrderStatus::Open.as_str().into(),
+            hold_secs: 36 * 3_600,
         }
     }
 
@@ -541,6 +575,25 @@ mod tests {
             payout_payment_hash: None,
             hold_received_at: None,
         }
+    }
+
+    #[test]
+    fn an_order_without_a_side_is_a_sell() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO orders (
+                    id, maker_nostr, maker_fiber, available_shannons, fiat_currency,
+                    price_per_ckb, min, max, payment_method, status
+                ) VALUES ('order', 'maker', 'fiber', 1, 'NGN', '1', '1', '2', 'bank', 'open')",
+                [],
+            )
+            .unwrap();
+        let order = db.get_order("order").unwrap().unwrap();
+        assert_eq!(order.side, "sell");
+        assert_eq!(order.hold_secs, 36 * 3_600);
     }
 
     #[test]

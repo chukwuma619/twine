@@ -1,4 +1,4 @@
-use crate::constant::SHANNONS_PER_CKB;
+use crate::constant::{MAX_HOLD_HOURS, MIN_HOLD_HOURS, SHANNONS_PER_CKB};
 use anyhow::{Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -83,6 +83,13 @@ pub fn validate_new_order(
     Ok(shannons)
 }
 
+pub fn validate_hold_hours(hours: u64) -> Result<u64, AmountError> {
+    if !(MIN_HOLD_HOURS..=MAX_HOLD_HOURS).contains(&hours) {
+        return Err(AmountError::Invalid("hold_hours"));
+    }
+    Ok(hours * 3_600)
+}
+
 pub fn validate_take(
     fiat_amount: &str,
     min: &str,
@@ -165,6 +172,14 @@ mod tests {
         assert!(validate_new_order("0", "1500", "1000", "9000", "NGN", "bank", "pk").is_err());
         assert!(validate_new_order("10", "1500", "9000", "1000", "NGN", "bank", "pk").is_err());
     }
+
+    #[test]
+    fn hold_hours_stay_inside_fibers_range() {
+        assert_eq!(validate_hold_hours(16).unwrap(), 16 * 3_600);
+        assert_eq!(validate_hold_hours(48).unwrap(), 48 * 3_600);
+        assert!(validate_hold_hours(15).is_err());
+        assert!(validate_hold_hours(49).is_err());
+    }
 }
 
 /// Live Fiber helpers for engine tests. A node must be running at `TWINE_RPC`.
@@ -176,7 +191,7 @@ pub(crate) mod support {
     use crate::fiber::{FiberRpc, HttpFiber, InvoiceInfo};
     use crate::{
         CANT_DO, Envelope, FIAT_SENT, FiatSentPayload, NEW_ORDER, NewOrderPayload, Outbound,
-        PAY_INVOICE, PayInvoicePayload, TAKE_SELL, TakeSellPayload,
+        PAY_INVOICE, PayInvoicePayload, TAKE, TakePayload,
     };
     use std::env;
     use std::sync::Arc;
@@ -230,13 +245,15 @@ pub(crate) mod support {
                 maker,
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
+                        side: "sell".into(),
                         fiber_pubkey: fiber_pubkey.into(),
                         available_ckb: "10".into(),
-                        fiat_currency_code: "NGN".into(),
+                        fiat_currency: "NGN".into(),
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
                         payment_method: "bank".into(),
+                        hold_hours: 36,
                     })
                     .unwrap(),
             )
@@ -257,8 +274,8 @@ pub(crate) mod support {
         let outbound = engine
             .handle(
                 taker,
-                Envelope::new(TAKE_SELL)
-                    .with_payload(TakeSellPayload {
+                Envelope::new(TAKE)
+                    .with_payload(TakePayload {
                         order_id: order_id.into(),
                         fiat_amount: "1000".into(),
                         taker_fiber_pubkey: taker_fiber_pubkey.into(),

@@ -1,11 +1,22 @@
-use crate::constant::{DISPUTE_WINDOW_SECS, FIAT_WINDOW_SECS, FINAL_EXPIRY_DELTA_MS, SAFETY_SECS};
+use crate::constant::{DISPUTE_WINDOW_SECS, FIAT_WINDOW_SECS, SAFETY_SECS};
 use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
-pub fn actor_of(maker: &str, taker: Option<&str>, solver: Option<&str>, sender: &str) -> Actor {
+pub fn actor_of(maker: &str, solver: Option<&str>, sender: &str) -> Actor {
     if sender == maker {
         Actor::Maker
-    } else if taker == Some(sender) {
-        Actor::Taker
+    } else if solver == Some(sender) {
+        Actor::Solver
+    } else {
+        Actor::Other
+    }
+}
+
+/// Seller locks and releases. Buyer marks fiat sent and names the payout invoice.
+pub fn trade_actor(seller: &str, buyer: &str, solver: Option<&str>, sender: &str) -> Actor {
+    if sender == seller {
+        Actor::Seller
+    } else if sender == buyer {
+        Actor::Buyer
     } else if solver == Some(sender) {
         Actor::Solver
     } else {
@@ -14,18 +25,19 @@ pub fn actor_of(maker: &str, taker: Option<&str>, solver: Option<&str>, sender: 
 }
 
 /// Last moment a payout or a buyer-wins resolution may start.
-pub fn action_deadline(received_at: i64) -> i64 {
-    let fiber = received_at + (FINAL_EXPIRY_DELTA_MS / 1000) as i64 - SAFETY_SECS as i64;
+/// A short hold ends the window before the dispute allowance does.
+pub fn action_deadline(received_at: i64, hold_secs: u64) -> i64 {
+    let fiber = received_at + hold_secs as i64 - SAFETY_SECS as i64;
     let dispute = received_at + FIAT_WINDOW_SECS as i64 + DISPUTE_WINDOW_SECS as i64;
     fiber.min(dispute)
 }
 
-pub fn apply_clock(phase: Phase, now: i64, received_at: Option<i64>) -> Decision {
+pub fn apply_clock(phase: Phase, now: i64, received_at: Option<i64>, hold_secs: u64) -> Decision {
     let Some(received_at) = received_at else {
         return Decision::NoOp;
     };
     let fiat_end = received_at + FIAT_WINDOW_SECS as i64;
-    let action_end = action_deadline(received_at);
+    let action_end = action_deadline(received_at, hold_secs);
     match phase {
         Phase::WaitingFiat if now >= fiat_end => Decision::Ok(Phase::Refunding),
         Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed if now >= action_end => {
@@ -45,14 +57,6 @@ pub fn apply_take(phase: Phase, has_open_trade: bool) -> Decision {
     }
 }
 
-pub fn apply_locked(phase: Phase, actor: Actor) -> Decision {
-    match (phase, actor) {
-        (Phase::WaitingHold, Actor::Maker) => Decision::NoOp,
-        (Phase::WaitingHold, _) => Decision::Reject("only the seller can lock"),
-        _ => Decision::Reject("lock is only valid while waiting for the hold"),
-    }
-}
-
 pub fn apply_hold_received(phase: Phase) -> Decision {
     match phase {
         Phase::WaitingHold => Decision::Ok(Phase::WaitingFiat),
@@ -62,20 +66,28 @@ pub fn apply_hold_received(phase: Phase) -> Decision {
 
 pub fn apply_fiat_sent(phase: Phase, actor: Actor) -> Decision {
     match (phase, actor) {
-        (Phase::WaitingFiat, Actor::Taker) => Decision::Ok(Phase::FiatSent),
-        (Phase::AwaitingInvoice, Actor::Taker) => Decision::Ok(Phase::Releasing),
-        (Phase::WaitingFiat | Phase::AwaitingInvoice, _) => {
+        (Phase::WaitingFiat, Actor::Buyer) => Decision::Ok(Phase::FiatSent),
+        (Phase::AwaitingInvoice, Actor::Buyer) => Decision::Ok(Phase::Releasing),
+        (Phase::Disputed, Actor::Buyer) => Decision::Ok(Phase::Disputed),
+        (Phase::WaitingFiat | Phase::AwaitingInvoice | Phase::Disputed, _) => {
             Decision::Reject("only the buyer can submit a payout invoice")
         }
-        _ => Decision::Reject("fiat-sent is only valid while waiting for fiat or a new invoice"),
+        _ => Decision::Reject(
+            "fiat-sent is only valid while waiting for fiat, a new invoice, or during a dispute",
+        ),
     }
 }
 
-pub fn apply_release(phase: Phase, actor: Actor) -> Decision {
+pub fn apply_release(phase: Phase, actor: Actor, has_invoice: bool) -> Decision {
     match (phase, actor) {
-        (Phase::FiatSent, Actor::Maker) => Decision::Ok(Phase::Releasing),
-        (Phase::FiatSent, _) => Decision::Reject("only the seller can release"),
-        _ => Decision::Reject("release is only valid after fiat-sent"),
+        (Phase::FiatSent | Phase::Disputed, Actor::Seller) if has_invoice => {
+            Decision::Ok(Phase::Releasing)
+        }
+        (Phase::FiatSent | Phase::Disputed, Actor::Seller) => {
+            Decision::Reject("payout invoice is required")
+        }
+        (Phase::FiatSent | Phase::Disputed, _) => Decision::Reject("only the seller can release"),
+        _ => Decision::Reject("release is only valid after fiat is sent or during a dispute"),
     }
 }
 
@@ -97,7 +109,7 @@ pub fn apply_dispute(phase: Phase, actor: Actor) -> Decision {
     match (phase, actor) {
         (
             Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice,
-            Actor::Maker | Actor::Taker,
+            Actor::Seller | Actor::Buyer,
         ) => Decision::Ok(Phase::Disputed),
         (Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice, _) => {
             Decision::Reject("only a party to the trade can dispute")
@@ -144,7 +156,7 @@ pub fn apply_cancel(phase: Phase, actor: Actor, invoice: Option<InvoiceStatus>) 
             }
         }
         Phase::WaitingHold => {
-            if !matches!(actor, Actor::Maker | Actor::Taker) {
+            if !matches!(actor, Actor::Seller | Actor::Buyer) {
                 return Decision::Reject("only a party to the trade can cancel");
             }
             match invoice {
@@ -185,8 +197,12 @@ mod tests {
         Actor::Maker
     }
 
-    fn taker() -> Actor {
-        Actor::Taker
+    fn seller() -> Actor {
+        Actor::Seller
+    }
+
+    fn buyer() -> Actor {
+        Actor::Buyer
     }
 
     #[test]
@@ -206,31 +222,17 @@ mod tests {
     }
 
     #[test]
-    fn locked_is_seller_only_and_duplicate_is_noop() {
-        assert_eq!(apply_locked(Phase::WaitingHold, maker()), Decision::NoOp);
-        assert_eq!(apply_locked(Phase::WaitingHold, maker()), Decision::NoOp);
-        assert!(matches!(
-            apply_locked(Phase::WaitingHold, taker()),
-            Decision::Reject(_)
-        ));
-        assert!(matches!(
-            apply_locked(Phase::WaitingFiat, maker()),
-            Decision::Reject(_)
-        ));
-    }
-
-    #[test]
-    fn fiat_sent_is_taker_only_in_waiting_fiat() {
+    fn fiat_sent_is_buyer_only() {
         assert_eq!(
-            apply_fiat_sent(Phase::WaitingFiat, taker()),
+            apply_fiat_sent(Phase::WaitingFiat, buyer()),
             Decision::Ok(Phase::FiatSent)
         );
         assert!(matches!(
-            apply_fiat_sent(Phase::WaitingFiat, maker()),
+            apply_fiat_sent(Phase::WaitingFiat, seller()),
             Decision::Reject(_)
         ));
         assert!(matches!(
-            apply_fiat_sent(Phase::WaitingHold, taker()),
+            apply_fiat_sent(Phase::WaitingHold, buyer()),
             Decision::Reject(_)
         ));
     }
@@ -238,7 +240,7 @@ mod tests {
     #[test]
     fn release_then_failed_payout_waits_for_a_new_invoice() {
         assert_eq!(
-            apply_release(Phase::FiatSent, maker()),
+            apply_release(Phase::FiatSent, seller(), true),
             Decision::Ok(Phase::Releasing)
         );
         assert_eq!(
@@ -246,7 +248,7 @@ mod tests {
             Decision::Ok(Phase::AwaitingInvoice)
         );
         assert_eq!(
-            apply_fiat_sent(Phase::AwaitingInvoice, taker()),
+            apply_fiat_sent(Phase::AwaitingInvoice, buyer()),
             Decision::Ok(Phase::Releasing)
         );
         assert_eq!(
@@ -254,9 +256,29 @@ mod tests {
             Decision::Ok(Phase::Settled)
         );
         assert!(matches!(
-            apply_release(Phase::FiatSent, taker()),
+            apply_release(Phase::FiatSent, buyer(), true),
             Decision::Reject(_)
         ));
+    }
+
+    #[test]
+    fn seller_can_release_during_a_dispute_when_the_buyer_named_an_invoice() {
+        assert_eq!(
+            apply_release(Phase::Disputed, seller(), true),
+            Decision::Ok(Phase::Releasing)
+        );
+        assert_eq!(
+            apply_release(Phase::Disputed, seller(), false),
+            Decision::Reject("payout invoice is required")
+        );
+        assert!(matches!(
+            apply_release(Phase::Disputed, buyer(), true),
+            Decision::Reject(_)
+        ));
+        assert_eq!(
+            apply_fiat_sent(Phase::Disputed, buyer()),
+            Decision::Ok(Phase::Disputed)
+        );
     }
 
     #[test]
@@ -266,7 +288,7 @@ mod tests {
             Decision::Ok(Phase::Canceled)
         );
         assert!(matches!(
-            apply_cancel(Phase::Pending, taker(), None),
+            apply_cancel(Phase::Pending, Actor::Other, None),
             Decision::Reject(_)
         ));
     }
@@ -274,19 +296,19 @@ mod tests {
     #[test]
     fn cancel_waiting_hold_requires_an_open_invoice() {
         assert_eq!(
-            apply_cancel(Phase::WaitingHold, taker(), Some(InvoiceStatus::Open)),
+            apply_cancel(Phase::WaitingHold, buyer(), Some(InvoiceStatus::Open)),
             Decision::Ok(Phase::Canceled)
         );
         assert!(matches!(
-            apply_cancel(Phase::WaitingHold, taker(), None),
+            apply_cancel(Phase::WaitingHold, buyer(), None),
             Decision::Reject(_)
         ));
         assert_eq!(
-            apply_cancel(Phase::WaitingHold, maker(), Some(InvoiceStatus::Received)),
+            apply_cancel(Phase::WaitingHold, seller(), Some(InvoiceStatus::Received)),
             Decision::Reject("hold is locked; wait for the timelock")
         );
         assert_eq!(
-            apply_cancel(Phase::WaitingFiat, maker(), Some(InvoiceStatus::Received)),
+            apply_cancel(Phase::WaitingFiat, seller(), Some(InvoiceStatus::Received)),
             Decision::Reject("hold is locked; wait for the timelock")
         );
     }
@@ -302,35 +324,63 @@ mod tests {
     }
 
     #[test]
-    fn actor_of_matches_maker_taker_and_solver() {
-        assert_eq!(actor_of("m", Some("t"), Some("s"), "m"), Actor::Maker);
-        assert_eq!(actor_of("m", Some("t"), Some("s"), "t"), Actor::Taker);
-        assert_eq!(actor_of("m", Some("t"), Some("s"), "s"), Actor::Solver);
-        assert_eq!(actor_of("m", Some("t"), Some("s"), "x"), Actor::Other);
+    fn actor_of_matches_maker_and_solver() {
+        assert_eq!(actor_of("m", Some("s"), "m"), Actor::Maker);
+        assert_eq!(actor_of("m", Some("s"), "s"), Actor::Solver);
+        assert_eq!(actor_of("m", Some("s"), "x"), Actor::Other);
+    }
+
+    #[test]
+    fn trade_actor_names_seller_and_buyer() {
+        assert_eq!(
+            trade_actor("maker", "taker", Some("s"), "maker"),
+            Actor::Seller
+        );
+        assert_eq!(
+            trade_actor("maker", "taker", Some("s"), "taker"),
+            Actor::Buyer
+        );
+        assert_eq!(
+            trade_actor("taker", "maker", Some("s"), "taker"),
+            Actor::Seller
+        );
+        assert_eq!(
+            trade_actor("taker", "maker", Some("s"), "maker"),
+            Actor::Buyer
+        );
+        assert_eq!(trade_actor("taker", "maker", Some("s"), "s"), Actor::Solver);
     }
 
     #[test]
     fn fiat_window_and_dispute_window_refund_without_settling() {
         let received = 1_000;
+        let hold = 36 * 3_600;
         assert_eq!(
-            apply_clock(Phase::WaitingFiat, received + 7_199, Some(received)),
+            apply_clock(Phase::WaitingFiat, received + 7_199, Some(received), hold),
             Decision::NoOp
         );
         assert_eq!(
-            apply_clock(Phase::WaitingFiat, received + 7_200, Some(received)),
+            apply_clock(Phase::WaitingFiat, received + 7_200, Some(received), hold),
             Decision::Ok(Phase::Refunding)
         );
-        let deadline = action_deadline(received);
+        let deadline = action_deadline(received, hold);
         assert_eq!(
-            apply_clock(Phase::Disputed, deadline - 1, Some(received)),
+            apply_clock(Phase::Disputed, deadline - 1, Some(received), hold),
             Decision::NoOp
         );
         assert_eq!(
-            apply_clock(Phase::Disputed, deadline, Some(received)),
+            apply_clock(Phase::Disputed, deadline, Some(received), hold),
             Decision::Ok(Phase::Refunding)
         );
         assert_eq!(
-            apply_clock(Phase::AwaitingInvoice, deadline, Some(received)),
+            apply_clock(Phase::AwaitingInvoice, deadline, Some(received), hold),
+            Decision::Ok(Phase::Refunding)
+        );
+        let short = 16 * 3_600;
+        let short_deadline = action_deadline(received, short);
+        assert!(short_deadline < deadline);
+        assert_eq!(
+            apply_clock(Phase::Disputed, short_deadline, Some(received), short),
             Decision::Ok(Phase::Refunding)
         );
     }
@@ -338,11 +388,11 @@ mod tests {
     #[test]
     fn dispute_and_resolve() {
         assert_eq!(
-            apply_dispute(Phase::WaitingFiat, taker()),
+            apply_dispute(Phase::WaitingFiat, buyer()),
             Decision::Ok(Phase::Disputed)
         );
         assert_eq!(
-            apply_dispute(Phase::FiatSent, maker()),
+            apply_dispute(Phase::FiatSent, seller()),
             Decision::Ok(Phase::Disputed)
         );
         assert!(matches!(
@@ -362,7 +412,7 @@ mod tests {
             Decision::Reject("payout invoice is required")
         );
         assert!(matches!(
-            apply_resolve(Phase::Disputed, maker(), Winner::Seller, true),
+            apply_resolve(Phase::Disputed, seller(), Winner::Seller, true),
             Decision::Reject(_)
         ));
     }

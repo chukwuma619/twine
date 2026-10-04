@@ -1,7 +1,6 @@
 use crate::constant::{
-    CANCEL, CANCELED, CANT_DO, DISPUTE, DISPUTED, EXPIRED, FIAT_SENT, FIAT_SENT_OK, LOCKED,
-    NEW_INVOICE, NEW_ORDER, PAY_INVOICE, REFUNDING, RELEASE, RESOLVE, SETTLED, TAKE_SELL,
-    WAITING_FIAT,
+    CANCEL, CANCELED, CANT_DO, DISPUTE, DISPUTED, EXPIRED, FIAT_SENT, FIAT_SENT_OK, NEW_INVOICE,
+    NEW_ORDER, PAY_INVOICE, REFUNDING, RELEASE, RESOLVE, SETTLED, TAKE, WAITING_FIAT,
 };
 use crate::util::shannons_to_ckb_string;
 use anyhow::{Result, anyhow};
@@ -116,11 +115,43 @@ impl OrderStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Who is allowed to move a trade. `Maker` is only the order owner, for canceling
+/// an ad that has no trade yet. Once a trade exists, actions follow `Seller` and
+/// `Buyer`, which swap with the order side.
 pub enum Actor {
     Maker,
-    Taker,
+    Seller,
+    Buyer,
     Solver,
     Other,
+}
+
+/// A sell offers CKB. A buy offers fiat and asks for CKB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "buy" => Some(Self::Buy),
+            "sell" => Some(Self::Sell),
+            _ => None,
+        }
+    }
+}
+
+fn default_order_side() -> String {
+    Side::Sell.as_str().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,8 +186,7 @@ pub enum Decision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientAction {
     NewOrder,
-    TakeSell,
-    Locked,
+    Take,
     FiatSent,
     Release,
     Cancel,
@@ -209,8 +239,7 @@ impl Envelope {
     pub fn client_action(&self) -> Option<ClientAction> {
         match self.action.as_str() {
             NEW_ORDER => Some(ClientAction::NewOrder),
-            TAKE_SELL => Some(ClientAction::TakeSell),
-            LOCKED => Some(ClientAction::Locked),
+            TAKE => Some(ClientAction::Take),
             FIAT_SENT => Some(ClientAction::FiatSent),
             RELEASE => Some(ClientAction::Release),
             CANCEL => Some(ClientAction::Cancel),
@@ -246,17 +275,22 @@ impl Envelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewOrderPayload {
+    /// `buy` or `sell`. Omitted means `sell`.
+    #[serde(default = "default_order_side")]
+    pub side: String,
     pub fiber_pubkey: String,
     pub available_ckb: String,
-    pub fiat_currency_code: String,
+    pub fiat_currency: String,
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
     pub payment_method: String,
+    pub hold_hours: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TakeSellPayload {
+/// Works for a buy or a sell. The order's `side` decides who locks.
+pub struct TakePayload {
     pub order_id: String,
     pub fiat_amount: String,
     pub taker_fiber_pubkey: String,
@@ -312,41 +346,67 @@ pub enum Outbound {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicOrder {
     pub order_id: String,
+    pub side: String,
     pub maker_nostr_pubkey: String,
     pub maker_fiber_pubkey: String,
     pub available_ckb: String,
-    pub fiat_currency_code: String,
+    pub fiat_currency: String,
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
     pub payment_method: String,
+    pub hold_hours: u64,
 }
 
 pub struct Order {
     pub id: String,
+    pub side: String,
     pub maker_nostr: String,
     pub maker_fiber: String,
     pub available_shannons: u128,
-    pub fiat_currency_code: String,
+    pub fiat_currency: String,
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
     pub payment_method: String,
     pub status: String,
+    pub hold_secs: u64,
 }
 
 impl Order {
+    pub fn order_side(&self) -> Result<Side> {
+        Side::parse(&self.side).ok_or_else(|| anyhow!("unknown order side {}", self.side))
+    }
+
+    /// Nostr key that pays the hold invoice and may release it.
+    pub fn seller_nostr<'a>(&'a self, trade: &'a Trade) -> Result<&'a str> {
+        match self.order_side()? {
+            Side::Sell => Ok(self.maker_nostr.as_str()),
+            Side::Buy => Ok(trade.taker_nostr.as_str()),
+        }
+    }
+
+    /// Nostr key that pays fiat and submits the payout invoice.
+    pub fn buyer_nostr<'a>(&'a self, trade: &'a Trade) -> Result<&'a str> {
+        match self.order_side()? {
+            Side::Sell => Ok(trade.taker_nostr.as_str()),
+            Side::Buy => Ok(self.maker_nostr.as_str()),
+        }
+    }
+
     pub fn public(&self) -> PublicOrder {
         PublicOrder {
             order_id: self.id.clone(),
+            side: self.side.clone(),
             maker_nostr_pubkey: self.maker_nostr.clone(),
             maker_fiber_pubkey: self.maker_fiber.clone(),
             available_ckb: shannons_to_ckb_string(self.available_shannons),
-            fiat_currency_code: self.fiat_currency_code.clone(),
+            fiat_currency: self.fiat_currency.clone(),
             price_per_ckb: self.price_per_ckb.clone(),
             min: self.min.clone(),
             max: self.max.clone(),
             payment_method: self.payment_method.clone(),
+            hold_hours: self.hold_secs / 3_600,
         }
     }
 
@@ -385,19 +445,65 @@ mod tests {
     fn envelope_roundtrip() {
         let env = Envelope::new(NEW_ORDER)
             .with_payload(NewOrderPayload {
+                side: "sell".into(),
                 fiber_pubkey: "pk".into(),
                 available_ckb: "10".into(),
-                fiat_currency_code: "NGN".into(),
+                fiat_currency: "NGN".into(),
                 price_per_ckb: "1500".into(),
                 min: "1000".into(),
                 max: "5000".into(),
                 payment_method: "bank".into(),
+                hold_hours: 36,
             })
             .unwrap();
         let json = serde_json::to_string(&env).unwrap();
         let parsed: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.client_action(), Some(ClientAction::NewOrder));
         let payload: NewOrderPayload = parsed.decode_payload().unwrap();
-        assert_eq!(payload.fiat_currency_code, "NGN");
+        assert_eq!(payload.fiat_currency, "NGN");
+    }
+
+    #[test]
+    fn a_missing_side_is_a_sell_and_a_buy_locks_from_the_taker() {
+        let parsed: Envelope = serde_json::from_str(
+            r#"{"action":"new-order","payload":{"fiber_pubkey":"pk","available_ckb":"10","fiat_currency":"NGN","price_per_ckb":"1500","min":"1000","max":"5000","payment_method":"bank","hold_hours":16}}"#,
+        )
+        .unwrap();
+        let payload: NewOrderPayload = parsed.decode_payload().unwrap();
+        assert_eq!(payload.side, "sell");
+        assert_eq!(payload.hold_hours, 16);
+
+        let order = Order {
+            id: "order".into(),
+            side: "buy".into(),
+            maker_nostr: "maker".into(),
+            maker_fiber: "fiber-maker".into(),
+            available_shannons: 1,
+            fiat_currency: "NGN".into(),
+            price_per_ckb: "1".into(),
+            min: "1".into(),
+            max: "2".into(),
+            payment_method: "bank".into(),
+            status: "open".into(),
+            hold_secs: 16 * 3_600,
+        };
+        let trade = Trade {
+            id: "trade".into(),
+            order_id: "order".into(),
+            taker_nostr: "taker".into(),
+            taker_fiber: "fiber-taker".into(),
+            fiat_amount: "1".into(),
+            shannons: 1,
+            state: "waiting-hold".into(),
+            hold_payment_hash: None,
+            hold_invoice: None,
+            payout_invoice: None,
+            payout_payment_hash: None,
+            hold_received_at: None,
+        };
+        assert_eq!(order.seller_nostr(&trade).unwrap(), "taker");
+        assert_eq!(order.buyer_nostr(&trade).unwrap(), "maker");
+        assert_eq!(order.public().side, "buy");
+        assert_eq!(order.public().hold_hours, 16);
     }
 }

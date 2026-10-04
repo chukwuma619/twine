@@ -42,6 +42,7 @@ pub trait FiberRpc: Send + Sync {
         amount: u128,
         payment_hash: &str,
         description: &str,
+        final_expiry_delta_ms: u64,
     ) -> Result<InvoiceCreated>;
     #[allow(dead_code)]
     async fn new_payout_invoice(&self, amount: u128, description: &str) -> Result<InvoiceCreated>;
@@ -153,6 +154,7 @@ impl FiberRpc for HttpFiber {
         amount: u128,
         payment_hash: &str,
         description: &str,
+        final_expiry_delta_ms: u64,
     ) -> Result<InvoiceCreated> {
         let result = self
             .call(
@@ -162,7 +164,7 @@ impl FiberRpc for HttpFiber {
                     "currency": self.currency,
                     "payment_hash": payment_hash,
                     "hash_algorithm": HASH_ALGORITHM,
-                    "final_expiry_delta": hex_u64(FINAL_EXPIRY_DELTA_MS),
+                    "final_expiry_delta": hex_u64(final_expiry_delta_ms),
                     "expiry": hex_u64(INVOICE_EXPIRY_SECS),
                     "description": description,
                 })),
