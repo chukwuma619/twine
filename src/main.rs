@@ -22,7 +22,12 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let keys = Keys::parse(&config.nostr_secret)?;
-    info!(pubkey = %keys.public_key(), "twine daemon");
+    let npub = keys.public_key().to_bech32()?;
+    info!(
+        %npub,
+        relays = %config.relays.join(","),
+        "daemon address for the app"
+    );
 
     let db = Arc::new(Db::open(&config.db_path)?);
     info!(network = %config.network, currency = %config.invoice_currency, "fiber");
