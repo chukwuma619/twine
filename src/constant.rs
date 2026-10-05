@@ -68,6 +68,12 @@ pub const KIND_ACTION: u16 = 4242;
 /// Public addressable order. The `d` tag is the order id. Not a NIP.
 pub const KIND_ORDER: u16 = 31420;
 
+/// Public addressable Fiber node for this daemon. The `d` tag is [FIBER_NODE_TAG].
+/// Not a NIP. The app shows this pubkey so a wallet can open a channel to it.
+pub const KIND_FIBER_NODE: u16 = 31421;
+
+pub const FIBER_NODE_TAG: &str = "fiber-node";
+
 pub const NEW_ORDER: &str = "new-order";
 pub const TAKE: &str = "take";
 pub const FIAT_SENT: &str = "fiat-sent";

@@ -7,7 +7,7 @@ use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{
-    connect, decrypt_action, publish_outbounds, sender_hex, subscribe_actions,
+    connect, decrypt_action, publish_fiber_node, publish_outbounds, sender_hex, subscribe_actions,
 };
 use twine_daemon::{Config, KIND_ACTION, Phase};
 
@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
         &config.rpc_token,
     )?);
     pin_fiber_node(&db, fiber.as_ref()).await?;
+    let fiber_pubkey = db.fiber_pubkey()?;
     let engine = Engine::new(db, fiber, config.solver.clone());
     engine.arm_watchtower().await?;
     let client = connect(&keys, &config.relays).await?;
@@ -49,6 +50,15 @@ async fn main() -> Result<()> {
     }
 
     subscribe_actions(&client, keys.public_key()).await?;
+    match fiber_pubkey {
+        Some(pubkey) => {
+            info!(pubkey = %pubkey, "fiber node for the app");
+            if let Err(error) = publish_fiber_node(&client, &keys, &pubkey).await {
+                warn!(%error, "fiber node announcement failed");
+            }
+        }
+        None => warn!("fiber node is not pinned"),
+    }
     let mut notifications = client.notifications();
 
     while let Some(notification) = notifications.next().await {
