@@ -6,7 +6,9 @@ use tracing::{info, warn};
 use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{HttpFiber, NodeRpc, accept_node_pubkey};
-use twine_daemon::nostr::{action_filter, connect, decrypt_action, publish_outbounds, sender_hex};
+use twine_daemon::nostr::{
+    connect, decrypt_action, publish_outbounds, sender_hex, subscribe_actions,
+};
 use twine_daemon::{Config, KIND_ACTION, Phase};
 
 #[tokio::main]
@@ -32,7 +34,7 @@ async fn main() -> Result<()> {
     pin_fiber_node(&db, fiber.as_ref()).await?;
     let engine = Engine::new(db, fiber, config.solver.clone());
     engine.arm_watchtower().await?;
-    let client = connect(&config.relays).await?;
+    let client = connect(&keys, &config.relays).await?;
 
     let polling = Arc::new(Mutex::new(HashSet::new()));
     engine.bind_polls(client.clone(), keys.clone(), polling);
@@ -41,7 +43,7 @@ async fn main() -> Result<()> {
         engine.watch(&trade_id)?;
     }
 
-    client.subscribe(action_filter(keys.public_key())).await?;
+    subscribe_actions(&client, keys.public_key()).await?;
     let mut notifications = client.notifications();
 
     while let Some(notification) = notifications.next().await {

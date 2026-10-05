@@ -1,19 +1,53 @@
 use crate::types::Outbound;
 use crate::{Envelope, KIND_ACTION, KIND_ORDER};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nostr::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
+use std::time::Duration;
+use tracing::{info, warn};
 
-pub async fn connect(relays: &[String]) -> Result<Client> {
-    let client = Client::default();
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
     for relay in relays {
         client
             .add_relay(relay)
             .await
-            .with_context(|| relay.clone())?;
+            .with_context(|| format!("invalid relay {relay}"))?;
     }
-    client.connect().await;
+    client.connect().and_wait(RELAY_CONNECT_TIMEOUT).await;
+
+    let mut connected = 0usize;
+    for (url, relay) in client.relays().await {
+        let status = relay.status();
+        if status.is_connected() {
+            connected += 1;
+            info!(%url, "nostr relay connected");
+        } else {
+            warn!(%url, %status, "nostr relay not connected");
+        }
+    }
+    if connected == 0 {
+        bail!("no nostr relay connected");
+    }
     Ok(client)
+}
+
+pub async fn subscribe_actions(client: &Client, daemon: PublicKey) -> Result<()> {
+    let output = client.subscribe(action_filter(daemon)).await?;
+    for (url, error) in &output.failed {
+        warn!(%url, %error, "action subscription failed");
+    }
+    if output.success.is_empty() {
+        bail!("no relay accepted the action subscription");
+    }
+    for url in output.success.keys() {
+        info!(%url, "subscribed to actions");
+    }
+    Ok(())
 }
 
 pub fn action_filter(daemon: PublicKey) -> Filter {
