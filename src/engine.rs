@@ -314,7 +314,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
             }
             let payment = match self.fiber.send_payment(&invoice).await {
                 Ok(payment) => payment,
-                Err(error) => return self.fail_payout(&trade, &sender_reason(&error)),
+                Err(error) => {
+                    return self.fail_payout(&trade, &format!("buyer payout failed: {error}"));
+                }
             };
             self.db
                 .set_payout(&trade.id, &invoice, Some(&payment.payment_hash))?;
@@ -483,18 +485,16 @@ impl<F: FiberRpc + 'static> Engine<F> {
                         }
                     },
                 }
-                match engine.db.get_trade(&trade_id) {
-                    Ok(Some(trade)) => {
-                        let stay = match (kind, trade.phase().ok()) {
-                            (PollKind::Hold, Some(phase)) if phase.watched() => true,
-                            (PollKind::Payout, Some(Phase::Releasing)) => true,
-                            _ => false,
-                        };
-                        if !stay {
-                            break;
-                        }
-                    }
-                    _ => break,
+                let stay = match engine.db.get_trade(&trade_id) {
+                    Ok(Some(trade)) => match (kind, trade.phase().ok()) {
+                        (PollKind::Hold, Some(phase)) if phase.watched() => true,
+                        (PollKind::Payout, Some(Phase::Releasing)) => true,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !stay {
+                    break;
                 }
                 tokio::time::sleep(Duration::from_secs(FIBER_POLL_SECS)).await;
             }
@@ -534,10 +534,6 @@ pub(crate) fn cant_do(to: &str, trade_id: Option<String>, reason: &str) -> Outbo
         to: to.to_string(),
         envelope,
     }
-}
-
-fn sender_reason(error: &anyhow::Error) -> String {
-    format!("buyer payout failed: {error}")
 }
 
 fn payout_invoice_ok(

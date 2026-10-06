@@ -1,9 +1,11 @@
 use crate::{
-    i64_from_shannons, Order, OrderStatus, PaymentKind, PaymentMethod, Phase,
-    SupportedPaymentMethod, Trade, SUPPORTED_PAYMENT_METHODS,
+    Order, OrderStatus, PaymentKind, PaymentMethod, Phase, SUPPORTED_PAYMENT_METHODS,
+    SupportedPaymentMethod, Trade, i64_from_shannons,
 };
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -25,7 +27,6 @@ impl Db {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -198,10 +199,8 @@ impl Db {
         let ids = {
             let conn = self.conn.lock().expect("db");
             let mut stmt = conn.prepare("SELECT id FROM orders ORDER BY id")?;
-            let ids = stmt
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<String>, _>>()?;
-            ids
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?
         };
         ids.iter()
             .map(|id| {

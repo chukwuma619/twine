@@ -88,20 +88,20 @@ pub async fn publish_outbounds(client: &Client, keys: &Keys, outbound: &[Outboun
 }
 
 pub fn public_order_event(keys: &Keys, order: &PublicOrder) -> Result<Event> {
-    Ok(EventBuilder::new(Kind::from(KIND_ORDER), serde_json::to_string(order)?)
-        .tag(Tag::identifier(&order.order_id))
-        .finalize(keys)?)
+    Ok(
+        EventBuilder::new(Kind::from(KIND_ORDER), serde_json::to_string(order)?)
+            .tag(Tag::identifier(&order.order_id))
+            .finalize(keys)?,
+    )
 }
 
-/// Sends [event] until one relay accepts it.
-///
-/// One acceptance is enough for the app: that relay pushes the event to an
-/// open subscription as soon as it stores it. A relay that times out is logged
-/// and retried. The event stays the same across attempts, so a relay that
-/// already stored it treats the retry as a duplicate.
+/// Retries until one relay accepts the event. A relay that already stored it treats the retry as a duplicate.
 pub async fn publish_event(client: &Client, event: &Event) -> Result<()> {
     for attempt in 1..=PUBLISH_ATTEMPTS {
-        let output = client.send_event(event).ok_timeout(RELAY_OK_TIMEOUT).await?;
+        let output = client
+            .send_event(event)
+            .ok_timeout(RELAY_OK_TIMEOUT)
+            .await?;
         for (url, error) in &output.failed {
             warn!(%url, %error, attempt, "relay rejected event");
         }
@@ -123,7 +123,6 @@ pub fn sender_hex(event: &Event) -> String {
     event.pubkey.to_hex()
 }
 
-/// Addressable announcement of the Fiber node pinned for this daemon.
 pub fn fiber_node_event(keys: &Keys, pubkey: &str) -> Result<Event> {
     let pubkey = pubkey.trim();
     if pubkey.is_empty() {
@@ -140,7 +139,6 @@ pub async fn publish_fiber_node(client: &Client, keys: &Keys, pubkey: &str) -> R
     publish_event(client, &event).await
 }
 
-/// Addressable announcement of the payment methods this daemon accepts.
 pub fn payment_catalog_event(keys: &Keys, methods: &[SupportedPaymentMethod]) -> Result<Event> {
     let methods: Vec<serde_json::Value> = methods
         .iter()

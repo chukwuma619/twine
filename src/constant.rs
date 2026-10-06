@@ -3,9 +3,7 @@ use crate::types::ConfiguredPaymentMethod;
 /// 1 CKB = 100_000_000 shannons.
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
-/// How long the seller's coins stay in the Fiber hold.
-/// Fiber accepts 16 to 48 hours. A received hold cannot be canceled, so this
-/// is also how long the coins can sit if the trade never finishes.
+/// Fiber accepts 16 to 48 hours. A received hold cannot be canceled.
 pub const HOLD_HOURS: u64 = 36;
 
 pub const fn hold_secs(hours: u64) -> u64 {
@@ -17,12 +15,10 @@ pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 /// How long the buyer has to pay after the seller locks.
 pub const PAYMENT_WINDOW_SECS: u64 = 15 * 60;
 
-/// Accounts on one post. Each one must be a method in `SUPPORTED_PAYMENT_METHODS`.
+/// A post may name at most this many catalog ids.
 pub const MAX_PAYMENT_METHODS: usize = 5;
 
-/// The catalog. This daemon ships with one NGN method and one USD method.
-/// A post can use a method only when that method's currency is the post's
-/// fiat currency. It does not accept a method that is not listed here.
+/// A post can use a method only when its currency matches the post.
 pub const SUPPORTED_PAYMENT_METHODS: &[ConfiguredPaymentMethod] = &[
     ConfiguredPaymentMethod {
         id: "gtbank",
@@ -44,19 +40,16 @@ pub const INVOICE_EXPIRY_SECS: u64 = 60 * 60;
 /// Do not start a payout this close to the Fiber timelock.
 pub const SAFETY_SECS: u64 = 30 * 60;
 
-/// Routing-fee cap on `send_payment`, per thousand. Fiber's default is 5.
+/// Per-thousand routing-fee cap on `send_payment`. Fiber's default is 5.
 pub const MAX_FEE_RATE: u64 = 5;
 
-/// Invoice currency for Fiber testnet (`fibt` invoices).
 pub const TESTNET_INVOICE_CURRENCY: &str = "Fibt";
 
-/// Invoice currency for Fiber mainnet (`fibb` invoices).
 pub const MAINNET_INVOICE_CURRENCY: &str = "Fibb";
 
-/// Hash used for hold invoices. Must match the preimage the daemon stores.
+/// Hold invoices. Must match the preimage the daemon stores.
 pub const HASH_ALGORITHM: &str = "sha256";
 
-/// How often the daemon asks Fiber for hold and payout status.
 pub const FIBER_POLL_SECS: u64 = 2;
 
 /// SQLite path when `TWINE_DB` is unset.
@@ -68,14 +61,12 @@ pub const KIND_ACTION: u16 = 4242;
 /// Public addressable order. The `d` tag is the order id. Not a NIP.
 pub const KIND_ORDER: u16 = 31420;
 
-/// Public addressable Fiber node for this daemon. The `d` tag is [FIBER_NODE_TAG].
-/// Not a NIP. The app shows this pubkey so a wallet can open a channel to it.
+/// Public addressable Fiber node. The `d` tag is [FIBER_NODE_TAG]. Not a NIP.
 pub const KIND_FIBER_NODE: u16 = 31421;
 
 pub const FIBER_NODE_TAG: &str = "fiber-node";
 
-/// Public addressable payment catalog. The `d` tag is [PAYMENT_CATALOG_TAG].
-/// Not a NIP. The app reads this for the currencies and methods on a new post.
+/// Public addressable payment catalog. The `d` tag is [PAYMENT_CATALOG_TAG]. Not a NIP.
 pub const KIND_CATALOG: u16 = 31422;
 
 pub const PAYMENT_CATALOG_TAG: &str = "payment-methods";

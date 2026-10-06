@@ -13,14 +13,12 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct InvoiceCreated {
     pub invoice: String,
     pub payment_hash: String,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct InvoiceInfo {
     pub invoice: String,
     pub payment_hash: String,
@@ -34,7 +32,6 @@ pub struct PaymentInfo {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ParsedInvoice {
     pub payment_hash: String,
     pub currency: String,

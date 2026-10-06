@@ -1,12 +1,8 @@
-use crate::constant::{
-    CANCEL, CANCELED, CANT_DO, DISPUTE, DISPUTED, EXPIRED, FIAT_SENT, FIAT_SENT_OK, NEW_INVOICE,
-    NEW_ORDER, PAY_INVOICE, REFUNDING, RELEASE, RESOLVE, SETTLED, TAKE, WAITING_FIAT,
-};
+use crate::constant::{CANCEL, DISPUTE, FIAT_SENT, NEW_ORDER, RELEASE, RESOLVE, TAKE};
 use crate::util::shannons_to_ckb_string;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-/// Trade and order phase. An order with no trade is `Pending`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Pending,
@@ -156,9 +152,8 @@ impl Side {
     }
 }
 
+/// The maker posted the order. On a trade, seller and buyer are the CKB sides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Who is allowed to move an order or a trade.
-/// The maker posted it. On a trade, seller and buyer are the CKB sides.
 pub enum Actor {
     Maker,
     Seller,
@@ -207,20 +202,6 @@ pub enum ClientAction {
     Resolve,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplyAction {
-    PayInvoice,
-    WaitingFiat,
-    FiatSentOk,
-    NewInvoice,
-    Disputed,
-    Refunding,
-    Settled,
-    Canceled,
-    Expired,
-    CantDo,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     pub action: String,
@@ -262,22 +243,6 @@ impl Envelope {
         }
     }
 
-    pub fn reply_action(&self) -> Option<ReplyAction> {
-        match self.action.as_str() {
-            PAY_INVOICE => Some(ReplyAction::PayInvoice),
-            WAITING_FIAT => Some(ReplyAction::WaitingFiat),
-            FIAT_SENT_OK => Some(ReplyAction::FiatSentOk),
-            NEW_INVOICE => Some(ReplyAction::NewInvoice),
-            DISPUTED => Some(ReplyAction::Disputed),
-            REFUNDING => Some(ReplyAction::Refunding),
-            SETTLED => Some(ReplyAction::Settled),
-            CANCELED => Some(ReplyAction::Canceled),
-            EXPIRED => Some(ReplyAction::Expired),
-            CANT_DO => Some(ReplyAction::CantDo),
-            _ => None,
-        }
-    }
-
     pub fn decode_payload<T: for<'de> Deserialize<'de>>(&self) -> Result<T, serde_json::Error> {
         match &self.payload {
             Some(value) => serde_json::from_value(value.clone()),
@@ -301,9 +266,7 @@ pub struct NewOrderPayload {
     pub payment_methods: Vec<PaymentMethodInput>,
 }
 
-/// A payment method this daemon accepts. The coordinator adds or removes
-/// entries in `SUPPORTED_PAYMENT_METHODS`. `id` is stable. `kind` is `bank`
-/// or `wallet`. `currency` is an ISO 4217 code, such as `NGN` or `USD`.
+/// One entry in `SUPPORTED_PAYMENT_METHODS`.
 pub struct ConfiguredPaymentMethod {
     pub id: &'static str,
     pub kind: &'static str,
@@ -351,10 +314,10 @@ impl PaymentMethod {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Someone joining a post. `fiber_pubkey` is the taker's Fiber key.
 /// On a sell post the taker buys CKB. On a buy post the taker sells CKB.
 /// `payment_method_id` is one method named on the post.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakePayload {
     pub order_id: String,
     pub fiat_amount: String,
