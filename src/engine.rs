@@ -442,17 +442,6 @@ impl<F: FiberRpc + 'static> Engine<F> {
         )
     }
 
-    pub(crate) fn with_solver(&self, trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
-        let mut outbound = party_replies(trade, envelope.clone());
-        if let Some(solver) = &self.solver {
-            outbound.push(Outbound::Reply {
-                to: solver.clone(),
-                envelope,
-            });
-        }
-        outbound
-    }
-
     pub(crate) fn require_order(&self, id: &str) -> Result<Order> {
         self.db
             .get_order(id)?
@@ -751,6 +740,8 @@ mod tests {
         assert_eq!(details.label, "GTBank");
         assert_eq!(details.currency, "NGN");
         assert_eq!(details.reference, "trade");
+        assert_eq!(details.seller_nostr, "seller");
+        assert_eq!(details.buyer_nostr, "buyer");
         let trade = engine.db.get_trade("trade").unwrap().unwrap();
         assert!(trade.hold_received_at.is_some());
         engine
@@ -778,10 +769,38 @@ mod tests {
         let (engine, fiber) = fake_engine("Received");
         engine.on_hold_status("trade").await.unwrap();
         let disputed = engine
-            .handle("buyer", Envelope::new(DISPUTE).with_trade("trade"))
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        conversation_key: Some("ab".repeat(32)),
+                    })
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert!(replies_contain(&disputed, DISPUTED));
+        let solver_key = disputed.iter().find_map(|item| match item {
+            Outbound::Reply { to, envelope } if to == "solver" && envelope.action == DISPUTED => {
+                envelope
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("conversation_key"))
+                    .and_then(|key| key.as_str())
+                    .map(str::to_string)
+            }
+            _ => None,
+        });
+        assert_eq!(solver_key.as_deref(), Some("ab".repeat(32).as_str()));
+        let buyer_key = disputed.iter().find_map(|item| match item {
+            Outbound::Reply { to, envelope } if to == "buyer" && envelope.action == DISPUTED => {
+                Some(envelope.payload.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(buyer_key, Some(None));
         let missing = engine
             .handle(
                 "solver",
@@ -1029,6 +1048,8 @@ mod tests {
         assert_eq!(details.kind, "bank");
         assert_eq!(details.label, "GTBank");
         assert_eq!(details.currency, "NGN");
+        assert_eq!(details.seller_nostr, "seller");
+        assert_eq!(details.buyer_nostr, "buyer");
 
         let seller_fiat = engine
             .handle(
@@ -1433,6 +1454,7 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: Some("buyer-invoice".into()),
+                        conversation_key: None,
                     })
                     .unwrap(),
             )

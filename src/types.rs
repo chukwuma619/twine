@@ -371,6 +371,8 @@ pub struct FiatSentPayload {
 pub struct DisputePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +398,8 @@ pub struct PayInvoicePayload {
     pub invoice: String,
     pub amount_shannons: String,
     pub order_id: String,
+    pub seller_nostr: String,
+    pub buyer_nostr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +446,8 @@ pub struct WaitingFiatPayload {
     pub kind: String,
     pub label: String,
     pub currency: String,
+    pub seller_nostr: String,
+    pub buyer_nostr: String,
 }
 
 impl WaitingFiatPayload {
@@ -453,6 +459,8 @@ impl WaitingFiatPayload {
             kind: trade.payment_kind.clone(),
             label: trade.payment_label.clone(),
             currency: trade.payment_currency.clone(),
+            seller_nostr: trade.seller_nostr.clone(),
+            buyer_nostr: trade.buyer_nostr.clone(),
         }
     }
 }

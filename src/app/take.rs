@@ -164,6 +164,8 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
             invoice: created.invoice,
             amount_shannons: shannons.to_string(),
             order_id: order.id.clone(),
+            seller_nostr: trade.seller_nostr.clone(),
+            buyer_nostr: trade.buyer_nostr.clone(),
         })?;
     Ok(vec![
         Outbound::PublicOrder(order.public()),

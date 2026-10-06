@@ -1,8 +1,9 @@
-use crate::engine::{Engine, cant_do};
+use crate::engine::{Engine, cant_do, party_replies};
 use crate::fiber::FiberRpc;
 use crate::types::Outbound;
 use crate::{Actor, DISPUTED, DisputePayload, Envelope, apply_dispute};
 use anyhow::Result;
+use serde::Serialize;
 
 pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
     engine: &Engine<F>,
@@ -41,9 +42,37 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
             engine.watch(&trade.id)?;
-            Ok(engine.with_solver(&trade, Envelope::new(DISPUTED).with_trade(&trade.id)))
+            let mut outbound = party_replies(&trade, Envelope::new(DISPUTED).with_trade(&trade.id));
+            if let Some(solver) = &engine.solver {
+                let mut envelope = Envelope::new(DISPUTED).with_trade(&trade.id);
+                if let Some(key) = conversation_key(payload.conversation_key.as_deref()) {
+                    envelope = envelope.with_payload(SolverDispute {
+                        conversation_key: key,
+                    })?;
+                }
+                outbound.push(Outbound::Reply {
+                    to: solver.clone(),
+                    envelope,
+                });
+            }
+            Ok(outbound)
         }
         crate::Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
         crate::Decision::NoOp => Ok(Vec::new()),
+    }
+}
+
+#[derive(Serialize)]
+struct SolverDispute {
+    conversation_key: String,
+}
+
+/// 32-byte hex. Anything else is dropped so a bad key does not block the dispute.
+fn conversation_key(value: Option<&str>) -> Option<String> {
+    let key = value?.trim().to_ascii_lowercase();
+    if key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(key)
+    } else {
+        None
     }
 }
