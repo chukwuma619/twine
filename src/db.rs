@@ -1,9 +1,9 @@
 use crate::{
-    Order, OrderStatus, PaymentKind, PaymentMethod, Phase, SUPPORTED_PAYMENT_METHODS,
-    SupportedPaymentMethod, Trade, i64_from_shannons,
+    i64_from_shannons, Order, OrderStatus, PaymentKind, PaymentMethod, Phase,
+    SupportedPaymentMethod, Trade, SUPPORTED_PAYMENT_METHODS,
 };
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -192,6 +192,23 @@ impl Db {
         };
         order.payment_methods = load_methods(&conn, id)?;
         Ok(Some(order))
+    }
+
+    pub fn orders(&self) -> Result<Vec<Order>> {
+        let ids = {
+            let conn = self.conn.lock().expect("db");
+            let mut stmt = conn.prepare("SELECT id FROM orders ORDER BY id")?;
+            let ids = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            ids
+        };
+        ids.iter()
+            .map(|id| {
+                self.get_order(id)?
+                    .with_context(|| format!("order {id} disappeared"))
+            })
+            .collect()
     }
 
     /// Debit the order, insert the trade, and store the hold preimage together.
@@ -711,6 +728,17 @@ mod tests {
             payment_label: "GTBank".into(),
             payment_currency: "NGN".into(),
         }
+    }
+
+    #[test]
+    fn orders_lists_what_was_inserted() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.orders().unwrap().is_empty());
+        db.insert_order(&sample_order(100_000_000)).unwrap();
+        let orders = db.orders().unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].id, "order");
+        assert_eq!(orders[0].payment_methods[0].id, "gtbank");
     }
 
     #[test]

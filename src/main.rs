@@ -7,8 +7,8 @@ use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{
-    connect, decrypt_action, publish_fiber_node, publish_outbounds, publish_payment_catalog,
-    sender_hex, subscribe_actions,
+    connect, decrypt_action, public_order_event, publish_event, publish_fiber_node,
+    publish_outbounds, publish_payment_catalog, sender_hex, subscribe_actions,
 };
 use twine_daemon::{Config, KIND_ACTION, Phase};
 
@@ -67,6 +67,28 @@ async fn main() -> Result<()> {
             }
         }
         Err(error) => warn!(%error, "payment catalog announcement failed"),
+    }
+    match engine.db.orders() {
+        Ok(orders) => {
+            let client = client.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                for order in orders {
+                    let order_id = order.id.clone();
+                    let event = match public_order_event(&keys, &order.public()) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            warn!(%error, %order_id, "order event failed");
+                            continue;
+                        }
+                    };
+                    if let Err(error) = publish_event(&client, &event).await {
+                        warn!(%error, %order_id, "order never reached a relay");
+                    }
+                }
+            });
+        }
+        Err(error) => warn!(%error, "could not load orders to republish"),
     }
     let mut notifications = client.notifications();
 

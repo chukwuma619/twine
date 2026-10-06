@@ -1,4 +1,4 @@
-use crate::types::{Outbound, SupportedPaymentMethod};
+use crate::types::{Outbound, PublicOrder, SupportedPaymentMethod};
 use crate::{
     Envelope, FIBER_NODE_TAG, KIND_ACTION, KIND_CATALOG, KIND_FIBER_NODE, KIND_ORDER,
     PAYMENT_CATALOG_TAG,
@@ -10,6 +10,9 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_OK_TIMEOUT: Duration = Duration::from_secs(4);
+const PUBLISH_ATTEMPTS: u32 = 5;
+const PUBLISH_RETRY: Duration = Duration::from_secs(5);
 
 pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
     let client = Client::builder()
@@ -73,18 +76,47 @@ pub async fn publish_outbounds(client: &Client, keys: &Keys, outbound: &[Outboun
                 let event = EventBuilder::new(Kind::from(KIND_ACTION), ciphertext)
                     .tag(Tag::public_key(recipient))
                     .finalize(keys)?;
-                client.send_event(&event).await?;
+                publish_event(client, &event).await?;
             }
             Outbound::PublicOrder(order) => {
-                let event =
-                    EventBuilder::new(Kind::from(KIND_ORDER), serde_json::to_string(order)?)
-                        .tag(Tag::identifier(&order.order_id))
-                        .finalize(keys)?;
-                client.send_event(&event).await?;
+                let event = public_order_event(keys, order)?;
+                publish_event(client, &event).await?;
             }
         }
     }
     Ok(())
+}
+
+pub fn public_order_event(keys: &Keys, order: &PublicOrder) -> Result<Event> {
+    Ok(EventBuilder::new(Kind::from(KIND_ORDER), serde_json::to_string(order)?)
+        .tag(Tag::identifier(&order.order_id))
+        .finalize(keys)?)
+}
+
+/// Sends [event] until one relay accepts it.
+///
+/// One acceptance is enough for the app: that relay pushes the event to an
+/// open subscription as soon as it stores it. A relay that times out is logged
+/// and retried. The event stays the same across attempts, so a relay that
+/// already stored it treats the retry as a duplicate.
+pub async fn publish_event(client: &Client, event: &Event) -> Result<()> {
+    for attempt in 1..=PUBLISH_ATTEMPTS {
+        let output = client.send_event(event).ok_timeout(RELAY_OK_TIMEOUT).await?;
+        for (url, error) in &output.failed {
+            warn!(%url, %error, attempt, "relay rejected event");
+        }
+        if !output.success.is_empty() {
+            for url in output.success.keys() {
+                info!(%url, attempt, "relay accepted event");
+            }
+            return Ok(());
+        }
+        warn!(attempt, "no relay accepted the event");
+        if attempt < PUBLISH_ATTEMPTS {
+            tokio::time::sleep(PUBLISH_RETRY).await;
+        }
+    }
+    bail!("no relay accepted the event")
 }
 
 pub fn sender_hex(event: &Event) -> String {
@@ -105,8 +137,7 @@ pub fn fiber_node_event(keys: &Keys, pubkey: &str) -> Result<Event> {
 
 pub async fn publish_fiber_node(client: &Client, keys: &Keys, pubkey: &str) -> Result<()> {
     let event = fiber_node_event(keys, pubkey)?;
-    client.send_event(&event).await?;
-    Ok(())
+    publish_event(client, &event).await
 }
 
 /// Addressable announcement of the payment methods this daemon accepts.
@@ -134,8 +165,7 @@ pub async fn publish_payment_catalog(
     methods: &[SupportedPaymentMethod],
 ) -> Result<()> {
     let event = payment_catalog_event(keys, methods)?;
-    client.send_event(&event).await?;
-    Ok(())
+    publish_event(client, &event).await
 }
 
 #[cfg(test)]
