@@ -74,6 +74,12 @@ pub const KIND_FIBER_NODE: u16 = 31421;
 
 pub const FIBER_NODE_TAG: &str = "fiber-node";
 
+/// Public addressable payment catalog. The `d` tag is [PAYMENT_CATALOG_TAG].
+/// Not a NIP. The app reads this for the currencies and methods on a new post.
+pub const KIND_CATALOG: u16 = 31422;
+
+pub const PAYMENT_CATALOG_TAG: &str = "payment-methods";
+
 pub const NEW_ORDER: &str = "new-order";
 pub const TAKE: &str = "take";
 pub const FIAT_SENT: &str = "fiat-sent";

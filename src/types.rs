@@ -430,6 +430,8 @@ pub struct PublicOrder {
     pub max: String,
     pub payment_methods: Vec<PublicPaymentMethod>,
     pub hold_hours: u64,
+    /// `open` or `canceled`. A filled post stays `open` with `available_ckb` at 0.
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,6 +491,7 @@ impl Order {
                 .map(PaymentMethod::public)
                 .collect(),
             hold_hours: self.hold_secs / 3_600,
+            status: self.status.clone(),
         }
     }
 
@@ -557,6 +560,10 @@ mod tests {
         assert_eq!(sell.public().maker_nostr_pubkey, "seller");
         assert_eq!(sell.public().maker_fiber_pubkey, "fiber-seller");
         assert_eq!(sell.public().hold_hours, 16);
+        assert_eq!(sell.public().status, "open");
+        let mut closed = sample_order("sell", "seller", "fiber-seller");
+        closed.status = "canceled".into();
+        assert_eq!(closed.public().status, "canceled");
         let published = serde_json::to_string(&sell.public()).unwrap();
         assert!(published.contains("GTBank"));
         assert!(published.contains("NGN"));

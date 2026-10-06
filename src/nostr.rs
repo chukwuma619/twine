@@ -1,5 +1,8 @@
-use crate::types::Outbound;
-use crate::{Envelope, FIBER_NODE_TAG, KIND_ACTION, KIND_FIBER_NODE, KIND_ORDER};
+use crate::types::{Outbound, SupportedPaymentMethod};
+use crate::{
+    Envelope, FIBER_NODE_TAG, KIND_ACTION, KIND_CATALOG, KIND_FIBER_NODE, KIND_ORDER,
+    PAYMENT_CATALOG_TAG,
+};
 use anyhow::{Context, Result, bail};
 use nostr::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
@@ -106,6 +109,35 @@ pub async fn publish_fiber_node(client: &Client, keys: &Keys, pubkey: &str) -> R
     Ok(())
 }
 
+/// Addressable announcement of the payment methods this daemon accepts.
+pub fn payment_catalog_event(keys: &Keys, methods: &[SupportedPaymentMethod]) -> Result<Event> {
+    let methods: Vec<serde_json::Value> = methods
+        .iter()
+        .map(|method| {
+            serde_json::json!({
+                "id": method.id,
+                "kind": method.kind,
+                "label": method.label,
+                "currency": method.currency,
+            })
+        })
+        .collect();
+    let content = serde_json::json!({ "methods": methods }).to_string();
+    Ok(EventBuilder::new(Kind::from(KIND_CATALOG), content)
+        .tag(Tag::identifier(PAYMENT_CATALOG_TAG))
+        .finalize(keys)?)
+}
+
+pub async fn publish_payment_catalog(
+    client: &Client,
+    keys: &Keys,
+    methods: &[SupportedPaymentMethod],
+) -> Result<()> {
+    let event = payment_catalog_event(keys, methods)?;
+    client.send_event(&event).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +155,29 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(event.content.as_str()).unwrap();
         assert_eq!(body["pubkey"], "02abc");
         assert!(fiber_node_event(&keys, " ").is_err());
+    }
+
+    #[test]
+    fn payment_catalog_event_lists_the_methods_the_daemon_accepts() {
+        let keys = Keys::generate();
+        let event = payment_catalog_event(
+            &keys,
+            &[SupportedPaymentMethod {
+                id: "gtbank".into(),
+                kind: "bank".into(),
+                label: "GTBank".into(),
+                currency: "NGN".into(),
+            }],
+        )
+        .unwrap();
+        event.verify().unwrap();
+        assert_eq!(event.kind, Kind::from(KIND_CATALOG));
+        assert!(event.tags.iter().any(|tag| {
+            let values = tag.as_slice();
+            values.len() >= 2 && values[0] == "d" && values[1] == PAYMENT_CATALOG_TAG
+        }));
+        let body: serde_json::Value = serde_json::from_str(event.content.as_str()).unwrap();
+        assert_eq!(body["methods"][0]["id"], "gtbank");
+        assert_eq!(body["methods"][0]["currency"], "NGN");
     }
 }

@@ -39,7 +39,9 @@ pub(crate) async fn on_cancel<F: FiberRpc + 'static>(
                 Outbound::PublicOrder(order.public()),
                 Outbound::Reply {
                     to: sender.to_string(),
-                    envelope: Envelope::new(CANCELED),
+                    envelope: Envelope::new(CANCELED).with_payload(CancelPayload {
+                        order_id: Some(order.id.clone()),
+                    })?,
                 },
             ])
         }

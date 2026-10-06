@@ -1278,6 +1278,7 @@ mod tests {
         let Outbound::PublicOrder(public) = &posted[0] else {
             panic!("expected a public order");
         };
+        assert_eq!(public.status, "open");
         let order_id = public.order_id.clone();
         let stranger = engine
             .handle(
@@ -1296,13 +1297,24 @@ mod tests {
                 "buyer",
                 Envelope::new(CANCEL)
                     .with_payload(crate::CancelPayload {
-                        order_id: Some(order_id),
+                        order_id: Some(order_id.clone()),
                     })
                     .unwrap(),
             )
             .await
             .unwrap();
         assert!(replies_contain(&canceled, CANCELED));
+        let published = canceled.iter().find_map(|item| match item {
+            Outbound::PublicOrder(order) => Some(order),
+            Outbound::Reply { .. } => None,
+        });
+        assert_eq!(published.unwrap().status, "canceled");
+        let reply = canceled.iter().find_map(|item| match item {
+            Outbound::Reply { envelope, .. } if envelope.action == CANCELED => Some(envelope),
+            _ => None,
+        });
+        let payload: crate::CancelPayload = reply.unwrap().decode_payload().unwrap();
+        assert_eq!(payload.order_id.as_deref(), Some(order_id.as_str()));
     }
 
     fn reply_to(out: &[Outbound], to: &str, action: &str) -> bool {
