@@ -196,7 +196,11 @@ impl<F: FiberRpc + 'static> Engine<F> {
         if status == InvoiceStatus::Cancelled && phase == Phase::WaitingHold {
             return self.complete_cancel(&order, &trade).await;
         }
-        if phase == Phase::WaitingHold && status == InvoiceStatus::Received {
+        // A seller payment can land as Paid when Fiber settles the hold before
+        // this poll observes Received. Either status means the coins arrived.
+        if phase == Phase::WaitingHold
+            && matches!(status, InvoiceStatus::Received | InvoiceStatus::Paid)
+        {
             return match apply_hold_received(Phase::WaitingHold) {
                 Decision::Ok(next) => {
                     self.db
@@ -758,6 +762,26 @@ mod tests {
         assert!(replies_contain(&expired, EXPIRED));
         let order = engine.db.get_order("order").unwrap().unwrap();
         assert_eq!(order.available_shannons, 1_100_000_000);
+    }
+
+    #[tokio::test]
+    async fn paid_hold_opens_the_fiat_step() {
+        let (engine, _) = fake_engine("Paid");
+        let waiting = engine.on_hold_status("trade").await.unwrap();
+        assert!(replies_contain(&waiting, WAITING_FIAT));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::WaitingFiat.as_str()
+        );
+        assert!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .hold_received_at
+                .is_some()
+        );
     }
 
     #[tokio::test]
