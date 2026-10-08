@@ -2,8 +2,8 @@ use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Outbound, Trade};
 use crate::{
-    Envelope, PAY_INVOICE, PayInvoicePayload, Phase, Side, TakePayload, apply_take, hex_bytes,
-    validate_take,
+    Envelope, INVOICE_EXPIRY_SECS, PAY_INVOICE, PayInvoicePayload, Phase, Side, TakePayload,
+    apply_take, hex_bytes, unix_now, validate_take,
 };
 use anyhow::{Result, anyhow};
 use rand::RngCore;
@@ -105,6 +105,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         payout_invoice: None,
         payout_payment_hash: None,
         hold_received_at: None,
+        hold_created_at: None,
         payment_method_id: method.id.clone(),
         payment_kind: method.kind.clone(),
         payment_label: method.label.clone(),
@@ -149,9 +150,10 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
             &format!("watchtower preimage failed: {error}"),
         )]);
     }
+    let created_at = unix_now();
     engine
         .db
-        .set_hold(&trade_id, &payment_hash, &created.invoice)?;
+        .set_hold(&trade_id, &payment_hash, &created.invoice, created_at)?;
     engine.watch(&trade_id)?;
 
     let order = engine
@@ -166,6 +168,8 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
             order_id: order.id.clone(),
             seller_nostr: trade.seller_nostr.clone(),
             buyer_nostr: trade.buyer_nostr.clone(),
+            lock_by: Some(created_at + INVOICE_EXPIRY_SECS as i64),
+            hold_ends_at: Some(created_at + order.hold_secs as i64),
         })?;
     Ok(vec![
         Outbound::PublicOrder(order.public()),

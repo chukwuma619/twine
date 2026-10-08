@@ -4,7 +4,15 @@ use anyhow::{Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+pub fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AmountError {

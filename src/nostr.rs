@@ -123,19 +123,25 @@ pub fn sender_hex(event: &Event) -> String {
     event.pubkey.to_hex()
 }
 
-pub fn fiber_node_event(keys: &Keys, pubkey: &str) -> Result<Event> {
+pub fn fiber_node_event(keys: &Keys, pubkey: &str, solver: Option<&str>) -> Result<Event> {
     let pubkey = pubkey.trim();
     if pubkey.is_empty() {
         bail!("fiber node pubkey is empty");
     }
-    let content = serde_json::json!({ "pubkey": pubkey }).to_string();
+    let solver = solver.map(str::trim).filter(|value| !value.is_empty());
+    let content = serde_json::json!({ "pubkey": pubkey, "solver": solver }).to_string();
     Ok(EventBuilder::new(Kind::from(KIND_FIBER_NODE), content)
         .tag(Tag::identifier(FIBER_NODE_TAG))
         .finalize(keys)?)
 }
 
-pub async fn publish_fiber_node(client: &Client, keys: &Keys, pubkey: &str) -> Result<()> {
-    let event = fiber_node_event(keys, pubkey)?;
+pub async fn publish_fiber_node(
+    client: &Client,
+    keys: &Keys,
+    pubkey: &str,
+    solver: Option<&str>,
+) -> Result<()> {
+    let event = fiber_node_event(keys, pubkey, solver)?;
     publish_event(client, &event).await
 }
 
@@ -173,7 +179,7 @@ mod tests {
     #[test]
     fn fiber_node_event_is_signed_by_the_daemon() {
         let keys = Keys::generate();
-        let event = fiber_node_event(&keys, " 02abc ").unwrap();
+        let event = fiber_node_event(&keys, " 02abc ", None).unwrap();
         event.verify().unwrap();
         assert_eq!(event.kind, Kind::from(KIND_FIBER_NODE));
         assert!(event.tags.iter().any(|tag| {
@@ -182,7 +188,11 @@ mod tests {
         }));
         let body: serde_json::Value = serde_json::from_str(event.content.as_str()).unwrap();
         assert_eq!(body["pubkey"], "02abc");
-        assert!(fiber_node_event(&keys, " ").is_err());
+        assert!(body["solver"].is_null());
+        let with_solver = fiber_node_event(&keys, "02abc", Some("solverpk")).unwrap();
+        let solved: serde_json::Value = serde_json::from_str(with_solver.content.as_str()).unwrap();
+        assert_eq!(solved["solver"], "solverpk");
+        assert!(fiber_node_event(&keys, " ", None).is_err());
     }
 
     #[test]

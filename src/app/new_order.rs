@@ -50,6 +50,7 @@ pub(crate) async fn on_new_order<F: FiberRpc + 'static>(
         payment_methods,
         status: OrderStatus::Open.as_str().into(),
         hold_secs: crate::HOLD_SECS,
+        reserved_shannons: 0,
     };
     engine.db.insert_order(&order)?;
     Ok(vec![Outbound::PublicOrder(order.public())])

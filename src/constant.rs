@@ -78,6 +78,7 @@ pub const RELEASE: &str = "release";
 pub const CANCEL: &str = "cancel";
 pub const DISPUTE: &str = "dispute";
 pub const RESOLVE: &str = "resolve";
+pub const MY_TRADES: &str = "my-trades";
 
 pub const PAY_INVOICE: &str = "pay-invoice";
 pub const WAITING_FIAT: &str = "waiting-fiat";
@@ -89,3 +90,4 @@ pub const SETTLED: &str = "settled";
 pub const CANCELED: &str = "canceled";
 pub const EXPIRED: &str = "expired";
 pub const CANT_DO: &str = "cant-do";
+pub const TRADES: &str = "trades";

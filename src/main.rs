@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
     match fiber_pubkey {
         Some(pubkey) => {
             info!(pubkey = %pubkey, "fiber node for the app");
-            if let Err(error) = publish_fiber_node(&client, &keys, &pubkey).await {
+            if let Err(error) =
+                publish_fiber_node(&client, &keys, &pubkey, config.solver.as_deref()).await
+            {
                 warn!(%error, "fiber node announcement failed");
             }
         }

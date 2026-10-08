@@ -1,7 +1,7 @@
 use crate::engine::{Engine, cant_do, party_replies};
 use crate::fiber::FiberRpc;
 use crate::types::Outbound;
-use crate::{Actor, DISPUTED, DisputePayload, Envelope, apply_dispute};
+use crate::{Actor, DISPUTED, DisputedPayload, DisputePayload, Envelope, apply_dispute};
 use anyhow::Result;
 use serde::Serialize;
 
@@ -42,7 +42,14 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
             engine.watch(&trade.id)?;
-            let mut outbound = party_replies(&trade, Envelope::new(DISPUTED).with_trade(&trade.id));
+            let mut outbound = party_replies(
+                &trade,
+                Envelope::new(DISPUTED).with_trade(&trade.id).with_payload(
+                    DisputedPayload {
+                        solver: engine.solver.clone(),
+                    },
+                )?,
+            );
             if let Some(solver) = &engine.solver {
                 let mut envelope = Envelope::new(DISPUTED).with_trade(&trade.id);
                 if let Some(key) = conversation_key(payload.conversation_key.as_deref()) {

@@ -1,4 +1,7 @@
-use crate::constant::{CANCEL, DISPUTE, FIAT_SENT, NEW_ORDER, RELEASE, RESOLVE, TAKE};
+use crate::constant::{
+    CANCEL, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER, PAYMENT_WINDOW_SECS,
+    RELEASE, RESOLVE, SAFETY_SECS, TAKE,
+};
 use crate::util::shannons_to_ckb_string;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -200,6 +203,7 @@ pub enum ClientAction {
     Cancel,
     Dispute,
     Resolve,
+    MyTrades,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +243,7 @@ impl Envelope {
             CANCEL => Some(ClientAction::Cancel),
             DISPUTE => Some(ClientAction::Dispute),
             RESOLVE => Some(ClientAction::Resolve),
+            MY_TRADES => Some(ClientAction::MyTrades),
             _ => None,
         }
     }
@@ -363,6 +368,10 @@ pub struct PayInvoicePayload {
     pub order_id: String,
     pub seller_nostr: String,
     pub buyer_nostr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_by: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ends_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +408,8 @@ pub struct PublicOrder {
     pub hold_hours: u64,
     /// `open` or `canceled`. A filled post stays `open` with `available_ckb` at 0.
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_ckb: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,10 +422,14 @@ pub struct WaitingFiatPayload {
     pub currency: String,
     pub seller_nostr: String,
     pub buyer_nostr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pay_by: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_by: Option<i64>,
 }
 
 impl WaitingFiatPayload {
-    pub fn from_trade(trade: &Trade, fiat_currency: &str) -> Self {
+    pub fn from_trade(trade: &Trade, fiat_currency: &str, hold_secs: u64, received_at: i64) -> Self {
         Self {
             fiat_amount: trade.fiat_amount.clone(),
             fiat_currency: fiat_currency.to_string(),
@@ -424,8 +439,74 @@ impl WaitingFiatPayload {
             currency: trade.payment_currency.clone(),
             seller_nostr: trade.seller_nostr.clone(),
             buyer_nostr: trade.buyer_nostr.clone(),
+            pay_by: Some(received_at + PAYMENT_WINDOW_SECS as i64),
+            release_by: trade.release_by(hold_secs),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputedPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solver: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeSnapshot {
+    pub trade_id: String,
+    pub order_id: String,
+    pub state: String,
+    pub seller_nostr: String,
+    pub buyer_nostr: String,
+    pub fiat_amount: String,
+    pub fiat_currency: String,
+    pub amount_shannons: String,
+    pub payment_kind: String,
+    pub payment_label: String,
+    pub payment_currency: String,
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_invoice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payout_invoice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_by: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ends_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pay_by: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_by: Option<i64>,
+}
+
+impl TradeSnapshot {
+    pub fn from_trade(trade: &Trade, fiat_currency: &str, hold_secs: u64) -> Self {
+        Self {
+            trade_id: trade.id.clone(),
+            order_id: trade.order_id.clone(),
+            state: trade.state.clone(),
+            seller_nostr: trade.seller_nostr.clone(),
+            buyer_nostr: trade.buyer_nostr.clone(),
+            fiat_amount: trade.fiat_amount.clone(),
+            fiat_currency: fiat_currency.to_string(),
+            amount_shannons: trade.shannons.to_string(),
+            payment_kind: trade.payment_kind.clone(),
+            payment_label: trade.payment_label.clone(),
+            payment_currency: trade.payment_currency.clone(),
+            reference: trade.id.clone(),
+            hold_invoice: trade.hold_invoice.clone(),
+            payout_invoice: trade.payout_invoice.clone(),
+            lock_by: trade.lock_by(),
+            hold_ends_at: trade.hold_ends_at(hold_secs),
+            pay_by: trade.pay_by(),
+            release_by: trade.release_by(hold_secs),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradesPayload {
+    pub trades: Vec<TradeSnapshot>,
 }
 
 pub struct Order {
@@ -441,6 +522,7 @@ pub struct Order {
     pub payment_methods: Vec<PaymentMethod>,
     pub status: String,
     pub hold_secs: u64,
+    pub reserved_shannons: u128,
 }
 
 impl Order {
@@ -463,6 +545,7 @@ impl Order {
                 .collect(),
             hold_hours: self.hold_secs / 3_600,
             status: self.status.clone(),
+            reserved_ckb: Some(shannons_to_ckb_string(self.reserved_shannons)),
         }
     }
 
@@ -487,6 +570,8 @@ pub struct Trade {
     pub payout_payment_hash: Option<String>,
     /// Unix seconds when the hold invoice became `Received`.
     pub hold_received_at: Option<i64>,
+    /// Unix seconds when the hold invoice was created.
+    pub hold_created_at: Option<i64>,
     pub payment_method_id: String,
     pub payment_kind: String,
     pub payment_label: String,
@@ -496,6 +581,25 @@ pub struct Trade {
 impl Trade {
     pub fn phase(&self) -> Result<Phase> {
         Phase::parse(&self.state).ok_or_else(|| anyhow!("unknown trade state {}", self.state))
+    }
+
+    pub fn lock_by(&self) -> Option<i64> {
+        self.hold_created_at
+            .map(|at| at + INVOICE_EXPIRY_SECS as i64)
+    }
+
+    pub fn hold_ends_at(&self, hold_secs: u64) -> Option<i64> {
+        self.hold_created_at.map(|at| at + hold_secs as i64)
+    }
+
+    pub fn pay_by(&self) -> Option<i64> {
+        self.hold_received_at
+            .map(|at| at + PAYMENT_WINDOW_SECS as i64)
+    }
+
+    pub fn release_by(&self, hold_secs: u64) -> Option<i64> {
+        self.hold_ends_at(hold_secs)
+            .map(|at| at - SAFETY_SECS as i64)
     }
 }
 
@@ -565,6 +669,7 @@ mod tests {
             }],
             status: "open".into(),
             hold_secs: 16 * 3_600,
+            reserved_shannons: 0,
         }
     }
 }

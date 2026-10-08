@@ -11,8 +11,8 @@ use std::sync::Mutex;
 
 const TRADE_COLUMNS: &str = "id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber, \
      fiat_amount, shannons, state, hold_payment_hash, hold_invoice, payout_invoice, \
-     payout_payment_hash, hold_received_at, payment_method_id, payment_kind, payment_label, \
-     payment_currency";
+     payout_payment_hash, hold_received_at, hold_created_at, payment_method_id, payment_kind, \
+     payment_label, payment_currency";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -95,6 +95,7 @@ impl Db {
                 payout_invoice TEXT,
                 payout_payment_hash TEXT,
                 hold_received_at INTEGER,
+                hold_created_at INTEGER,
                 payment_method_id TEXT NOT NULL,
                 payment_kind TEXT NOT NULL,
                 payment_label TEXT NOT NULL,
@@ -114,6 +115,7 @@ impl Db {
             );
             ",
         )?;
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN hold_created_at INTEGER", []);
         sync_supported(&conn)?;
         Ok(())
     }
@@ -185,6 +187,7 @@ impl Db {
                     payment_methods: Vec::new(),
                     status: row.get(9)?,
                     hold_secs: read_u64(row.get(10)?, 10)?,
+                    reserved_shannons: 0,
                 })
             })
             .optional()?;
@@ -192,6 +195,7 @@ impl Db {
             return Ok(None);
         };
         order.payment_methods = load_methods(&conn, id)?;
+        order.reserved_shannons = reserved_shannons_for(&conn, id)?;
         Ok(Some(order))
     }
 
@@ -234,9 +238,9 @@ impl Db {
             "INSERT INTO trades (
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
-                payout_invoice, payout_payment_hash, hold_received_at,
+                payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
                 payment_method_id, payment_kind, payment_label, payment_currency
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 trade.id,
                 trade.order_id,
@@ -252,6 +256,7 @@ impl Db {
                 trade.payout_invoice,
                 trade.payout_payment_hash,
                 trade.hold_received_at,
+                trade.hold_created_at,
                 trade.payment_method_id,
                 trade.payment_kind,
                 trade.payment_label,
@@ -344,9 +349,9 @@ impl Db {
             "INSERT INTO trades (
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
-                payout_invoice, payout_payment_hash, hold_received_at,
+                payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
                 payment_method_id, payment_kind, payment_label, payment_currency
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 trade.id,
                 trade.order_id,
@@ -362,6 +367,7 @@ impl Db {
                 trade.payout_invoice,
                 trade.payout_payment_hash,
                 trade.hold_received_at,
+                trade.hold_created_at,
                 trade.payment_method_id,
                 trade.payment_kind,
                 trade.payment_label,
@@ -430,13 +436,34 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_hold(&self, id: &str, payment_hash: &str, invoice: &str) -> Result<()> {
+    pub fn set_hold(
+        &self,
+        id: &str,
+        payment_hash: &str,
+        invoice: &str,
+        created_at: i64,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute(
-            "UPDATE trades SET hold_payment_hash = ?1, hold_invoice = ?2 WHERE id = ?3",
-            params![payment_hash, invoice, id],
+            "UPDATE trades SET hold_payment_hash = ?1, hold_invoice = ?2, hold_created_at = ?3 WHERE id = ?4",
+            params![payment_hash, invoice, created_at, id],
         )?;
         Ok(())
+    }
+
+    pub fn trades_for_party(&self, pubkey: &str) -> Result<Vec<Trade>> {
+        let conn = self.conn.lock().expect("db");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TRADE_COLUMNS} FROM trades
+             WHERE lower(seller_nostr) = lower(?1) OR lower(buyer_nostr) = lower(?1)
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![pubkey], row_to_trade)?;
+        let mut trades = Vec::new();
+        for row in rows {
+            trades.push(row?);
+        }
+        Ok(trades)
     }
 
     pub fn set_payout(&self, id: &str, invoice: &str, payment_hash: Option<&str>) -> Result<()> {
@@ -602,6 +629,24 @@ fn watched_states() -> Vec<&'static str> {
         .collect()
 }
 
+fn reserved_shannons_for(conn: &Connection, order_id: &str) -> Result<u128> {
+    let states = watched_states();
+    let marks = vec!["?"; states.len()].join(",");
+    let sql = format!(
+        "SELECT COALESCE(SUM(shannons), 0) FROM trades WHERE order_id = ? AND state IN ({marks})"
+    );
+    let mut values: Vec<&dyn rusqlite::ToSql> = vec![&order_id];
+    for state in &states {
+        values.push(&*state);
+    }
+    let total: i64 = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(values.iter().copied()),
+        |row| row.get(0),
+    )?;
+    Ok(read_shannons(total, 0)?)
+}
+
 fn open_trades_for(conn: &Connection, order_id: &str) -> Result<i64> {
     let states = watched_states();
     let marks = vec!["?"; states.len()].join(",");
@@ -673,10 +718,11 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         payout_invoice: row.get(11)?,
         payout_payment_hash: row.get(12)?,
         hold_received_at: row.get(13)?,
-        payment_method_id: row.get(14)?,
-        payment_kind: row.get(15)?,
-        payment_label: row.get(16)?,
-        payment_currency: row.get(17)?,
+        hold_created_at: row.get(14)?,
+        payment_method_id: row.get(15)?,
+        payment_kind: row.get(16)?,
+        payment_label: row.get(17)?,
+        payment_currency: row.get(18)?,
     })
 }
 
@@ -703,6 +749,7 @@ mod tests {
             }],
             status: OrderStatus::Open.as_str().into(),
             hold_secs: 36 * 3_600,
+            reserved_shannons: 0,
         }
     }
 
@@ -722,6 +769,7 @@ mod tests {
             payout_invoice: None,
             payout_payment_hash: None,
             hold_received_at: None,
+            hold_created_at: None,
             payment_method_id: "gtbank".into(),
             payment_kind: "bank".into(),
             payment_label: "GTBank".into(),

@@ -6,13 +6,13 @@ use crate::{
     Actor, CANCELED, CANT_DO, CantDoPayload, ClientAction, Decision, EXPIRED, Envelope,
     FIBER_POLL_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound, Phase, REFUNDING,
     SETTLED, WAITING_FIAT, WaitingFiatPayload, apply_clock, apply_expired, apply_hold_received,
-    apply_release_failed, apply_release_succeeded, trade_actor,
+    apply_release_failed, apply_release_succeeded, trade_actor, unix_now,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::warn;
 
 #[derive(Clone, Copy)]
@@ -166,6 +166,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             Some(ClientAction::Resolve) => {
                 crate::app::resolve::on_resolve(self, sender, envelope).await
             }
+            Some(ClientAction::MyTrades) => crate::app::my_trades::on_my_trades(self, sender),
             None => Ok(vec![cant_do(
                 sender,
                 envelope.trade_id.clone(),
@@ -203,8 +204,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
         {
             return match apply_hold_received(Phase::WaitingHold) {
                 Decision::Ok(next) => {
+                    let received_at = unix_now();
                     self.db
-                        .set_hold_received(&trade.id, next.as_str(), unix_now())?;
+                        .set_hold_received(&trade.id, next.as_str(), received_at)?;
                     Ok(party_replies(
                         &trade,
                         Envelope::new(WAITING_FIAT)
@@ -212,6 +214,8 @@ impl<F: FiberRpc + 'static> Engine<F> {
                             .with_payload(WaitingFiatPayload::from_trade(
                                 &trade,
                                 &order.fiat_currency,
+                                order.hold_secs,
+                                received_at,
                             ))?,
                     ))
                 }
@@ -507,13 +511,6 @@ impl<F: FiberRpc + 'static> Engine<F> {
     }
 }
 
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 pub(crate) fn party_replies(trade: &Trade, envelope: Envelope) -> Vec<Outbound> {
     vec![
         Outbound::Reply {
@@ -695,6 +692,7 @@ mod tests {
             }],
             status: OrderStatus::Open.as_str().into(),
             hold_secs: crate::HOLD_SECS,
+            reserved_shannons: 0,
         })
         .unwrap();
         db.insert_trade(&Trade {
@@ -712,6 +710,7 @@ mod tests {
             payout_invoice: None,
             payout_payment_hash: None,
             hold_received_at: None,
+            hold_created_at: Some(unix_now()),
             payment_method_id: "gtbank".into(),
             payment_kind: "bank".into(),
             payment_label: "GTBank".into(),
@@ -742,6 +741,8 @@ mod tests {
         assert_eq!(details.reference, "trade");
         assert_eq!(details.seller_nostr, "seller");
         assert_eq!(details.buyer_nostr, "buyer");
+        assert!(details.pay_by.is_some());
+        assert!(details.release_by.is_some());
         let trade = engine.db.get_trade("trade").unwrap().unwrap();
         assert!(trade.hold_received_at.is_some());
         engine
@@ -814,13 +815,19 @@ mod tests {
             _ => None,
         });
         assert_eq!(solver_key.as_deref(), Some("ab".repeat(32).as_str()));
-        let buyer_key = disputed.iter().find_map(|item| match item {
+        let buyer_payload = disputed.iter().find_map(|item| match item {
             Outbound::Reply { to, envelope } if to == "buyer" && envelope.action == DISPUTED => {
-                Some(envelope.payload.clone())
+                envelope.payload.clone()
             }
             _ => None,
         });
-        assert_eq!(buyer_key, Some(None));
+        assert_eq!(
+            buyer_payload
+                .as_ref()
+                .and_then(|payload| payload.get("solver"))
+                .and_then(|value| value.as_str()),
+            Some("solver")
+        );
         let missing = engine
             .handle(
                 "solver",
@@ -1070,6 +1077,8 @@ mod tests {
         assert_eq!(details.currency, "NGN");
         assert_eq!(details.seller_nostr, "seller");
         assert_eq!(details.buyer_nostr, "buyer");
+        assert!(details.pay_by.is_some());
+        assert!(details.release_by.is_some());
 
         let seller_fiat = engine
             .handle(
@@ -1560,5 +1569,46 @@ mod tests {
             .unwrap();
         assert!(cant_do_reason(&rejected).contains("timelock"));
         assert!(replies_contain(&rejected, CANT_DO));
+    }
+
+    #[tokio::test]
+    async fn my_trades_returns_only_the_caller() {
+        let (engine, _) = fake_engine("Received");
+        let mine = engine
+            .handle("buyer", Envelope::new(crate::MY_TRADES))
+            .await
+            .unwrap();
+        let payload: crate::TradesPayload = mine
+            .iter()
+            .find_map(|item| match item {
+                Outbound::Reply { to, envelope } if to == "buyer" && envelope.action == crate::TRADES => {
+                    Some(envelope.decode_payload().unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(payload.trades.len(), 1);
+        assert_eq!(payload.trades[0].trade_id, "trade");
+        assert_eq!(payload.trades[0].buyer_nostr, "buyer");
+        assert!(payload.trades[0].lock_by.is_some());
+        let stranger = engine
+            .handle("stranger", Envelope::new(crate::MY_TRADES))
+            .await
+            .unwrap();
+        let empty: crate::TradesPayload = stranger
+            .iter()
+            .find_map(|item| match item {
+                Outbound::Reply { to, envelope }
+                    if to == "stranger" && envelope.action == crate::TRADES =>
+                {
+                    Some(envelope.decode_payload().unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(empty.trades.is_empty());
+        let reserved = engine.db.get_order("order").unwrap().unwrap();
+        assert_eq!(reserved.reserved_shannons, 100_000_000);
+        assert_eq!(reserved.public().reserved_ckb.as_deref(), Some("1"));
     }
 }
