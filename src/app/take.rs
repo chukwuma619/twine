@@ -1,13 +1,8 @@
-use crate::engine::{Engine, cant_do};
+use crate::engine::{Engine, cant_do, need_invoice_replies};
 use crate::fiber::FiberRpc;
 use crate::types::{Outbound, Trade};
-use crate::{
-    Envelope, INVOICE_EXPIRY_SECS, PAY_INVOICE, PayInvoicePayload, Phase, Side, TakePayload,
-    apply_take, hex_bytes, unix_now, validate_take,
-};
+use crate::{Envelope, Phase, Side, TakePayload, apply_take, unix_now};
 use anyhow::{Result, anyhow};
-use rand::RngCore;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub(crate) async fn on_take<F: FiberRpc + 'static>(
@@ -38,18 +33,12 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     let has_open = engine.db.open_trade_for_order(&order.id)?.is_some();
     match apply_take(Phase::Pending, has_open) {
         crate::Decision::Ok(Phase::WaitingHold) => {}
-        crate::Decision::Reject(reason) => return Ok(vec![cant_do(sender, None, reason)]),
+        crate::Decision::Reject(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
         _ => return Ok(vec![cant_do(sender, None, "cannot take this order")]),
     }
-    let shannons = match validate_take(
-        &payload.fiat_amount,
-        &order.min,
-        &order.max,
-        &order.price_per_ckb,
-        order.available_shannons,
-    ) {
+    let shannons = match validate_take_amount(&payload, &order) {
         Ok(value) => value,
-        Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
+        Err(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
     };
     if payload.fiber_pubkey.trim().is_empty() {
         return Ok(vec![cant_do(sender, None, "fiber pubkey is required")]);
@@ -68,14 +57,18 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
             "payment method does not match this currency",
         )]);
     }
-    let mut secret = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut secret);
-    let hash = Sha256::digest(secret);
-    let preimage = hex_bytes(&secret);
-    let payment_hash = hex_bytes(hash.as_slice());
+    let invoice = payload
+        .invoice
+        .as_deref()
+        .map(str::trim)
+        .filter(|invoice| !invoice.is_empty())
+        .map(ToOwned::to_owned);
+    // Sell post: the taker is the buyer and the invoice is in this message.
+    // Buy post: the maker is the buyer and still has to send the invoice.
+    if side == Side::Sell && invoice.is_none() {
+        return Ok(vec![cant_do(sender, None, "payout invoice is required")]);
+    }
     let trade_id = Uuid::new_v4().to_string();
-
-    // A sell post offers CKB, so the poster locks. A buy post bids for CKB, so the taker locks.
     let (seller_nostr, seller_fiber, buyer_nostr, buyer_fiber) = match side {
         Side::Sell => (
             order.maker_nostr.clone(),
@@ -90,6 +83,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
             order.maker_fiber.clone(),
         ),
     };
+    let created_at = unix_now();
     let trade = Trade {
         id: trade_id.clone(),
         order_id: order.id.clone(),
@@ -99,87 +93,50 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         buyer_fiber,
         fiat_amount: payload.fiat_amount,
         shannons,
-        state: Phase::WaitingHold.as_str().into(),
-        hold_payment_hash: Some(payment_hash.clone()),
+        state: Phase::WaitingInvoice.as_str().into(),
+        hold_payment_hash: None,
         hold_invoice: None,
         payout_invoice: None,
         payout_payment_hash: None,
         hold_received_at: None,
-        hold_created_at: None,
+        hold_created_at: Some(created_at),
         payment_method_id: method.id.clone(),
         payment_kind: method.kind.clone(),
         payment_label: method.label.clone(),
         payment_currency: method.currency.clone(),
     };
-    if let Err(error) = engine.db.commit_take(&trade, &preimage) {
+    if let Err(error) = engine.db.commit_take(&trade) {
         return Ok(vec![cant_do(sender, None, &error.to_string())]);
     }
-
-    let created = match engine
-        .fiber
-        .new_hold_invoice(
-            shannons,
-            &payment_hash,
-            &format!("twine {trade_id}"),
-            order.hold_secs * 1_000,
-            crate::INVOICE_EXPIRY_SECS,
-        )
-        .await
-    {
-        Ok(created) => created,
-        Err(error) => {
+    let Some(invoice) = invoice else {
+        engine.watch(&trade_id)?;
+        let order = engine
+            .db
+            .get_order(&order.id)?
+            .ok_or_else(|| anyhow!("order missing after take"))?;
+        return need_invoice_replies(&trade, &order);
+    };
+    match engine.bind_buyer_hold(&trade, &invoice).await? {
+        Ok(outbound) => Ok(outbound),
+        Err(reason) => {
             engine
                 .db
-                .rollback_take(&trade.order_id, &trade.id, &payment_hash, trade.shannons)?;
-            return Ok(vec![cant_do(
-                sender,
-                Some(trade_id),
-                &format!("hold invoice failed: {error}"),
-            )]);
+                .rollback_take(&trade.order_id, &trade.id, "", trade.shannons)?;
+            Ok(vec![cant_do(sender, Some(trade_id), &reason)])
         }
-    };
-    if let Err(error) = engine.fiber.create_preimage(&payment_hash, &preimage).await {
-        let _ = engine.fiber.cancel_invoice(&payment_hash).await;
-        let _ = engine.fiber.remove_preimage(&payment_hash).await;
-        engine
-            .db
-            .rollback_take(&trade.order_id, &trade.id, &payment_hash, trade.shannons)?;
-        return Ok(vec![cant_do(
-            sender,
-            Some(trade_id),
-            &format!("watchtower preimage failed: {error}"),
-        )]);
     }
-    let created_at = unix_now();
-    engine
-        .db
-        .set_hold(&trade_id, &payment_hash, &created.invoice, created_at)?;
-    engine.watch(&trade_id)?;
+}
 
-    let order = engine
-        .db
-        .get_order(&order.id)?
-        .ok_or_else(|| anyhow!("order missing after take"))?;
-    let pay = Envelope::new(PAY_INVOICE)
-        .with_trade(&trade_id)
-        .with_payload(PayInvoicePayload {
-            invoice: created.invoice,
-            amount_shannons: shannons.to_string(),
-            order_id: order.id.clone(),
-            seller_nostr: trade.seller_nostr.clone(),
-            buyer_nostr: trade.buyer_nostr.clone(),
-            lock_by: Some(created_at + INVOICE_EXPIRY_SECS as i64),
-            hold_ends_at: Some(created_at + order.hold_secs as i64),
-        })?;
-    Ok(vec![
-        Outbound::PublicOrder(order.public()),
-        Outbound::Reply {
-            to: trade.seller_nostr.clone(),
-            envelope: pay.clone(),
-        },
-        Outbound::Reply {
-            to: trade.buyer_nostr,
-            envelope: pay,
-        },
-    ])
+fn validate_take_amount(
+    payload: &TakePayload,
+    order: &crate::types::Order,
+) -> Result<u128, String> {
+    crate::validate_take(
+        &payload.fiat_amount,
+        &order.min,
+        &order.max,
+        &order.price_per_ckb,
+        order.available_shannons,
+    )
+    .map_err(|error| error.to_string())
 }

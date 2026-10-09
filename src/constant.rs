@@ -47,7 +47,7 @@ pub const TESTNET_INVOICE_CURRENCY: &str = "Fibt";
 
 pub const MAINNET_INVOICE_CURRENCY: &str = "Fibb";
 
-/// Hold invoices. Must match the preimage the daemon stores.
+/// Hold invoices use the buyer's payment hash. The daemon does not mint it.
 pub const HASH_ALGORITHM: &str = "sha256";
 
 pub const FIBER_POLL_SECS: u64 = 2;
@@ -73,6 +73,7 @@ pub const PAYMENT_CATALOG_TAG: &str = "payment-methods";
 
 pub const NEW_ORDER: &str = "new-order";
 pub const TAKE: &str = "take";
+pub const PAYOUT_INVOICE: &str = "payout-invoice";
 pub const FIAT_SENT: &str = "fiat-sent";
 pub const RELEASE: &str = "release";
 pub const CANCEL: &str = "cancel";
@@ -81,6 +82,7 @@ pub const RESOLVE: &str = "resolve";
 pub const MY_TRADES: &str = "my-trades";
 
 pub const PAY_INVOICE: &str = "pay-invoice";
+pub const NEED_INVOICE: &str = "need-invoice";
 pub const WAITING_FIAT: &str = "waiting-fiat";
 pub const FIAT_SENT_OK: &str = "fiat-sent-ok";
 pub const NEW_INVOICE: &str = "new-invoice";

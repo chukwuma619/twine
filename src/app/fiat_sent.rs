@@ -22,16 +22,28 @@ pub(crate) async fn on_fiat_sent<F: FiberRpc + 'static>(
             )]);
         }
     };
-    if payload.invoice.trim().is_empty() {
+    let Some(trade) = engine.db.get_trade(&trade_id)? else {
+        return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
+    };
+    let replacement = payload.invoice.trim();
+    let stored = trade
+        .payout_invoice
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty();
+    if replacement.is_empty() && stored {
         return Ok(vec![cant_do(
             sender,
             Some(trade_id),
             "payout invoice is required",
         )]);
     }
-    let Some(trade) = engine.db.get_trade(&trade_id)? else {
-        return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
-    };
+    if !replacement.is_empty()
+        && let Err(reason) = engine.require_same_hold_hash(&trade, replacement).await?
+    {
+        return Ok(vec![cant_do(sender, Some(trade_id), &reason)]);
+    }
     let order = engine.require_order(&trade.order_id)?;
     if let Some(outbound) = engine.refund_due_outbound(&order, &trade).await? {
         return Ok(outbound);
@@ -39,7 +51,9 @@ pub(crate) async fn on_fiat_sent<F: FiberRpc + 'static>(
     let actor = engine.trade_actor(&trade, sender);
     match apply_fiat_sent(trade.phase()?, actor) {
         crate::Decision::Ok(phase) => {
-            engine.db.set_payout(&trade.id, &payload.invoice, None)?;
+            if !replacement.is_empty() {
+                engine.db.set_payout(&trade.id, replacement, None)?;
+            }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
             engine.watch(&trade.id)?;
             if phase == Phase::Releasing {

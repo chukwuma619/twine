@@ -214,12 +214,9 @@ impl Db {
             .collect()
     }
 
-    /// Debit the order, insert the trade, and store the hold preimage together.
-    pub fn commit_take(&self, trade: &Trade, preimage: &str) -> Result<()> {
-        let hash = trade
-            .hold_payment_hash
-            .as_deref()
-            .context("take is missing a hold hash")?;
+    /// Debit the order and insert the trade. The hold hash may still be empty.
+    /// The buyer's preimage is never stored here.
+    pub fn commit_take(&self, trade: &Trade) -> Result<()> {
         let shannons = i64_from_shannons(trade.shannons)?;
         let conn = self.conn.lock().expect("db");
         let tx = conn.unchecked_transaction()?;
@@ -251,7 +248,7 @@ impl Db {
                 trade.fiat_amount,
                 shannons,
                 trade.state,
-                hash,
+                trade.hold_payment_hash,
                 trade.hold_invoice,
                 trade.payout_invoice,
                 trade.payout_payment_hash,
@@ -262,10 +259,6 @@ impl Db {
                 trade.payment_label,
                 trade.payment_currency,
             ],
-        )?;
-        tx.execute(
-            "INSERT INTO preimages (payment_hash, preimage) VALUES (?1, ?2)",
-            params![hash, preimage],
         )?;
         tx.commit()?;
         Ok(())
@@ -316,7 +309,7 @@ impl Db {
 
     /// Mark an order canceled only while it has no open trade, and clear the book.
     pub fn cancel_order(&self, id: &str) -> Result<()> {
-        let states = watched_states();
+        let states = open_states();
         let marks = vec!["?"; states.len()].join(",");
         let sql = format!(
             "UPDATE orders SET status = ?, available_shannons = 0
@@ -387,7 +380,7 @@ impl Db {
 
     pub fn open_trade_for_order(&self, order_id: &str) -> Result<Option<Trade>> {
         Ok(self
-            .trades_in_states(Phase::watched_phases())?
+            .trades_in_states(Phase::open_phases())?
             .into_iter()
             .find(|trade| trade.order_id == order_id))
     }
@@ -466,6 +459,20 @@ impl Db {
         Ok(trades)
     }
 
+    /// True when another trade already used this hold hash.
+    /// A settled payment reveals the preimage, so the hash cannot be reused.
+    pub fn hold_hash_used(&self, payment_hash: &str, except_trade: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM trades
+             WHERE id != ?1 AND hold_payment_hash IS NOT NULL
+             AND lower(hold_payment_hash) = lower(?2)",
+            params![except_trade, payment_hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn set_payout(&self, id: &str, invoice: &str, payment_hash: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute(
@@ -478,7 +485,7 @@ impl Db {
     pub fn insert_preimage(&self, payment_hash: &str, preimage: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute(
-            "INSERT INTO preimages (payment_hash, preimage) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO preimages (payment_hash, preimage) VALUES (?1, ?2)",
             params![payment_hash, preimage],
         )?;
         Ok(())
@@ -622,15 +629,15 @@ fn load_methods(conn: &Connection, order_id: &str) -> Result<Vec<PaymentMethod>>
     Ok(methods)
 }
 
-fn watched_states() -> Vec<&'static str> {
-    Phase::watched_phases()
+fn open_states() -> Vec<&'static str> {
+    Phase::open_phases()
         .iter()
         .map(|phase| phase.as_str())
         .collect()
 }
 
 fn reserved_shannons_for(conn: &Connection, order_id: &str) -> Result<u128> {
-    let states = watched_states();
+    let states = open_states();
     let marks = vec!["?"; states.len()].join(",");
     let sql = format!(
         "SELECT COALESCE(SUM(shannons), 0) FROM trades WHERE order_id = ? AND state IN ({marks})"
@@ -648,7 +655,7 @@ fn reserved_shannons_for(conn: &Connection, order_id: &str) -> Result<u128> {
 }
 
 fn open_trades_for(conn: &Connection, order_id: &str) -> Result<i64> {
-    let states = watched_states();
+    let states = open_states();
     let marks = vec!["?"; states.len()].join(",");
     let sql = format!("SELECT COUNT(*) FROM trades WHERE order_id = ? AND state IN ({marks})");
     let mut values: Vec<&dyn rusqlite::ToSql> = vec![&order_id];
@@ -810,13 +817,13 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.insert_order(&sample_order(200_000_000)).unwrap();
         let trade = sample_trade(100_000_000);
-        db.commit_take(&trade, "preimage").unwrap();
+        db.commit_take(&trade).unwrap();
         assert_eq!(
             db.get_order("order").unwrap().unwrap().available_shannons,
             100_000_000
         );
-        assert!(db.get_preimage("0xhash").unwrap().is_some());
-        assert!(db.commit_take(&trade, "preimage").is_err());
+        assert!(db.get_preimage("0xhash").unwrap().is_none());
+        assert!(db.commit_take(&trade).is_err());
         assert_eq!(
             db.get_order("order").unwrap().unwrap().available_shannons,
             100_000_000
@@ -832,11 +839,30 @@ mod tests {
     }
 
     #[test]
+    fn waiting_invoice_reserves_the_slice_and_blocks_the_post() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_order(&sample_order(200_000_000)).unwrap();
+        let mut trade = sample_trade(100_000_000);
+        trade.state = Phase::WaitingInvoice.as_str().into();
+        trade.hold_payment_hash = None;
+        db.commit_take(&trade).unwrap();
+        let order = db.get_order("order").unwrap().unwrap();
+        assert_eq!(order.available_shannons, 100_000_000);
+        assert_eq!(order.reserved_shannons, 100_000_000);
+        assert!(db.open_trade_for_order("order").unwrap().is_some());
+        assert!(db.cancel_order("order").is_err());
+        let second = Trade {
+            id: "trade-2".into(),
+            ..trade
+        };
+        assert!(db.commit_take(&second).is_err());
+    }
+
+    #[test]
     fn cancel_order_refuses_an_open_trade_and_clears_a_free_book() {
         let db = Db::open_in_memory().unwrap();
         db.insert_order(&sample_order(200_000_000)).unwrap();
-        db.commit_take(&sample_trade(100_000_000), "preimage")
-            .unwrap();
+        db.commit_take(&sample_trade(100_000_000)).unwrap();
         assert!(db.cancel_order("order").is_err());
         db.finish_trade("order", "trade", Phase::Settled.as_str(), None)
             .unwrap();

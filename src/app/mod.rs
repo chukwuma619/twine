@@ -5,6 +5,7 @@ pub(crate) mod dispute;
 pub(crate) mod fiat_sent;
 pub(crate) mod my_trades;
 pub(crate) mod new_order;
+pub(crate) mod payout_invoice;
 pub(crate) mod release;
 pub(crate) mod resolve;
 pub(crate) mod take;

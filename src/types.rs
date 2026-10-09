@@ -1,6 +1,6 @@
 use crate::constant::{
     CANCEL, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER, PAYMENT_WINDOW_SECS,
-    RELEASE, RESOLVE, SAFETY_SECS, TAKE,
+    PAYOUT_INVOICE, RELEASE, RESOLVE, SAFETY_SECS, TAKE,
 };
 use crate::util::shannons_to_ckb_string;
 use anyhow::{Result, anyhow};
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Pending,
+    WaitingInvoice,
     WaitingHold,
     WaitingFiat,
     FiatSent,
@@ -25,6 +26,7 @@ impl Phase {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::WaitingInvoice => "waiting-invoice",
             Self::WaitingHold => "waiting-hold",
             Self::WaitingFiat => "waiting-fiat",
             Self::FiatSent => "fiat-sent",
@@ -41,6 +43,7 @@ impl Phase {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(Self::Pending),
+            "waiting-invoice" => Some(Self::WaitingInvoice),
             "waiting-hold" => Some(Self::WaitingHold),
             "waiting-fiat" => Some(Self::WaitingFiat),
             "fiat-sent" => Some(Self::FiatSent),
@@ -71,6 +74,21 @@ impl Phase {
 
     pub fn watched_phases() -> &'static [Phase] {
         &[
+            Self::WaitingHold,
+            Self::WaitingFiat,
+            Self::FiatSent,
+            Self::Releasing,
+            Self::AwaitingInvoice,
+            Self::Disputed,
+            Self::Refunding,
+        ]
+    }
+
+    /// A slice is reserved. Includes `waiting-invoice`, where no hold exists yet
+    /// and the post still must not be taken or canceled.
+    pub fn open_phases() -> &'static [Phase] {
+        &[
+            Self::WaitingInvoice,
             Self::WaitingHold,
             Self::WaitingFiat,
             Self::FiatSent,
@@ -198,6 +216,7 @@ pub enum Decision {
 pub enum ClientAction {
     NewOrder,
     Take,
+    PayoutInvoice,
     FiatSent,
     Release,
     Cancel,
@@ -238,6 +257,7 @@ impl Envelope {
         match self.action.as_str() {
             NEW_ORDER => Some(ClientAction::NewOrder),
             TAKE => Some(ClientAction::Take),
+            PAYOUT_INVOICE => Some(ClientAction::PayoutInvoice),
             FIAT_SENT => Some(ClientAction::FiatSent),
             RELEASE => Some(ClientAction::Release),
             CANCEL => Some(ClientAction::Cancel),
@@ -328,10 +348,31 @@ pub struct TakePayload {
     pub fiat_amount: String,
     pub fiber_pubkey: String,
     pub payment_method_id: String,
+    /// Buyer's payout invoice. Required when the taker is the buyer (a sell post).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayoutInvoicePayload {
+    pub invoice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeedInvoicePayload {
+    pub amount_shannons: String,
+    pub fiat_amount: String,
+    pub fiat_currency: String,
+    pub seller_nostr: String,
+    pub buyer_nostr: String,
+    /// Unix seconds by which the buyer must send the payout invoice.
+    pub submit_by: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FiatSentPayload {
+    /// Empty keeps the invoice already stored on the trade.
+    #[serde(default)]
     pub invoice: String,
 }
 
@@ -429,7 +470,12 @@ pub struct WaitingFiatPayload {
 }
 
 impl WaitingFiatPayload {
-    pub fn from_trade(trade: &Trade, fiat_currency: &str, hold_secs: u64, received_at: i64) -> Self {
+    pub fn from_trade(
+        trade: &Trade,
+        fiat_currency: &str,
+        hold_secs: u64,
+        received_at: i64,
+    ) -> Self {
         Self {
             fiat_amount: trade.fiat_amount.clone(),
             fiat_currency: fiat_currency.to_string(),
@@ -606,6 +652,13 @@ impl Trade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_phases_add_waiting_invoice_to_the_watched_holds() {
+        let open = Phase::open_phases();
+        assert_eq!(open[0], Phase::WaitingInvoice);
+        assert_eq!(&open[1..], Phase::watched_phases());
+    }
 
     #[test]
     fn envelope_roundtrip() {

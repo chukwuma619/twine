@@ -29,6 +29,7 @@ pub struct InvoiceInfo {
 pub struct PaymentInfo {
     pub payment_hash: String,
     pub status: String,
+    pub preimage: Option<String>,
 }
 
 #[derive(Debug, Clone)]

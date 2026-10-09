@@ -351,6 +351,11 @@ pub(crate) mod support {
             .payment_methods[0]
             .id
             .clone();
+        let payout = engine
+            .fiber
+            .new_payout_invoice(100_000_000, "twine payout", 36 * 3_600 * 1_000)
+            .await
+            .unwrap();
         let outbound = engine
             .handle(
                 buyer,
@@ -360,6 +365,7 @@ pub(crate) mod support {
                         fiat_amount: "1000".into(),
                         fiber_pubkey: fiber_pubkey.into(),
                         payment_method_id: method_id,
+                        invoice: Some(payout.invoice),
                     })
                     .unwrap(),
             )

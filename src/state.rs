@@ -151,6 +151,13 @@ pub fn apply_cancel(phase: Phase, actor: Actor, invoice: Option<InvoiceStatus>) 
             Actor::Maker => Decision::Ok(Phase::Canceled),
             _ => Decision::Reject("only the poster can cancel an open order"),
         },
+        Phase::WaitingInvoice => {
+            if matches!(actor, Actor::Seller | Actor::Buyer) {
+                Decision::Ok(Phase::Canceled)
+            } else {
+                Decision::Reject("only a party to the trade can cancel")
+            }
+        }
         Phase::WaitingHold => {
             if !matches!(actor, Actor::Seller | Actor::Buyer) {
                 return Decision::Reject("only a party to the trade can cancel");
