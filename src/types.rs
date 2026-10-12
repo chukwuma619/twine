@@ -278,7 +278,7 @@ impl Envelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewOrderPayload {
-    /// `sell` or `buy`. A sell post offers CKB. A buy post bids for CKB.
+    /// `sell`. A post offers CKB.
     pub side: String,
     pub fiber_pubkey: String,
     pub available_ckb: String,
@@ -286,7 +286,7 @@ pub struct NewOrderPayload {
     pub price_per_ckb: String,
     pub min: String,
     pub max: String,
-    /// Ids from the daemon catalog. A sell post and a buy post both name methods.
+    /// Ids from the daemon catalog.
     /// Account details are shared in the client chat.
     pub payment_methods: Vec<PaymentMethodInput>,
 }
@@ -339,16 +339,15 @@ impl PaymentMethod {
     }
 }
 
-/// Someone joining a post. `fiber_pubkey` is the taker's Fiber key.
-/// On a sell post the taker buys CKB. On a buy post the taker sells CKB.
-/// `payment_method_id` is one method named on the post.
+/// Someone joining a sell post. `fiber_pubkey` is the taker's Fiber key.
+/// The taker buys CKB. `payment_method_id` is one method named on the post.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakePayload {
     pub order_id: String,
     pub fiat_amount: String,
     pub fiber_pubkey: String,
     pub payment_method_id: String,
-    /// Buyer's payout invoice. Required when the taker is the buyer (a sell post).
+    /// Buyer's payout invoice. Required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoice: Option<String>,
 }

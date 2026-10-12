@@ -10,9 +10,9 @@ There is no HTTP API for trades. Twine charges no fee, keeps no ratings, takes n
 
 | Role | Who | What they do |
 | --- | --- | --- |
-| Poster | Whoever creates the post | Sets the side, price, currency, size, and payment methods. Only they can cancel the post before it is taken. |
-| Seller | The CKB seller | Locks the hold invoice and later releases. On a sell post this is the poster. On a buy post this is the taker. |
-| Buyer | The CKB buyer | Pays fiat, then names the Fiber invoice that should receive the coins. On a sell post this is the taker. On a buy post this is the poster. |
+| Poster | Whoever creates the post | Sets the price, currency, size, and payment methods. The post offers CKB. Only they can cancel the post before it is taken. |
+| Seller | The CKB seller | Locks the hold invoice and later releases. This is the poster. |
+| Buyer | The CKB buyer | Pays fiat, then names the Fiber invoice that should receive the coins. This is the taker. |
 | Solver | `TWINE_SOLVER` | A Nostr pubkey that can resolve a dispute. Disputes are refused while this is unset. |
 | Operator | Whoever runs this process | Runs the daemon and the Twine Fiber node. Does not custody trader keys. |
 
@@ -20,9 +20,9 @@ Anyone except the poster can take a post. A post has at most one open trade. The
 
 ## How a trade works
 
-1. **Post.** The poster sends `new-order`. The daemon publishes a public order. `side` is `sell` (offering CKB) or `buy` (bidding for CKB). `status` stays `open` until the poster cancels it. A filled post stays `open` with `available_ckb` at `0`.
+1. **Post.** The poster sends `new-order`. The daemon publishes a public order. `side` is `sell`: the post offers CKB. `status` stays `open` until the poster cancels it. A filled post stays `open` with `available_ckb` at `0`.
 
-2. **Take.** Someone else sends `take` with a fiat amount inside the post's min and max, their Fiber pubkey, and one payment-method id from the post. On a sell post the taker is the buyer, so `take` also carries the buyer's Fiber invoice. The daemon debits that slice, creates the seller's hold under that invoice's payment hash, and does not learn the preimage. Both parties receive `pay-invoice`. On a buy post the maker is the buyer, so `take` has no invoice. Both parties receive `need-invoice`, and the buyer sends `payout-invoice` before the hold exists. A payment hash already used by another trade is rejected. The same hash is required if the buyer later replaces the invoice.
+2. **Take.** Someone else sends `take` with a fiat amount inside the post's min and max, their Fiber pubkey, one payment-method id from the post, and the buyer's Fiber invoice. The taker is the buyer. The daemon debits that slice, creates the seller's hold under that invoice's payment hash, and does not learn the preimage. Both parties receive `pay-invoice`. A payment hash already used by another trade is rejected. The same hash is required if the buyer later replaces the invoice.
 
 3. **Lock.** The seller pays the hold invoice from their own Fiber node. The daemon polls until Fiber reports the invoice `Received`, then sends `waiting-fiat` to both parties. That message names the chosen payment method. Account numbers are not stored here. Traders share them in the client chat.
 
@@ -30,7 +30,7 @@ Anyone except the poster can take a post. A post has at most one open trade. The
 
 5. **Release.** The seller sends `release`. The daemon records the hold hash, pays the buyer's invoice (`send_payment`), and only then reads the preimage Fiber learned from that payment. It registers that preimage with the watchtower and settles the hold. Both parties receive `settled`. Until the payout succeeds, the daemon cannot settle. If the payout fails, the buyer receives `new-invoice` and can submit another invoice with the same payment hash.
 
-6. **Refund.** If the buyer does not send fiat in time, or a later phase runs into the safety deadline below, the daemon sends `refunding`. A preimage is removed only when one was stored. Fiber's timelock then returns the hold to the seller. The slice goes back on the post when Fiber reports the hold invoice `Expired`, and both parties receive `expired`. A buy post that never receives an invoice is canceled after the invoice expiry and the slice returns.
+6. **Refund.** If the buyer does not send fiat in time, or a later phase runs into the safety deadline below, the daemon sends `refunding`. A preimage is removed only when one was stored. Fiber's timelock then returns the hold to the seller. The slice goes back on the post when Fiber reports the hold invoice `Expired`, and both parties receive `expired`. A trade still waiting on an invoice is canceled after the invoice expiry and the slice returns.
 
 Cancel is only possible before the hold is locked. The poster can cancel an untaken post. Either party can cancel while the hold invoice is still `Open`. Once Fiber reports `Received` or `Paid`, cancel is refused and the coins wait for release or for the timelock.
 
@@ -38,7 +38,7 @@ Cancel is only possible before the hold is locked. The poster can cancel an unta
 
 | State | Meaning |
 | --- | --- |
-| `waiting-invoice` | A buy post was taken. The buyer has not sent the payout invoice, so no hold exists yet. |
+| `waiting-invoice` | The buyer has not sent the payout invoice, so no hold exists yet. A new sell post does not stay here: `take` includes the invoice. |
 | `waiting-hold` | Hold invoice exists. The seller has not locked it yet. The daemon does not know the preimage. |
 | `waiting-fiat` | Hold is locked. The buyer has the payment window to pay and name a payout invoice. |
 | `fiat-sent` | The buyer named a payout invoice. Waiting for the seller to release. |
@@ -50,7 +50,7 @@ Cancel is only possible before the hold is locked. The poster can cancel an unta
 | `canceled` | The trade or the post was canceled before the hold locked. A canceled trade returns its slice. |
 | `expired` | The hold invoice expired. The slice is back on the post. |
 
-The daemon watches every state from `waiting-hold` through `refunding`, and also `waiting-invoice` so an unanswered buy post does not reserve the slice forever. On startup it re-registers a preimage only after a payout has revealed one, drops that preimage for any trade already `refunding`, and resumes polling.
+The daemon watches every state from `waiting-hold` through `refunding`, and also `waiting-invoice` so a trade still waiting on an invoice does not reserve the slice forever. On startup it re-registers a preimage only after a payout has revealed one, drops that preimage for any trade already `refunding`, and resumes polling.
 
 ### Disputes
 
@@ -141,7 +141,7 @@ Actions and replies are JSON, then NIP-44 encrypted:
 }
 ```
 
-`side` is `sell` or `buy`. `available_ckb`, `price_per_ckb`, `min`, and `max` are positive decimals. `min` must be less than or equal to `max`. `fiber_pubkey` is the poster's Fiber node.
+`side` must be `sell`. `available_ckb`, `price_per_ckb`, `min`, and `max` are positive decimals. `min` must be less than or equal to `max`. `fiber_pubkey` is the poster's Fiber node.
 
 `take`
 

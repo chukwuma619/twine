@@ -1,8 +1,8 @@
-use crate::engine::{Engine, cant_do, need_invoice_replies};
+use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Outbound, Trade};
 use crate::{Envelope, Phase, Side, TakePayload, apply_take, unix_now};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use uuid::Uuid;
 
 pub(crate) async fn on_take<F: FiberRpc + 'static>(
@@ -30,6 +30,9 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     let Some(side) = Side::parse(&order.side) else {
         return Ok(vec![cant_do(sender, None, "order side is invalid")]);
     };
+    if side != Side::Sell {
+        return Ok(vec![cant_do(sender, None, "only a sell post can be taken")]);
+    }
     let has_open = engine.db.open_trade_for_order(&order.id)?.is_some();
     match apply_take(Phase::Pending, has_open) {
         crate::Decision::Ok(Phase::WaitingHold) => {}
@@ -63,26 +66,16 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         .map(str::trim)
         .filter(|invoice| !invoice.is_empty())
         .map(ToOwned::to_owned);
-    // Sell post: the taker is the buyer and the invoice is in this message.
-    // Buy post: the maker is the buyer and still has to send the invoice.
-    if side == Side::Sell && invoice.is_none() {
+    let Some(invoice) = invoice else {
         return Ok(vec![cant_do(sender, None, "payout invoice is required")]);
-    }
-    let trade_id = Uuid::new_v4().to_string();
-    let (seller_nostr, seller_fiber, buyer_nostr, buyer_fiber) = match side {
-        Side::Sell => (
-            order.maker_nostr.clone(),
-            order.maker_fiber.clone(),
-            sender.to_string(),
-            payload.fiber_pubkey,
-        ),
-        Side::Buy => (
-            sender.to_string(),
-            payload.fiber_pubkey,
-            order.maker_nostr.clone(),
-            order.maker_fiber.clone(),
-        ),
     };
+    let trade_id = Uuid::new_v4().to_string();
+    let (seller_nostr, seller_fiber, buyer_nostr, buyer_fiber) = (
+        order.maker_nostr.clone(),
+        order.maker_fiber.clone(),
+        sender.to_string(),
+        payload.fiber_pubkey,
+    );
     let created_at = unix_now();
     let trade = Trade {
         id: trade_id.clone(),
@@ -108,14 +101,6 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     if let Err(error) = engine.db.commit_take(&trade) {
         return Ok(vec![cant_do(sender, None, &error.to_string())]);
     }
-    let Some(invoice) = invoice else {
-        engine.watch(&trade_id)?;
-        let order = engine
-            .db
-            .get_order(&order.id)?
-            .ok_or_else(|| anyhow!("order missing after take"))?;
-        return need_invoice_replies(&trade, &order);
-    };
     match engine.bind_buyer_hold(&trade, &invoice).await? {
         Ok(outbound) => Ok(outbound),
         Err(reason) => {

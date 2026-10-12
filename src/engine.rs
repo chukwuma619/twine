@@ -4,8 +4,8 @@ use crate::nostr::publish_outbounds;
 use crate::types::{Order, Trade};
 use crate::{
     Actor, CANCELED, CANT_DO, CantDoPayload, ClientAction, Decision, EXPIRED, Envelope,
-    FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEED_INVOICE, NEW_INVOICE,
-    NeedInvoicePayload, NewInvoicePayload, Outbound, PAY_INVOICE, PayInvoicePayload, Phase,
+    FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload,
+    Outbound, PAY_INVOICE, PayInvoicePayload, Phase,
     REFUNDING, SETTLED, WAITING_FIAT, WaitingFiatPayload, apply_clock, apply_expired,
     apply_hold_received, apply_release_failed, apply_release_succeeded, trade_actor, unix_now,
 };
@@ -728,31 +728,6 @@ fn pay_invoice_replies(
     ])
 }
 
-pub(crate) fn need_invoice_replies(trade: &Trade, order: &Order) -> Result<Vec<Outbound>> {
-    let submit_by = trade.hold_created_at.unwrap_or_else(unix_now) + INVOICE_EXPIRY_SECS as i64;
-    let need = Envelope::new(NEED_INVOICE)
-        .with_trade(&trade.id)
-        .with_payload(NeedInvoicePayload {
-            amount_shannons: trade.shannons.to_string(),
-            fiat_amount: trade.fiat_amount.clone(),
-            fiat_currency: order.fiat_currency.clone(),
-            seller_nostr: trade.seller_nostr.clone(),
-            buyer_nostr: trade.buyer_nostr.clone(),
-            submit_by,
-        })?;
-    Ok(vec![
-        Outbound::PublicOrder(order.public()),
-        Outbound::Reply {
-            to: trade.seller_nostr.clone(),
-            envelope: need.clone(),
-        },
-        Outbound::Reply {
-            to: trade.buyer_nostr.clone(),
-            envelope: need,
-        },
-    ])
-}
-
 fn same_hash(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
@@ -790,9 +765,9 @@ mod tests {
     };
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
-        FiatSentPayload, NEED_INVOICE, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus,
-        PAY_INVOICE, PAYMENT_WINDOW_SECS, PAYOUT_INVOICE, PaymentMethod, PaymentMethodInput,
-        PayoutInvoicePayload, REFUNDING, RELEASE, RESOLVE, ResolvePayload, SETTLED, TAKE,
+        FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus, PAY_INVOICE,
+        PAYMENT_WINDOW_SECS, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE, RESOLVE,
+        ResolvePayload, SETTLED, TAKE,
         TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
@@ -1388,17 +1363,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_seller_fills_a_buy_post() {
+    async fn a_buy_post_cannot_be_created_or_taken() {
         let fiber = Arc::new(FakeFiber {
             status: StdMutex::new("Open".into()),
             removed: StdMutex::new(false),
             preimages: StdMutex::new(HashSet::new()),
             payment_status: StdMutex::new("Inflight".into()),
             payment_preimage: StdMutex::new(None),
-            parsed_amount: StdMutex::new(100_000_000),
+            parsed_amount: StdMutex::new(0),
         });
-        let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber.clone(), None);
-        let posted = engine
+        let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber, None);
+        let rejected = engine
             .handle(
                 "buyer",
                 Envelope::new(NEW_ORDER)
@@ -1416,152 +1391,53 @@ mod tests {
             )
             .await
             .unwrap();
-        let Outbound::PublicOrder(public) = &posted[0] else {
-            panic!("expected a public order");
-        };
-        assert_eq!(public.side, "buy");
-        assert_eq!(public.maker_nostr_pubkey, "buyer");
-        assert_eq!(public.payment_methods[0].kind, "wallet");
-        assert_eq!(public.payment_methods[0].currency, "USD");
-        let order_id = public.order_id.clone();
-        let method_id = public.payment_methods[0].id.clone();
+        assert!(cant_do_reason(&rejected).contains("sell"));
+        assert!(engine.db.orders().unwrap().is_empty());
 
-        let own = engine
-            .handle(
-                "buyer",
-                Envelope::new(TAKE)
-                    .with_payload(TakePayload {
-                        order_id: order_id.clone(),
-                        fiat_amount: "1000".into(),
-                        fiber_pubkey: "fiber-buyer".into(),
-                        payment_method_id: method_id.clone(),
-                        invoice: None,
-                    })
-                    .unwrap(),
-            )
-            .await
+        engine
+            .db
+            .insert_order(&Order {
+                id: "buy-1".into(),
+                side: "buy".into(),
+                maker_nostr: "buyer".into(),
+                maker_fiber: "fiber-buyer".into(),
+                available_shannons: 1_000_000_000,
+                fiat_currency: "USD".into(),
+                price_per_ckb: "1000".into(),
+                min: "1000".into(),
+                max: "10000".into(),
+                payment_methods: vec![PaymentMethod {
+                    id: "zelle".into(),
+                    kind: "wallet".into(),
+                    label: "Zelle".into(),
+                    currency: "USD".into(),
+                }],
+                status: OrderStatus::Open.as_str().into(),
+                hold_secs: 36 * 3_600,
+                reserved_shannons: 0,
+            })
             .unwrap();
-        assert!(cant_do_reason(&own).contains("your own order"));
-
         let taken = engine
             .handle(
                 "seller",
                 Envelope::new(TAKE)
                     .with_payload(TakePayload {
-                        order_id,
+                        order_id: "buy-1".into(),
                         fiat_amount: "1000".into(),
                         fiber_pubkey: "fiber-seller".into(),
-                        payment_method_id: method_id,
+                        payment_method_id: "zelle".into(),
                         invoice: None,
                     })
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert!(reply_to(&taken, "seller", NEED_INVOICE));
-        assert!(reply_to(&taken, "buyer", NEED_INVOICE));
-        let need: crate::NeedInvoicePayload = taken
-            .iter()
-            .find_map(|item| match item {
-                Outbound::Reply { envelope, .. } if envelope.action == NEED_INVOICE => {
-                    Some(envelope.decode_payload().unwrap())
-                }
-                _ => None,
-            })
-            .unwrap();
-        let now = crate::unix_now();
-        assert!(need.submit_by >= now);
-        assert!(need.submit_by <= now + crate::INVOICE_EXPIRY_SECS as i64 + 2);
-        let trade_id = taken
-            .iter()
-            .find_map(|item| match item {
-                Outbound::Reply { envelope, .. } => envelope.trade_id.clone(),
-                _ => None,
-            })
-            .unwrap();
-        let invoiced = engine
-            .handle(
-                "buyer",
-                Envelope::new(PAYOUT_INVOICE)
-                    .with_trade(&trade_id)
-                    .with_payload(PayoutInvoicePayload {
-                        invoice: "buyer-invoice".into(),
-                    })
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(reply_to(&invoiced, "seller", PAY_INVOICE));
-        assert!(reply_to(&invoiced, "buyer", PAY_INVOICE));
-        assert!(engine.db.get_preimage("hash").unwrap().is_none());
-        let trade = engine.db.get_trade(&trade_id).unwrap().unwrap();
-        assert_eq!(trade.seller_nostr, "seller");
-        assert_eq!(trade.seller_fiber, "fiber-seller");
-        assert_eq!(trade.buyer_nostr, "buyer");
-        assert_eq!(trade.buyer_fiber, "fiber-buyer");
-        assert_eq!(trade.payment_method_id, "zelle");
-
-        *fiber.status.lock().unwrap() = "Received".into();
-        let waiting = engine.on_hold_status(&trade_id).await.unwrap();
-        assert!(replies_contain(&waiting, WAITING_FIAT));
-        let details: WaitingFiatPayload = waiting
-            .iter()
-            .find_map(|item| match item {
-                Outbound::Reply { envelope, .. } if envelope.action == WAITING_FIAT => {
-                    Some(envelope.decode_payload().unwrap())
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(details.kind, "wallet");
-        assert_eq!(details.label, "Zelle");
-        assert_eq!(details.currency, "USD");
-
-        let seller_fiat = engine
-            .handle(
-                "seller",
-                Envelope::new(FIAT_SENT)
-                    .with_trade(&trade_id)
-                    .with_payload(FiatSentPayload {
-                        invoice: "seller-invoice".into(),
-                    })
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(cant_do_reason(&seller_fiat).contains("buyer"));
-
-        let fiat = engine
-            .handle(
-                "buyer",
-                Envelope::new(FIAT_SENT)
-                    .with_trade(&trade_id)
-                    .with_payload(FiatSentPayload {
-                        invoice: "buyer-invoice".into(),
-                    })
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(replies_contain(&fiat, FIAT_SENT_OK));
-
-        let buyer_release = engine
-            .handle("buyer", Envelope::new(RELEASE).with_trade(&trade_id))
-            .await
-            .unwrap();
-        assert!(cant_do_reason(&buyer_release).contains("seller"));
-        engine
-            .handle("seller", Envelope::new(RELEASE).with_trade(&trade_id))
-            .await
-            .unwrap();
-        assert_eq!(
-            engine.db.get_trade(&trade_id).unwrap().unwrap().state,
-            Phase::Releasing.as_str()
-        );
+        assert!(cant_do_reason(&taken).contains("sell"));
+        assert!(engine.db.open_trade_for_order("buy-1").unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn a_post_must_be_sell_or_buy() {
+    async fn a_post_must_be_sell() {
         let fiber = Arc::new(FakeFiber {
             status: StdMutex::new("Open".into()),
             removed: StdMutex::new(false),
@@ -1589,7 +1465,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(cant_do_reason(&rejected).contains("sell or buy"));
+        assert!(cant_do_reason(&rejected).contains("sell"));
     }
 
     #[tokio::test]
@@ -1608,7 +1484,7 @@ mod tests {
                 "buyer",
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
-                        side: "buy".into(),
+                        side: "sell".into(),
                         fiber_pubkey: "fiber-buyer".into(),
                         available_ckb: "10".into(),
                         fiat_currency: "USD".into(),

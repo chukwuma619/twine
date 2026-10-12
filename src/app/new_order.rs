@@ -16,9 +16,9 @@ pub(crate) async fn on_new_order<F: FiberRpc + 'static>(
         Ok(payload) => payload,
         Err(_) => return Ok(vec![cant_do(sender, None, "invalid new-order payload")]),
     };
-    let Some(side) = Side::parse(payload.side.trim()) else {
-        return Ok(vec![cant_do(sender, None, "side must be sell or buy")]);
-    };
+    if Side::parse(payload.side.trim()) != Some(Side::Sell) {
+        return Ok(vec![cant_do(sender, None, "side must be sell")]);
+    }
     let available = match validate_new_order(
         &payload.available_ckb,
         &payload.price_per_ckb,
@@ -39,7 +39,7 @@ pub(crate) async fn on_new_order<F: FiberRpc + 'static>(
         };
     let order = Order {
         id: Uuid::new_v4().to_string(),
-        side: side.as_str().to_string(),
+        side: Side::Sell.as_str().to_string(),
         maker_nostr: sender.to_string(),
         maker_fiber: payload.fiber_pubkey,
         available_shannons: available,
