@@ -15,9 +15,11 @@ docker build -f docker/Dockerfile -t fiber:local .
 
 ## Run the published image
 
+The node's CKB wallet, the two passwords, and how the daemon reaches RPC are in the [README](../README.md#fiber-node). Use `nervos/fiber:0.9.1` with this daemon. The key file is 64 hex characters with no `0x` prefix.
+
 ```bash
 mkdir -p ./fiber-node/ckb
-# Put your CKB private key in ./fiber-node/ckb/key before starting the node.
+# Create or export the CKB wallet into ./fiber-node/ckb/key before starting the node.
 
 docker run --rm -it \
   --name fiber-node \

@@ -150,11 +150,14 @@ Actions and replies are JSON, then NIP-44 encrypted:
   "order_id": "<order id>",
   "fiat_amount": "1000",
   "fiber_pubkey": "<taker's fnn pubkey>",
-  "payment_method_id": "gtbank"
+  "payment_method_id": "gtbank",
+  "invoice": "<buyer payout invoice>"
 }
 ```
 
-`fiat-sent` requires `trade_id` and `{ "invoice": "<fiber invoice>" }`. Only the buyer can send it.
+`invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to.
+
+`fiat-sent` requires `trade_id`. The payload is `{ "invoice": "<fiber invoice>" }`. Leave `invoice` empty when `take` already stored the payout invoice. A replacement must use the same payment hash. Only the buyer can send it.
 
 `release` requires `trade_id` and no payload. Only the seller can send it, and only after a payout invoice is stored.
 
@@ -217,53 +220,202 @@ A public order is published alongside the replies that change the book (`new-ord
 
 ## Configuration
 
-The process reads its environment directly. It does not load a `.env` file. Copy `.env.example` and export it yourself.
+Export the variables below before `cargo run`. The [run](#run-locally) section writes them to `.env` and exports that file. On a VPS, systemd loads the same variables. That install is [DEPLOY.md](DEPLOY.md).
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `TWINE_NOSTR_SECRET` | yes | Daemon Nostr key. Hex or `nsec`. Startup logs the matching `npub`. People paste that `npub` and `TWINE_RELAYS` into the app. |
 | `TWINE_RELAYS` | yes | Comma-separated websocket URLs. At least one. |
-| `TWINE_RPC` | yes | Fiber JSON-RPC URL, usually `http://127.0.0.1:8227`. |
+| `TWINE_RPC` | yes | Fiber JSON-RPC URL. Locally this is `http://127.0.0.1:8227`. |
 | `TWINE_RPC_TOKEN` | yes | Biscuit for that RPC, sent as `Authorization: Bearer`. |
 | `FIBER_NETWORK` | no | `testnet` (default) or `mainnet`. Selects invoice currency `Fibt` or `Fibb`. |
 | `TWINE_SOLVER` | no | Hex Nostr pubkey allowed to send `resolve`. Empty means disputes are refused. |
 | `TWINE_DB` | no | SQLite path. Default `./twine.db`. |
 | `RUST_LOG` | no | Tracing filter. Default `info`. |
 
-The Fiber node checks the biscuit against `rpc.biscuit_public_key`. The token needs:
+`FIBER_SECRET_KEY_PASSWORD` is the Fiber node's password. It encrypts `fiber-node/ckb/key`. The password typed into `ckb-cli` only unlocks that wallet inside `ckb-cli`.
 
-```
-read("node");
-read("invoices"); write("invoices");
-read("payments"); write("payments");
-node("<this fnn pubkey>");
-write("watchtower");
-```
+## Run locally
 
-`create_preimage` refuses a token that has no `node` fact. See Fiber's [biscuit auth](https://github.com/nervosnetwork/fiber/blob/main/docs/biscuit-auth.md) for how to mint the key pair.
+Run this from the repository root. You need a Rust toolchain that supports edition 2024 (`rustup`), Docker, [ckb-cli 2.0.0](https://github.com/nervosnetwork/ckb-cli/releases/tag/v2.0.0), and `openssl`. Start Fiber before the daemon. Traders open a channel to this node. The daemon announces its pubkey as kind `31421`.
 
-`FIBER_SECRET_KEY_PASSWORD` and `CKB_RPC_URL` belong to the Fiber node, not to this daemon. They are in `.env.example` because the node image reads them. Testnet uses Fiber's bundled `https://testnet.ckbapp.dev/`. Mainnet must set `CKB_RPC_URL` to a CKB RPC the node can reach. A store cannot change chains. To switch, stop the node and move `./fiber-node` aside.
+Use the published image `nervos/fiber:0.9.1`. Image build, `fnn-cli`, and store migration are in [docker/README.md](docker/README.md).
 
-## Run
+### CKB key
 
-Install a Rust toolchain that supports edition 2024, then:
+`fiber-node/ckb/key` is the node's CKB wallet. Fiber's [Docker guide](https://www.fiber.world/docs/quick-start/run-a-node/docker) uses the same file. `account new` asks for a wallet password and prints a `lock_arg`. The `--url` flag makes the printed address a testnet `ckt1` address.
 
 ```bash
-cp .env.example .env
-# fill in the daemon key, relays, and RPC token
+ckb-cli --url https://testnet.ckbapp.dev account new
+mkdir -p "$HOME/twine-ckb" fiber-node/ckb
+ckb-cli account export \
+  --lock-arg YOUR_LOCK_ARG \
+  --extended-privkey-path "$HOME/twine-ckb/exported-key"
+head -n 1 "$HOME/twine-ckb/exported-key" | sed 's/^0x//' > "$HOME/twine-ckb/ckb-key"
+rm "$HOME/twine-ckb/exported-key"
+cp "$HOME/twine-ckb/ckb-key" fiber-node/ckb/key
+chmod 600 "$HOME/twine-ckb/ckb-key" fiber-node/ckb/key
+ckb-cli --url https://testnet.ckbapp.dev util key-info --privkey-path "$HOME/twine-ckb/ckb-key"
+```
+
+`account export` asks for the wallet password again. The exported line starts with `0x`, and Fiber rejects a plaintext key in that form. Send testnet CKB to the `ckt1` address from `key-info`. The node spends it on chain fees. A `ckb1` address is the same key on mainnet.
+
+An account already in `ckb-cli` skips `account new` and exports with its own `lock_arg`. A key from another wallet is one line of 64 hex characters with no `0x` prefix: write that line to `$HOME/twine-ckb/ckb-key` and copy it to `fiber-node/ckb/key`.
+
+On first start, Fiber encrypts `fiber-node/ckb/key` with the password below. `$HOME/twine-ckb/ckb-key` stays the plaintext copy. Replace `YOUR_FIBER_PASSWORD` before running the block. One line, no spaces. Every later start of this store needs the same password.
+
+```bash
+umask 077
+cat > "$HOME/twine-ckb/fiber.env" << 'EOF'
+FIBER_SECRET_KEY_PASSWORD=YOUR_FIBER_PASSWORD
+EOF
+chmod 600 "$HOME/twine-ckb/fiber.env"
+```
+
+### Fiber node
+
+The commands below start testnet, which uses `https://testnet.ckbapp.dev/`. For mainnet, add `-e FIBER_CONFIG_TEMPLATE=/usr/local/share/fiber/config/mainnet/config.yml` to the first `docker run`, then set `ckb.rpc_url` in `fiber-node/config.yml` to a CKB RPC this machine can reach, and set `FIBER_NETWORK=mainnet` in `.env`. A store cannot change chains. To switch, stop the container, move `fiber-node/` aside, and start again.
+
+Run one of the two `docker run` commands. On Linux, `--network host` puts the node's `127.0.0.1:8227` on the machine, and that address is `TWINE_RPC`.
+
+```bash
+docker run -d --name fiber-node --restart unless-stopped \
+  --network host \
+  --env-file "$HOME/twine-ckb/fiber.env" \
+  -e RUST_LOG=info \
+  -v "$(pwd)/fiber-node:/fiber" \
+  nervos/fiber:0.9.1
+```
+
+Docker Desktop on macOS keeps the container's loopback inside the container, so skip the command above. This one publishes the Fiber port. RPC stays inside the container until the biscuit public key is set, and `fnn-cli` reads it from there:
+
+```bash
+docker run -d --name fiber-node --restart unless-stopped \
+  --env-file "$HOME/twine-ckb/fiber.env" \
+  -e RUST_LOG=info \
+  -v "$(pwd)/fiber-node:/fiber" \
+  -p 8228:8228 \
+  nervos/fiber:0.9.1
+```
+
+Decrypting the key can take about half a minute. Continue once `pubkey` is printed. Run the command again if it is missing.
+
+```bash
+docker exec fiber-node fnn-cli info
+```
+
+Copy `pubkey`. The token below binds itself to it.
+
+When wallets on another machine open a channel here, uncomment `announced_addrs` in `fiber-node/config.yml` and set a reachable address. The restart below picks it up:
+
+```yaml
+  announced_addrs:
+    - "/ip4/YOUR-PUBLIC-IP/tcp/8228"
+```
+
+### RPC token
+
+`biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.9.1 checks. The Fiber node checks the biscuit against `rpc.biscuit_public_key`. The token needs `read` and `write` on `invoices` and `payments`, `read("node")`, `write("watchtower")`, and `node("<fnn pubkey>")`. `create_preimage` refuses a token that has no `node` fact. Fiber's [biscuit auth](https://github.com/nervosnetwork/fiber/blob/main/docs/biscuit-auth.md) describes the format.
+
+```bash
+cargo install biscuit-cli --version 0.6.0-beta.2 --locked
+umask 077
+biscuit keypair | tee "$HOME/twine-ckb/biscuit-keypair.txt"
+chmod 600 "$HOME/twine-ckb/biscuit-keypair.txt"
+```
+
+The `Private key:` line signs tokens. The `Public key:` line starts with `ed25519/`. Set `FNN_PUBKEY` to the Fiber `pubkey` from `fnn-cli info`.
+
+```bash
+FNN_PUBKEY=YOUR_FNN_PUBKEY
+cat > "$HOME/twine-ckb/permissions.bc" << EOF
+read("node");
+read("invoices");
+write("invoices");
+read("payments");
+write("payments");
+write("watchtower");
+node("$FNN_PUBKEY");
+EOF
+PRIV=$(awk -F': ' '/^Private key:/{print $2}' "$HOME/twine-ckb/biscuit-keypair.txt")
+biscuit generate --private-key "$PRIV" "$HOME/twine-ckb/permissions.bc" \
+  | tr -d '\n' > "$HOME/twine-ckb/rpc-token"
+echo >> "$HOME/twine-ckb/rpc-token"
+chmod 600 "$HOME/twine-ckb/rpc-token"
+```
+
+Write the public key into `fiber-node/config.yml`. On Linux leave `RPC_BIND` as written. On macOS set it to `0.0.0.0:8227`. Fiber accepts that bind once the public key is in the file, and Docker can then publish RPC on the machine's loopback. If the write is denied, put `sudo env RPC_BIND="$RPC_BIND" PUB="$PUB"` in front of `python3` and drop the two assignments already on that line.
+
+```bash
+RPC_BIND=127.0.0.1:8227
+# macOS Docker Desktop: RPC_BIND=0.0.0.0:8227
+PUB=$(awk -F': ' '/^Public key:/{print $2}' "$HOME/twine-ckb/biscuit-keypair.txt")
+RPC_BIND="$RPC_BIND" PUB="$PUB" python3 - << 'PY'
+import os
+from pathlib import Path
+path = Path("fiber-node/config.yml")
+text = path.read_text()
+old = 'listening_addr: "127.0.0.1:8227"'
+new = f'listening_addr: "{os.environ["RPC_BIND"]}"\n  biscuit_public_key: "{os.environ["PUB"]}"'
+if "biscuit_public_key:" not in text:
+    if old not in text:
+        raise SystemExit("rpc listening_addr not found")
+    path.write_text(text.replace(old, new, 1))
+PY
+grep -n biscuit_public_key fiber-node/config.yml
+```
+
+On Linux, restart the container you already started:
+
+```bash
+docker restart fiber-node
+```
+
+On macOS, remove that container and start it again with RPC published on `127.0.0.1`:
+
+```bash
+docker rm -f fiber-node
+docker run -d --name fiber-node --restart unless-stopped \
+  --env-file "$HOME/twine-ckb/fiber.env" \
+  -e RUST_LOG=info \
+  -v "$(pwd)/fiber-node:/fiber" \
+  -p 127.0.0.1:8227:8227 \
+  -p 8228:8228 \
+  nervos/fiber:0.9.1
+```
+
+Give the key decrypt half a minute, then call RPC with the token. A JSON `node_info` result means the token matches the public key. After this, `fnn-cli info` needs `--auth-token`.
+
+```bash
+curl -sS http://127.0.0.1:8227 \
+  -H "Authorization: Bearer $(tr -d '\n' < "$HOME/twine-ckb/rpc-token")" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}'
+```
+
+### Daemon
+
+From the repo root. This writes a new Nostr secret. To keep an existing identity, put that `nsec` or 64-character hex secret in `TWINE_NOSTR_SECRET` after the file is written. Add `TWINE_SOLVER=<hex pubkey>` when a solver exists.
+
+```bash
+umask 077
+NOSTR_SECRET=$(openssl rand -hex 32)
+RPC_TOKEN=$(tr -d '\n' < "$HOME/twine-ckb/rpc-token")
+cat > .env << EOF
+FIBER_NETWORK=testnet
+RUST_LOG=info
+TWINE_NOSTR_SECRET=${NOSTR_SECRET}
+TWINE_RELAYS=wss://relay.damus.io,wss://nos.lol
+TWINE_RPC=http://127.0.0.1:8227
+TWINE_RPC_TOKEN=${RPC_TOKEN}
+EOF
+chmod 600 .env
+unset NOSTR_SECRET RPC_TOKEN
 set -a && source .env && set +a
 cargo run --release
 ```
 
-The daemon refuses to start when no relay connects, when the RPC token is empty, or when `FIBER_NETWORK` is neither `testnet` nor `mainnet`.
-
-The first successful RPC call stores that Fiber node's pubkey. Restarting against the same node is fine. Restarting against a different node while a hold is still open fails on purpose, and so does booting with open holds and no stored pubkey.
-
-## Fiber node
-
-Traders do not use this node as their wallet. They open a channel to it so a hold invoice can be paid. The daemon announces the pubkey as kind `31421`.
-
-`docker/` builds an `fnn` image from [nervosnetwork/fiber](https://github.com/nervosnetwork/fiber). It is the Fiber node, not this daemon. Setup, ports, `fnn-cli`, and store migration are in [docker/README.md](docker/README.md). Bundled configs are `config/testnet/config.yml` and `config/mainnet/config.yml`. RPC listens on `127.0.0.1:8227` in those files.
+Startup logs the daemon `npub` and the Fiber pubkey. The daemon exits when no relay connects, the RPC token is empty, or `FIBER_NETWORK` is not `testnet` or `mainnet`. The first successful RPC call pins that Fiber pubkey in SQLite. Restarting against the same node is fine. A different node, while a hold is still open, is refused.
 
 ## Persistence
 
@@ -294,3 +446,4 @@ cargo test -- --ignored
 | `src/db.rs` | SQLite. |
 | `src/constant.rs` | Time limits, catalog, and event kinds. |
 | `docker/` | Fiber node image. |
+| `DEPLOY.md` | VPS install for this daemon and a Fiber node. |
