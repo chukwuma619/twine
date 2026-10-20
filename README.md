@@ -1,38 +1,28 @@
 # Twine
 
-Twine is a peer-to-peer CKB market settled on [Fiber](https://github.com/nervosnetwork/fiber). Fiat moves outside the protocol. The seller's coins sit in a Fiber hold invoice until the seller releases them, or until that hold expires and Fiber refunds the seller.
+Twine is a peer-to-peer CKB market. Fiat moves outside the protocol. CKB stays in each trader's Fiber wallet.
 
-This repository is the coordinator daemon (`twine-daemon`). It speaks Nostr to clients and JSON-RPC to one Fiber node (`fnn`). It never holds a user's Fiber key. Each trader runs their own node and pays or receives on it. The operator runs this daemon and one Twine Fiber node that the hold invoices are locked to.
+This repository is the coordinator daemon (`twine-daemon`). It speaks Nostr to the [Flutter client](https://github.com/chukwuma619/twine_app) and JSON-RPC to one Fiber node (`fnn`). It never holds a user's Fiber key. Each trader pays and receives on their own node. The operator runs this daemon and one Twine Fiber node that the hold invoices are locked to.
 
 There is no HTTP API for trades. Twine charges no fee, keeps no ratings, takes no bond, and does not use UDTs. The two traders chat on the client. The daemon does not read that thread.
 
-## Roles
-
-| Role | Who | What they do |
-| --- | --- | --- |
-| Poster | Whoever creates the post | Sets the price, currency, size, and payment methods. The post offers CKB. Only they can cancel the post before it is taken. |
-| Seller | The CKB seller | Locks the hold invoice and later releases. This is the poster. |
-| Buyer | The CKB buyer | Pays fiat, then names the Fiber invoice that should receive the coins. This is the taker. |
-| Solver | `TWINE_SOLVER` | A Nostr pubkey that can resolve a dispute. Disputes are refused while this is unset. |
-| Operator | Whoever runs this process | Runs the daemon and the Twine Fiber node. Does not custody trader keys. |
-
-Anyone except the poster can take a post. A post has at most one open trade. The next take waits until that trade is settled, canceled, or expired.
-
 ## How a trade works
 
-1. **Post.** The poster sends `new-order`. The daemon publishes a public order. `side` is `sell`: the post offers CKB. `status` stays `open` until the poster cancels it. A filled post stays `open` with `available_ckb` at `0`.
+A post offers CKB. The poster is the seller. The taker is the buyer. There is no buy post, and there is no automatic matching: someone picks a post. Anyone except the poster can take it. A post has at most one open trade. The next take waits until that trade is settled, canceled, or expired.
 
-2. **Take.** Someone else sends `take` with a fiat amount inside the post's min and max, their Fiber pubkey, one payment-method id from the post, and the buyer's Fiber invoice. The taker is the buyer. The daemon debits that slice, creates the seller's hold under that invoice's payment hash, and does not learn the preimage. Both parties receive `pay-invoice`. A payment hash already used by another trade is rejected. The same hash is required if the buyer later replaces the invoice.
-
-3. **Lock.** The seller pays the hold invoice from their own Fiber node. The daemon polls until Fiber reports the invoice `Received`, then sends `waiting-fiat` to both parties. That message names the chosen payment method. Account numbers are not stored here. Traders share them in the client chat.
-
-4. **Fiat.** The buyer pays outside Twine and sends `fiat-sent`. The payout invoice is already the one from take or `payout-invoice`, so this message can leave `invoice` empty. A replacement invoice must use the same payment hash. The daemon replies `fiat-sent-ok`.
-
-5. **Release.** The seller sends `release`. The daemon records the hold hash, pays the buyer's invoice (`send_payment`), and only then reads the preimage Fiber learned from that payment. It registers that preimage with the watchtower and settles the hold. Both parties receive `settled`. Until the payout succeeds, the daemon cannot settle. If the payout fails, the buyer receives `new-invoice` and can submit another invoice with the same payment hash.
-
-6. **Refund.** If the buyer does not send fiat in time, or a later phase runs into the safety deadline below, the daemon sends `refunding`. A preimage is removed only when one was stored. Fiber's timelock then returns the hold to the seller. The slice goes back on the post when Fiber reports the hold invoice `Expired`, and both parties receive `expired`. A trade still waiting on an invoice is canceled after the invoice expiry and the slice returns.
+1. Someone posts CKB for sale: price, currency, size, and payment methods.
+2. Someone else takes it: a fiat amount inside the post's min and max, their Fiber pubkey, one payment method, and a Fiber invoice that should receive the CKB.
+3. The daemon creates a hold invoice under that payout invoice's payment hash. It does not learn the preimage. Both people get `pay-invoice`.
+4. The seller pays the hold from their own Fiber node. The daemon waits until Fiber reports it `Received`, then sends `waiting-fiat`. That message names the payment method. Account numbers are not stored here. Traders share them in client chat.
+5. The buyer sends fiat outside Twine and marks it sent. The payout invoice is already the one from take, so this message can leave `invoice` empty. A replacement must use the same payment hash.
+6. The seller releases. The daemon records the hold hash, pays the buyer's invoice, and only then reads the preimage Fiber learned from that payment. It registers that preimage with the watchtower and settles the hold. Both people get `settled`.
+7. If the buyer does not pay in time, or a later phase hits the safety deadline below, Fiber refunds the seller. The slice goes back on the post when the hold expires.
 
 Cancel is only possible before the hold is locked. The poster can cancel an untaken post. Either party can cancel while the hold invoice is still `Open`. Once Fiber reports `Received` or `Paid`, cancel is refused and the coins wait for release or for the timelock.
+
+Until the payout succeeds, the daemon cannot settle. If the payout fails, the buyer receives `new-invoice` and can submit another invoice with the same payment hash. A payment hash already used by another trade is rejected.
+
+The operator does not custody trader keys. The solver (`TWINE_SOLVER`) is a Nostr pubkey that can resolve a dispute. Disputes are refused while this is unset.
 
 ### States
 
@@ -110,8 +100,6 @@ On startup the daemon connects to `TWINE_RELAYS`, subscribes to kind `4242` even
 
 `pay-invoice` and `waiting-fiat` include `seller_nostr` and `buyer_nostr` so each client can find the other.
 
-### Envelope
-
 Actions and replies are JSON, then NIP-44 encrypted:
 
 ```json
@@ -126,7 +114,7 @@ Actions and replies are JSON, then NIP-44 encrypted:
 
 ### Client actions
 
-`new-order`
+`new-order` creates a sell post. `side` must be `sell`. Amounts are positive decimals. `min` must be less than or equal to `max`. `fiber_pubkey` is the poster's Fiber node.
 
 ```json
 {
@@ -141,9 +129,7 @@ Actions and replies are JSON, then NIP-44 encrypted:
 }
 ```
 
-`side` must be `sell`. `available_ckb`, `price_per_ckb`, `min`, and `max` are positive decimals. `min` must be less than or equal to `max`. `fiber_pubkey` is the poster's Fiber node.
-
-`take`
+`take` buys from that post. `invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to. `fiber_addr` is optional and must be a **public** Fiber listen multiaddr. Loopback and LAN addresses are refused. A local node should connect outbound to the hub instead.
 
 ```json
 {
@@ -156,28 +142,15 @@ Actions and replies are JSON, then NIP-44 encrypted:
 }
 ```
 
-`invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to. `fiber_addr` is optional and must be a **public** Fiber listen multiaddr. Loopback and LAN addresses are refused. A local node should connect outbound to the hub instead.
+The rest:
 
-`fiat-sent` requires `trade_id`. The payload is `{ "invoice": "<fiber invoice>", "fiber_addr": "<optional multiaddr>" }`. Leave `invoice` empty when `take` already stored the payout invoice. A replacement must use the same payment hash. Only the buyer can send it.
-
-`release` requires `trade_id` and no payload. Only the seller can send it, and only after a payout invoice is stored.
-
-`cancel` cancels a post or a trade. A post uses `{ "order_id": "<order id>" }` and no `trade_id`. A trade sets `trade_id` on the envelope.
-
-`dispute` requires `trade_id`. The payload is optional:
-
-```json
-{
-  "invoice": "<buyer payout invoice, optional>",
-  "conversation_key": "<64 hex chars, optional>"
-}
-```
-
-`resolve` is the solver only. `winner` is `buyer` or `seller`. `invoice` is optional and is the buyer's payout invoice when the solver awards the buyer.
-
-```json
-{ "winner": "seller", "invoice": null }
-```
+| Action | Who | Payload |
+| --- | --- | --- |
+| `fiat-sent` | Buyer | `{ "invoice", "fiber_addr"? }`. Leave `invoice` empty when `take` already stored it. A replacement must use the same payment hash. |
+| `release` | Seller | None. Only after a payout invoice is stored. |
+| `cancel` | Poster, or either party | A post uses `{ "order_id" }` and no `trade_id`. A trade sets `trade_id` on the envelope. |
+| `dispute` | Either party | Optional `{ "invoice", "conversation_key" }`. |
+| `resolve` | Solver | `{ "winner": "buyer" \| "seller", "invoice": null }`. `invoice` is the buyer's payout invoice when the solver awards the buyer. |
 
 ### Daemon replies
 
@@ -196,7 +169,7 @@ Actions and replies are JSON, then NIP-44 encrypted:
 | `expired` | Seller and buyer | none |
 | `cant-do` | The sender | `reason` |
 
-A public order is published alongside the replies that change the book (`new-order`, `take`, cancel, expire):
+A public order is published alongside the replies that change the book (`new-order`, `take`, cancel, expire). `status` is `open` or `canceled`. A filled post stays `open` with `available_ckb` at `0`.
 
 ```json
 {
@@ -216,8 +189,6 @@ A public order is published alongside the replies that change the book (`new-ord
   "status": "open"
 }
 ```
-
-`status` is `open` or `canceled`.
 
 ## Configuration
 
