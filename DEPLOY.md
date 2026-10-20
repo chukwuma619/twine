@@ -250,6 +250,8 @@ sudo journalctl -u twine -f
 
 Ctrl-C stops the log and leaves the service running. Startup logs the daemon `npub` and the Fiber pubkey. People paste that `npub` and the `TWINE_RELAYS` list into the app. The daemon also publishes the Fiber pubkey so a wallet can open a channel.
 
+Fund the Fiber node so sellers can lock (inbound room) and buyers can be paid (outbound liquidity toward buyers). Before a buyer takes, open or dual-fund their channel with funds on Twine's side that can flow to them (or use an LSP / JIT channel). A channel the buyer funds alone cannot receive the payout. See [Fiber channels](README.md#fiber-channels).
+
 The daemon exits when no relay connects, the RPC token is empty, or `FIBER_NETWORK` is not `testnet` or `mainnet`. systemd starts it again after 5 seconds. If it starts while Fiber is still decrypting its key, those attempts fail and the retry picks up once RPC answers.
 
 The first successful RPC call pins that Fiber pubkey in SQLite. Restarting against the same node is fine. A different node, while a hold is still open, is refused.

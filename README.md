@@ -235,6 +235,17 @@ Export the variables below before `cargo run`. The [run](#run-locally) section w
 
 `FIBER_SECRET_KEY_PASSWORD` is the Fiber node's password. It encrypts `fiber-node/ckb/key`. The password typed into `ckb-cli` only unlocks that wallet inside `ckb-cli`.
 
+## Fiber channels
+
+Traders open a Fiber channel to this node's pubkey (kind `31421`). Twine does not mint channel balance. Payments need directional liquidity ([Fiber overview](https://www.fiber.world/docs/concept/liquidity/overview)): outbound to send, inbound to receive. Capacity is not the same as usable send or receive.
+
+| Leg | Who | Liquidity |
+| --- | --- | --- |
+| Lock | Seller → Twine Fiber | Seller outbound (open and fund). Twine inbound room. |
+| Payout | Twine Fiber → buyer | Twine outbound toward the buyer. Buyer inbound: funds on the operator's side that can flow to them. A buyer-funded channel alone cannot receive. |
+
+Keep spare CKB on the Twine Fiber node. Before a buyer takes, open or dual-fund with funding on Twine's side, or use an LSP / JIT channel. A seller lock on one channel does not create outbound on the buyer's. Multi-hop through another hub only works if this node has a funded path there.
+
 ## Run locally
 
 Run this from the repository root. You need a Rust toolchain that supports edition 2024 (`rustup`), Docker, [ckb-cli 2.0.0](https://github.com/nervosnetwork/ckb-cli/releases/tag/v2.0.0), and `openssl`. Start Fiber before the daemon. Traders open a channel to this node. The daemon announces its pubkey as kind `31421`.
