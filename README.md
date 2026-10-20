@@ -6,6 +6,8 @@ This repository is the coordinator daemon (`twine-daemon`). It speaks Nostr to t
 
 There is no HTTP API for trades. Twine charges no fee, keeps no ratings, takes no bond, and does not use UDTs. The two traders chat on the client. The daemon does not read that thread.
 
+To run this on your own machine, follow [Run locally](#run-locally) from the top. Do not skip ahead. A VPS install is [DEPLOY.md](DEPLOY.md).
+
 ## How a trade works
 
 A post offers CKB. The poster is the seller. The taker is the buyer. There is no buy post, and there is no automatic matching: someone picks a post. Anyone except the poster can take it. A post has at most one open trade. The next take waits until that trade is settled, canceled, or expired.
@@ -220,11 +222,15 @@ Keep spare CKB on the Twine Fiber node. On release, if the buyer cannot receive,
 
 ## Run locally
 
-Run this from the repository root. You need a Rust toolchain that supports edition 2024 (`rustup`), Docker, [ckb-cli 2.0.0](https://github.com/nervosnetwork/ckb-cli/releases/tag/v2.0.0), and `openssl`. Start Fiber before the daemon. Traders open a channel to this node. The daemon announces its pubkey as kind `31421`.
+From the repository root, in this order. Each step writes a file the next step reads. You need a Rust toolchain that supports edition 2024 (`rustup`), Docker, [ckb-cli 2.0.0](https://github.com/nervosnetwork/ckb-cli/releases/tag/v2.0.0), and `openssl`.
+
+The same commands work on macOS, Linux, and Windows. They publish ports. `--network host` is not used: Docker Desktop does not put a container's loopback on the host, so a container started that way is not reachable from the machine.
+
+The blocks below are bash. On Windows, run them in [Git Bash](https://git-scm.com/install/windows) or WSL, from the repository root. PowerShell and Command Prompt will not run them. Git Bash rewrites Unix paths, so set `MSYS_NO_PATHCONV=1` in that window before any `docker run`. Docker Desktop must be running, and the drive that holds this repo must be shared with it.
 
 Use the published image `nervos/fiber:0.9.1`. Image build, `fnn-cli`, and store migration are in [docker/README.md](docker/README.md).
 
-### CKB key
+### 1. CKB key
 
 `fiber-node/ckb/key` is the node's CKB wallet. Fiber's [Docker guide](https://www.fiber.world/docs/quick-start/run-a-node/docker) uses the same file. `account new` asks for a wallet password and prints a `lock_arg`. The `--url` flag makes the printed address a testnet `ckt1` address.
 
@@ -241,38 +247,37 @@ chmod 600 "$HOME/twine-ckb/ckb-key" fiber-node/ckb/key
 ckb-cli --url https://testnet.ckbapp.dev util key-info --privkey-path "$HOME/twine-ckb/ckb-key"
 ```
 
-`account export` asks for the wallet password again. The exported line starts with `0x`, and Fiber rejects a plaintext key in that form. Send testnet CKB to the `ckt1` address from `key-info`. The node spends it on chain fees. A `ckb1` address is the same key on mainnet.
+Replace `YOUR_LOCK_ARG` with the `lock_arg` printed by `account new` before running `account export`. `account export` asks for the wallet password again. The exported line starts with `0x`, and Fiber rejects a plaintext key in that form. Send testnet CKB to the `ckt1` address from `key-info`. The node spends it on chain fees. A `ckb1` address is the same key on mainnet.
 
 An account already in `ckb-cli` skips `account new` and exports with its own `lock_arg`. A key from another wallet is one line of 64 hex characters with no `0x` prefix: write that line to `$HOME/twine-ckb/ckb-key` and copy it to `fiber-node/ckb/key`.
 
-On first start, Fiber encrypts `fiber-node/ckb/key` with the password below. `$HOME/twine-ckb/ckb-key` stays the plaintext copy. Replace `YOUR_FIBER_PASSWORD` before running the block. One line, no spaces. Every later start of this store needs the same password.
+### 2. Fiber password
+
+Fiber encrypts `fiber-node/ckb/key` with this password on first start. `$HOME/twine-ckb/ckb-key` stays the plaintext copy. Every later start of this store needs the same password.
+
+A new store: the block below writes a password. If `fiber.env` is already there, it is left alone. If that file still contains the words `YOUR_FIBER_PASSWORD` and `fiber-node/ckb/key` is still one line of hex, delete `fiber.env` and run the block again.
+
+An existing store: `fiber-node/ckb/key` is no longer hex. Put the password that encrypted it into `fiber.env`. A newly generated password will not open it. The node log `decryption failed` means the password does not match.
 
 ```bash
 umask 077
-cat > "$HOME/twine-ckb/fiber.env" << 'EOF'
-FIBER_SECRET_KEY_PASSWORD=YOUR_FIBER_PASSWORD
-EOF
-chmod 600 "$HOME/twine-ckb/fiber.env"
+mkdir -p "$HOME/twine-ckb"
+if [ ! -f "$HOME/twine-ckb/fiber.env" ]; then
+  printf 'FIBER_SECRET_KEY_PASSWORD=%s\n' "$(openssl rand -hex 24)" > "$HOME/twine-ckb/fiber.env"
+  chmod 600 "$HOME/twine-ckb/fiber.env"
+fi
 ```
 
-### Fiber node
+The password typed into `ckb-cli` only unlocks that wallet inside `ckb-cli`. It is not this password.
 
-The commands below start testnet, which uses `https://testnet.ckbapp.dev/`. For mainnet, add `-e FIBER_CONFIG_TEMPLATE=/usr/local/share/fiber/config/mainnet/config.yml` to the first `docker run`, then set `ckb.rpc_url` in `fiber-node/config.yml` to a CKB RPC this machine can reach, and set `FIBER_NETWORK=mainnet` in `.env`. A store cannot change chains. To switch, stop the container, move `fiber-node/` aside, and start again.
+### 3. Start Fiber
 
-Run one of the two `docker run` commands. On Linux, `--network host` puts the node's `127.0.0.1:8227` on the machine, and that address is `TWINE_RPC`.
+This starts testnet, which uses `https://testnet.ckbapp.dev/`. RPC stays inside the container until step 5. Only the Fiber peer port is published here.
 
-```bash
-docker run -d --name fiber-node --restart unless-stopped \
-  --network host \
-  --env-file "$HOME/twine-ckb/fiber.env" \
-  -e RUST_LOG=info \
-  -v "$(pwd)/fiber-node:/fiber" \
-  nervos/fiber:0.9.1
-```
-
-Docker Desktop on macOS keeps the container's loopback inside the container, so skip the command above. This one publishes the Fiber port. RPC stays inside the container until the biscuit public key is set, and `fnn-cli` reads it from there:
+Only one container may be named `fiber-node`. If an earlier attempt already created one, remove it first. "No such container" means there was nothing to remove.
 
 ```bash
+docker rm -f fiber-node
 docker run -d --name fiber-node --restart unless-stopped \
   --env-file "$HOME/twine-ckb/fiber.env" \
   -e RUST_LOG=info \
@@ -287,16 +292,18 @@ Decrypting the key can take about half a minute. Continue once `pubkey` is print
 docker exec fiber-node fnn-cli info
 ```
 
-Copy `pubkey`. The token below binds itself to it.
+Copy `pubkey`. The token in the next step binds itself to it.
 
-When wallets on another machine open a channel here, or when a buyer runs Fiber on a laptop, uncomment `announced_addrs` in `fiber-node/config.yml` and set a reachable address. Local nodes connect outbound to this address; the hub cannot dial their home network. The restart below picks it up:
+For mainnet, add `-e FIBER_CONFIG_TEMPLATE=/usr/local/share/fiber/config/mainnet/config.yml` to that `docker run` before the first start, then set `ckb.rpc_url` in `fiber-node/config.yml` to a CKB RPC this machine can reach, and set `FIBER_NETWORK=mainnet` in `.env`. A store cannot change chains. To switch, stop the container, move `fiber-node/` aside, and start again.
+
+When wallets on another machine open a channel here, uncomment `announced_addrs` in `fiber-node/config.yml` and set a reachable address. Local nodes connect outbound to this address. The restart in step 5 picks it up:
 
 ```yaml
   announced_addrs:
     - "/ip4/YOUR-PUBLIC-IP/tcp/8228"
 ```
 
-### RPC token
+### 4. RPC token
 
 `biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.9.1 checks. The Fiber node checks the biscuit against `rpc.biscuit_public_key`. The token needs `read` and `write` on `invoices`, `payments`, `channels`, and `peers`, `read("node")`, `write("watchtower")`, and `node("<fnn pubkey>")`. `create_preimage` refuses a token that has no `node` fact. Fiber's [biscuit auth](https://github.com/nervosnetwork/fiber/blob/v0.9.1/docs/biscuit-auth.md) describes the format.
 
@@ -331,19 +338,19 @@ echo >> "$HOME/twine-ckb/rpc-token"
 chmod 600 "$HOME/twine-ckb/rpc-token"
 ```
 
-Write the public key into `fiber-node/config.yml`. On Linux leave `RPC_BIND` as written. On macOS set it to `0.0.0.0:8227`. Fiber accepts that bind once the public key is in the file, and Docker can then publish RPC on the machine's loopback. If the write is denied, put `sudo env RPC_BIND="$RPC_BIND" PUB="$PUB"` in front of `python3` and drop the two assignments already on that line.
+### 5. Open RPC on this machine
+
+Write the biscuit public key into `fiber-node/config.yml` and bind RPC to `0.0.0.0:8227` inside the container. Fiber accepts that bind once the public key is in the file. Docker then publishes it on this machine's `127.0.0.1:8227`, which is `TWINE_RPC`. If the write is denied, put `sudo env PUB="$PUB"` in front of `python3` and drop the `PUB=` assignment already on that line.
 
 ```bash
-RPC_BIND=127.0.0.1:8227
-# macOS Docker Desktop: RPC_BIND=0.0.0.0:8227
 PUB=$(awk -F': ' '/^Public key:/{print $2}' "$HOME/twine-ckb/biscuit-keypair.txt")
-RPC_BIND="$RPC_BIND" PUB="$PUB" python3 - << 'PY'
+PUB="$PUB" python3 - << 'PY'
 import os
 from pathlib import Path
 path = Path("fiber-node/config.yml")
 text = path.read_text()
 old = 'listening_addr: "127.0.0.1:8227"'
-new = f'listening_addr: "{os.environ["RPC_BIND"]}"\n  biscuit_public_key: "{os.environ["PUB"]}"'
+new = f'listening_addr: "0.0.0.0:8227"\n  biscuit_public_key: "{os.environ["PUB"]}"'
 if "biscuit_public_key:" not in text:
     if old not in text:
         raise SystemExit("rpc listening_addr not found")
@@ -352,13 +359,7 @@ PY
 grep -n biscuit_public_key fiber-node/config.yml
 ```
 
-On Linux, restart the container you already started:
-
-```bash
-docker restart fiber-node
-```
-
-On macOS, remove that container and start it again with RPC published on `127.0.0.1`:
+Replace the container so both ports are published. The peer port stays on `8228`. RPC is only on this machine's loopback.
 
 ```bash
 docker rm -f fiber-node
@@ -380,7 +381,7 @@ curl -sS http://127.0.0.1:8227 \
   -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}'
 ```
 
-### Daemon
+### 6. Daemon
 
 From the repo root. This writes a new Nostr secret. To keep an existing identity, put that `nsec` or 64-character hex secret in `TWINE_NOSTR_SECRET` after the file is written. Add `TWINE_SOLVER=<hex pubkey>` when a solver exists.
 
