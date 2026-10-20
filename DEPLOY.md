@@ -130,7 +130,7 @@ sudo docker exec fiber-node fnn-cli info
 
 Copy `pubkey` from `fnn-cli info`. Run it again if the line is missing. The RPC token below binds itself to this pubkey.
 
-Set the address wallets use to open a channel. Replace `YOUR_PUBLIC_IP` with this machine's public IPv4 (`curl -4 ifconfig.me`).
+Set the address wallets use to open a channel. Local buyer and seller nodes connect **outbound** to this address; the VPS cannot reach `127.0.0.1` on a laptop. Replace `YOUR_PUBLIC_IP` with this machine's public IPv4 (`curl -4 ifconfig.me`).
 
 ```bash
 PUBLIC_IP=YOUR_PUBLIC_IP
@@ -163,6 +163,10 @@ read("invoices");
 write("invoices");
 read("payments");
 write("payments");
+read("channels");
+write("channels");
+read("peers");
+write("peers");
 write("watchtower");
 node("$FNN_PUBKEY");
 EOF
@@ -250,7 +254,7 @@ sudo journalctl -u twine -f
 
 Ctrl-C stops the log and leaves the service running. Startup logs the daemon `npub` and the Fiber pubkey. People paste that `npub` and the `TWINE_RELAYS` list into the app. The daemon also publishes the Fiber pubkey so a wallet can open a channel.
 
-Fund the Fiber node so sellers can lock (inbound room) and buyers can be paid (outbound liquidity toward buyers). Before a buyer takes, open or dual-fund their channel with funds on Twine's side that can flow to them (or use an LSP / JIT channel). A channel the buyer funds alone cannot receive the payout. See [Fiber channels](README.md#fiber-channels).
+Fund the Fiber node so sellers can lock (inbound room) and buyers can be paid (outbound liquidity toward buyers). On release the daemon opens a Twine-funded one-way channel to a buyer who cannot receive yet, at least 100 CKB so a default Fiber node auto-accepts. The RPC token must be able to `list_channels`, `list_peers`, `connect_peer`, and `open_channel`. Local wallets must already be connected to this hub. A channel the buyer funds alone cannot receive the payout. See [Fiber channels](README.md#fiber-channels).
 
 The daemon exits when no relay connects, the RPC token is empty, or `FIBER_NETWORK` is not `testnet` or `mainnet`. systemd starts it again after 5 seconds. If it starts while Fiber is still decrypting its key, those attempts fail and the retry picks up once RPC answers.
 

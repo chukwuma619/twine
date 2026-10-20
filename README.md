@@ -102,7 +102,7 @@ Clients encrypt actions to the daemon. The daemon encrypts replies back. Orders,
 | --- | --- | --- |
 | `4242` | `p` is the recipient | NIP-44 (v2) ciphertext. An action to the daemon, or a reply from it. |
 | `31420` | `d` is the order id | Public JSON order. Addressable. |
-| `31421` | `d` is `fiber-node` | Public JSON `{"pubkey":"<fnn pubkey>"}`. The app shows this so a wallet can open a channel to the operator's node. |
+| `31421` | `d` is `fiber-node` | Public JSON `{"pubkey":"<fnn pubkey>","addresses":["/ip4/.../tcp/8228"]}`. The app shows this so a wallet can connect and open a channel to the operator's node. |
 | `31422` | `d` is `payment-methods` | Public JSON `{"methods":[...]}`. The app reads this for the currencies and methods on a new post. |
 | `4243` | `p` is the other trader, `t` is the trade id | NIP-44 chat between the two traders. The client uses this. The daemon does not subscribe to it. |
 
@@ -151,13 +151,14 @@ Actions and replies are JSON, then NIP-44 encrypted:
   "fiat_amount": "1000",
   "fiber_pubkey": "<taker's fnn pubkey>",
   "payment_method_id": "gtbank",
-  "invoice": "<buyer payout invoice>"
+  "invoice": "<buyer payout invoice>",
+  "fiber_addr": "/ip4/1.2.3.4/tcp/8228"
 }
 ```
 
-`invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to.
+`invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to. `fiber_addr` is optional and must be a **public** Fiber listen multiaddr. Loopback and LAN addresses are refused. A local node should connect outbound to the hub instead.
 
-`fiat-sent` requires `trade_id`. The payload is `{ "invoice": "<fiber invoice>" }`. Leave `invoice` empty when `take` already stored the payout invoice. A replacement must use the same payment hash. Only the buyer can send it.
+`fiat-sent` requires `trade_id`. The payload is `{ "invoice": "<fiber invoice>", "fiber_addr": "<optional multiaddr>" }`. Leave `invoice` empty when `take` already stored the payout invoice. A replacement must use the same payment hash. Only the buyer can send it.
 
 `release` requires `trade_id` and no payload. Only the seller can send it, and only after a payout invoice is stored.
 
@@ -244,7 +245,7 @@ Traders open a Fiber channel to this node's pubkey (kind `31421`). Twine does no
 | Lock | Seller → Twine Fiber | Seller outbound (open and fund). Twine inbound room. |
 | Payout | Twine Fiber → buyer | Twine outbound toward the buyer. Buyer inbound: funds on the operator's side that can flow to them. A buyer-funded channel alone cannot receive. |
 
-Keep spare CKB on the Twine Fiber node. Before a buyer takes, open or dual-fund with funding on Twine's side, or use an LSP / JIT channel. A seller lock on one channel does not create outbound on the buyer's. Multi-hop through another hub only works if this node has a funded path there.
+Keep spare CKB on the Twine Fiber node. On release, if the buyer cannot receive, the daemon opens a private one-way channel (`open_channel` with `one_way: true`) funded with the trade plus at least 100 CKB so a default Fiber node auto-accepts. The buyer node must stay online, connected to this hub, and auto-accept. A laptop node does not need a public IP: connect outbound to `announced_addrs`. Loopback and LAN listen addresses are refused. A seller lock on one channel does not create outbound on the buyer's. Multi-hop through another hub only works if this node has a funded path there.
 
 ## Run locally
 
@@ -317,7 +318,7 @@ docker exec fiber-node fnn-cli info
 
 Copy `pubkey`. The token below binds itself to it.
 
-When wallets on another machine open a channel here, uncomment `announced_addrs` in `fiber-node/config.yml` and set a reachable address. The restart below picks it up:
+When wallets on another machine open a channel here, or when a buyer runs Fiber on a laptop, uncomment `announced_addrs` in `fiber-node/config.yml` and set a reachable address. Local nodes connect outbound to this address; the hub cannot dial their home network. The restart below picks it up:
 
 ```yaml
   announced_addrs:
@@ -326,7 +327,7 @@ When wallets on another machine open a channel here, uncomment `announced_addrs`
 
 ### RPC token
 
-`biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.9.1 checks. The Fiber node checks the biscuit against `rpc.biscuit_public_key`. The token needs `read` and `write` on `invoices` and `payments`, `read("node")`, `write("watchtower")`, and `node("<fnn pubkey>")`. `create_preimage` refuses a token that has no `node` fact. Fiber's [biscuit auth](https://github.com/nervosnetwork/fiber/blob/main/docs/biscuit-auth.md) describes the format.
+`biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.9.1 checks. The Fiber node checks the biscuit against `rpc.biscuit_public_key`. The token needs `read` and `write` on `invoices`, `payments`, `channels`, and `peers`, `read("node")`, `write("watchtower")`, and `node("<fnn pubkey>")`. `create_preimage` refuses a token that has no `node` fact. Fiber's [biscuit auth](https://github.com/nervosnetwork/fiber/blob/v0.9.1/docs/biscuit-auth.md) describes the format.
 
 ```bash
 cargo install biscuit-cli --version 0.6.0-beta.2 --locked
@@ -345,6 +346,10 @@ read("invoices");
 write("invoices");
 read("payments");
 write("payments");
+read("channels");
+write("channels");
+read("peers");
+write("peers");
 write("watchtower");
 node("$FNN_PUBKEY");
 EOF

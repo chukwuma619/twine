@@ -164,6 +164,66 @@ pub fn hex_u64(value: u64) -> String {
     format!("0x{value:x}")
 }
 
+/// Fiber `connect_peer` multiaddr. Loopback and LAN addresses are refused.
+pub fn parse_fiber_addr(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(trimmed) = value.map(str::trim).filter(|addr| !addr.is_empty()) else {
+        return Ok(None);
+    };
+    if !trimmed.starts_with('/') {
+        return Err("fiber listen address must be a multiaddr, like /ip4/1.2.3.4/tcp/8228".into());
+    }
+    if !fiber_addr_is_reachable(trimmed) {
+        return Err(
+            "fiber listen address must be reachable from the internet, not 127.0.0.1 or a LAN address. Connect your node to the hub instead".into(),
+        );
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+pub fn fiber_addr_is_reachable(addr: &str) -> bool {
+    let parts: Vec<&str> = addr
+        .trim()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(protocol) = parts.first().copied() else {
+        return false;
+    };
+    let Some(value) = parts.get(1).copied() else {
+        return false;
+    };
+    match protocol {
+        "ip4" | "ip6" => value
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .is_some_and(ip_is_reachable),
+        "dns" | "dns4" | "dns6" => {
+            let host = value.to_ascii_lowercase();
+            host != "localhost" && !host.ends_with(".localhost")
+        }
+        "onion" | "onion3" => true,
+        _ => false,
+    }
+}
+
+fn ip_is_reachable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast())
+        }
+        std::net::IpAddr::V6(ip) => {
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_unicast_link_local()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00)
+        }
+    }
+}
+
 pub fn hex_bytes(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
@@ -176,6 +236,23 @@ pub fn i64_from_shannons(value: u128) -> Result<i64> {
 mod tests {
     use super::*;
     use crate::{PaymentMethodInput, SupportedPaymentMethod};
+
+    #[test]
+    fn fiber_addr_is_a_multiaddr() {
+        assert_eq!(parse_fiber_addr(None).unwrap(), None);
+        assert_eq!(parse_fiber_addr(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_fiber_addr(Some("/ip4/1.2.3.4/tcp/8228")).unwrap(),
+            Some("/ip4/1.2.3.4/tcp/8228".into())
+        );
+        assert!(parse_fiber_addr(Some("1.2.3.4:8228")).is_err());
+        assert!(parse_fiber_addr(Some("/ip4/127.0.0.1/tcp/8228")).is_err());
+        assert!(parse_fiber_addr(Some("/ip4/192.168.1.10/tcp/8228")).is_err());
+        assert!(parse_fiber_addr(Some("/dns4/localhost/tcp/8228")).is_err());
+        assert!(fiber_addr_is_reachable(
+            "/dns4/bottle.fiber.channel/tcp/8119"
+        ));
+    }
 
     #[test]
     fn converts_whole_ckb() {
@@ -366,6 +443,7 @@ pub(crate) mod support {
                         fiber_pubkey: fiber_pubkey.into(),
                         payment_method_id: method_id,
                         invoice: Some(payout.invoice),
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -396,6 +474,7 @@ pub(crate) mod support {
                     .with_trade(trade_id)
                     .with_payload(FiatSentPayload {
                         invoice: invoice.into(),
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )

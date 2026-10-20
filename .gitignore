@@ -2,3 +2,5 @@ target
 .env
 fiber-node/
 *.db
+
+PROPOSAL.md

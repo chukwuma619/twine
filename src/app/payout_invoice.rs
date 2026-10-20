@@ -40,6 +40,9 @@ pub(crate) async fn on_payout_invoice<F: FiberRpc + 'static>(
             "only the buyer can send the payout invoice",
         )]);
     }
+    if let Err(reason) = engine.remember_fiber_addr(&trade.id, payload.fiber_addr.as_deref())? {
+        return Ok(vec![cant_do(sender, Some(trade_id), &reason)]);
+    }
     match engine.bind_buyer_hold(&trade, invoice).await? {
         Ok(outbound) => Ok(outbound),
         Err(reason) => Ok(vec![cant_do(sender, Some(trade_id), &reason)]),

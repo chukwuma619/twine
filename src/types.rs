@@ -350,11 +350,16 @@ pub struct TakePayload {
     /// Buyer's payout invoice. Required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoice: Option<String>,
+    /// Public Fiber listen multiaddr. Loopback and LAN are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fiber_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayoutInvoicePayload {
     pub invoice: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fiber_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +378,8 @@ pub struct FiatSentPayload {
     /// Empty keeps the invoice already stored on the trade.
     #[serde(default)]
     pub invoice: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fiber_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,6 +628,7 @@ pub struct Trade {
     pub payment_kind: String,
     pub payment_label: String,
     pub payment_currency: String,
+    pub buyer_fiber_addr: Option<String>,
 }
 
 impl Trade {

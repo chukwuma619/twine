@@ -43,6 +43,16 @@ pub const SAFETY_SECS: u64 = 30 * 60;
 /// Per-thousand routing-fee cap on `send_payment`. Fiber's default is 5.
 pub const MAX_FEE_RATE: u64 = 5;
 
+/// Fiber occupancy: 98 CKB commitment lock + 1 CKB shutdown fee.
+pub const CHANNEL_RESERVE_CKB: u128 = 99;
+
+pub const CHANNEL_RESERVE_SHANNONS: u128 = CHANNEL_RESERVE_CKB * SHANNONS_PER_CKB;
+
+/// Fiber default `open_channel_auto_accept_min_ckb_funding_amount`.
+pub const CHANNEL_AUTO_ACCEPT_MIN_CKB: u128 = 100;
+
+pub const CHANNEL_AUTO_ACCEPT_MIN_SHANNONS: u128 = CHANNEL_AUTO_ACCEPT_MIN_CKB * SHANNONS_PER_CKB;
+
 pub const TESTNET_INVOICE_CURRENCY: &str = "Fibt";
 
 pub const MAINNET_INVOICE_CURRENCY: &str = "Fibb";

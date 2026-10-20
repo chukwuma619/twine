@@ -1,13 +1,16 @@
 use crate::db::Db;
-use crate::fiber::{FiberRpc, ParsedInvoice};
+use crate::fiber::{
+    BuyerInbound, FiberRpc, ParsedInvoice, already_connected, already_opening, has_live_open,
+    jit_funding_amount, outbound_covers, route_not_ready,
+};
 use crate::nostr::publish_outbounds;
 use crate::types::{Order, Trade};
 use crate::{
     Actor, CANCELED, CANT_DO, CantDoPayload, ClientAction, Decision, EXPIRED, Envelope,
-    FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload,
-    Outbound, PAY_INVOICE, PayInvoicePayload, Phase,
-    REFUNDING, SETTLED, WAITING_FIAT, WaitingFiatPayload, apply_clock, apply_expired,
-    apply_hold_received, apply_release_failed, apply_release_succeeded, trade_actor, unix_now,
+    FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound,
+    PAY_INVOICE, PayInvoicePayload, Phase, REFUNDING, SETTLED, WAITING_FIAT, WaitingFiatPayload,
+    apply_clock, apply_expired, apply_hold_received, apply_release_failed, apply_release_succeeded,
+    fiber_addr_is_reachable, parse_fiber_addr, trade_actor, unix_now,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
@@ -451,7 +454,11 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
         match self.fiber.get_payment(&payment_hash).await {
             Err(error) if payment_missing(&error) => {
-                self.send_recorded_payout(&trade, &invoice).await
+                match self.ensure_buyer_inbound(&trade).await? {
+                    Ok(BuyerInbound::Ready) => self.send_recorded_payout(&trade, &invoice).await,
+                    Ok(BuyerInbound::Opening) => Ok(Vec::new()),
+                    Err(reason) => self.fail_payout(&trade, &reason),
+                }
             }
             Err(error) => Err(error),
             Ok(payment) => {
@@ -461,12 +468,102 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
     }
 
+    /// Open a Twine-funded one-way channel if the buyer cannot receive yet.
+    async fn ensure_buyer_inbound(&self, trade: &Trade) -> Result<Result<BuyerInbound, String>> {
+        let pubkey = trade.buyer_fiber.trim();
+        if pubkey.is_empty() {
+            return Ok(Err("buyer Fiber pubkey is missing".into()));
+        }
+        let ready = self.fiber.list_channels(Some(pubkey), false).await?;
+        if outbound_covers(&ready, trade.shannons) {
+            return Ok(Ok(BuyerInbound::Ready));
+        }
+        let pending = self.fiber.list_channels(Some(pubkey), true).await?;
+        if has_live_open(&pending) {
+            return Ok(Ok(BuyerInbound::Opening));
+        }
+        if !self.buyer_is_peered(pubkey).await
+            && let Err(reason) = self
+                .dial_buyer(pubkey, trade.buyer_fiber_addr.as_deref())
+                .await?
+        {
+            return Ok(Err(reason));
+        }
+        let funding = jit_funding_amount(trade.shannons);
+        match self.fiber.open_channel(pubkey, funding).await {
+            Ok(_) => Ok(Ok(BuyerInbound::Opening)),
+            Err(error) if already_opening(&error) => Ok(Ok(BuyerInbound::Opening)),
+            Err(error) => Ok(Err(format!(
+                "cannot open inbound to the buyer: {error}. Keep the node online, connected to this hub, and set to auto-accept"
+            ))),
+        }
+    }
+
+    async fn buyer_is_peered(&self, pubkey: &str) -> bool {
+        match self.fiber.list_peers().await {
+            Ok(peers) => peers.iter().any(|peer| peer.eq_ignore_ascii_case(pubkey)),
+            Err(error) => {
+                warn!(%error, "list_peers");
+                false
+            }
+        }
+    }
+
+    async fn dial_buyer(&self, pubkey: &str, addr: Option<&str>) -> Result<Result<(), String>> {
+        let addr = addr.filter(|value| fiber_addr_is_reachable(value));
+        if let Err(error) = self.connect_peer(pubkey, addr).await {
+            if addr.is_none() || self.connect_peer(pubkey, None).await.is_err() {
+                return Ok(Err(format!(
+                    "cannot reach the buyer Fiber node: {error}. {}",
+                    self.hub_connect_hint().await
+                )));
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    async fn connect_peer(&self, pubkey: &str, addr: Option<&str>) -> Result<()> {
+        match self.fiber.connect_peer(Some(pubkey), addr).await {
+            Ok(()) => Ok(()),
+            Err(error) if already_connected(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn hub_connect_hint(&self) -> String {
+        let Ok(info) = self.fiber.node_info().await else {
+            return "If the node is on a laptop or home network, connect it outbound to this hub. A local listen address is not reachable from Twine".into();
+        };
+        if info.addresses.is_empty() {
+            return format!(
+                "If the node is on a laptop or home network, connect it outbound to this hub pubkey {}. A local listen address is not reachable from Twine",
+                info.pubkey
+            );
+        }
+        format!(
+            "If the node is on a laptop or home network, connect it outbound to this hub: fnn-cli peer connect_peer --pubkey {} --address '{}' --save true",
+            info.pubkey, info.addresses[0]
+        )
+    }
+
     async fn send_recorded_payout(&self, trade: &Trade, invoice: &str) -> Result<Vec<Outbound>> {
         // A transport error may mean the payment landed. Leave the hash in place
         // and let the next poll read it. Do not fail the payout and do not send again.
-        let payment = self.fiber.send_payment(invoice).await?;
-        self.finish_recorded_payout(trade, &payment.status, payment.preimage)
-            .await
+        match self.fiber.send_payment(invoice).await {
+            Ok(payment) => {
+                self.finish_recorded_payout(trade, &payment.status, payment.preimage)
+                    .await
+            }
+            Err(error) if route_not_ready(&error) => {
+                warn!(
+                    trade_id = %trade.id,
+                    %error,
+                    "payout route not ready after inbound check; waiting"
+                );
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn finish_recorded_payout(
@@ -616,6 +713,21 @@ impl<F: FiberRpc + 'static> Engine<F> {
             .get_order(id)?
             .ok_or_else(|| anyhow!("order {id} not found"))
     }
+
+    pub(crate) fn remember_fiber_addr(
+        &self,
+        trade_id: &str,
+        addr: Option<&str>,
+    ) -> Result<Result<(), String>> {
+        match parse_fiber_addr(addr) {
+            Ok(None) => Ok(Ok(())),
+            Ok(Some(addr)) => {
+                self.db.set_buyer_fiber_addr(trade_id, Some(&addr))?;
+                Ok(Ok(()))
+            }
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
     fn spawn_poll(
         &self,
         kind: PollKind,
@@ -756,8 +868,8 @@ fn payout_invoice_ok(
 mod tests {
     use super::*;
     use crate::fiber::{
-        FiberRpc, InvoiceCreated, InvoiceInfo, InvoiceRpc, NodeRpc, ParsedInvoice, PaymentInfo,
-        PaymentRpc, WatchtowerRpc,
+        ChannelRpc, FiberChannel, FiberNodeInfo, FiberRpc, InvoiceCreated, InvoiceInfo, InvoiceRpc,
+        NodeRpc, ParsedInvoice, PaymentInfo, PaymentRpc, WatchtowerRpc,
     };
     use crate::util::support::{
         TestContext, cant_do_reason, fiat_sent, open_order, outbound_replies, replies_contain,
@@ -767,8 +879,7 @@ mod tests {
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
         FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus, PAY_INVOICE,
         PAYMENT_WINDOW_SECS, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE, RESOLVE,
-        ResolvePayload, SETTLED, TAKE,
-        TakePayload, WAITING_FIAT, WaitingFiatPayload,
+        ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
@@ -780,6 +891,53 @@ mod tests {
         payment_status: StdMutex<String>,
         payment_preimage: StdMutex<Option<String>>,
         parsed_amount: StdMutex<u128>,
+        channels: StdMutex<Vec<FiberChannel>>,
+        pending: StdMutex<Vec<FiberChannel>>,
+        connects: StdMutex<Vec<(Option<String>, Option<String>)>>,
+        opens: StdMutex<Vec<(String, u128)>>,
+        connect_error: StdMutex<Option<String>>,
+        open_error: StdMutex<Option<String>>,
+        get_payment_missing: StdMutex<bool>,
+        send_count: StdMutex<u32>,
+        peers: StdMutex<Vec<String>>,
+        hub_addresses: StdMutex<Vec<String>>,
+    }
+
+    fn ready_inbound(local_balance: u128) -> FiberChannel {
+        FiberChannel {
+            pubkey: "fiber-buyer".into(),
+            state_name: "ChannelReady".into(),
+            local_balance,
+            offered_tlc_balance: 0,
+            enabled: true,
+            is_one_way: true,
+            is_acceptor: false,
+            is_udt: false,
+            failure_detail: None,
+        }
+    }
+
+    impl FakeFiber {
+        fn new(status: &str, parsed_amount: u128) -> Self {
+            Self {
+                status: StdMutex::new(status.to_string()),
+                removed: StdMutex::new(false),
+                preimages: StdMutex::new(HashSet::new()),
+                payment_status: StdMutex::new("Inflight".to_string()),
+                payment_preimage: StdMutex::new(None),
+                parsed_amount: StdMutex::new(parsed_amount),
+                channels: StdMutex::new(vec![ready_inbound(1_000_000_000)]),
+                pending: StdMutex::new(Vec::new()),
+                connects: StdMutex::new(Vec::new()),
+                opens: StdMutex::new(Vec::new()),
+                connect_error: StdMutex::new(None),
+                open_error: StdMutex::new(None),
+                get_payment_missing: StdMutex::new(false),
+                send_count: StdMutex::new(0),
+                peers: StdMutex::new(Vec::new()),
+                hub_addresses: StdMutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait]
@@ -844,9 +1002,17 @@ mod tests {
     #[async_trait]
     impl PaymentRpc for FakeFiber {
         async fn send_payment(&self, _: &str) -> Result<PaymentInfo> {
-            bail!("unused")
+            *self.send_count.lock().expect("send") += 1;
+            Ok(PaymentInfo {
+                payment_hash: "hash".into(),
+                status: "Success".into(),
+                preimage: Some("preimage".into()),
+            })
         }
         async fn get_payment(&self, payment_hash: &str) -> Result<PaymentInfo> {
+            if *self.get_payment_missing.lock().expect("missing") {
+                bail!("payment not found");
+            }
             Ok(PaymentInfo {
                 payment_hash: payment_hash.to_string(),
                 status: self.payment_status.lock().expect("payment").clone(),
@@ -857,8 +1023,69 @@ mod tests {
 
     #[async_trait]
     impl NodeRpc for FakeFiber {
-        async fn node_pubkey(&self) -> Result<String> {
-            bail!("unused")
+        async fn node_info(&self) -> Result<FiberNodeInfo> {
+            Ok(FiberNodeInfo {
+                pubkey: "fiber-hub".into(),
+                addresses: self.hub_addresses.lock().expect("hub").clone(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ChannelRpc for FakeFiber {
+        async fn list_channels(
+            &self,
+            pubkey: Option<&str>,
+            only_pending: bool,
+        ) -> Result<Vec<FiberChannel>> {
+            let channels = if only_pending {
+                self.pending.lock().expect("pending").clone()
+            } else {
+                self.channels.lock().expect("channels").clone()
+            };
+            Ok(channels
+                .into_iter()
+                .filter(|channel| {
+                    pubkey.is_none_or(|want| channel.pubkey.eq_ignore_ascii_case(want))
+                })
+                .collect())
+        }
+
+        async fn connect_peer(&self, pubkey: Option<&str>, address: Option<&str>) -> Result<()> {
+            self.connects.lock().expect("connects").push((
+                pubkey.map(ToOwned::to_owned),
+                address.map(ToOwned::to_owned),
+            ));
+            if let Some(error) = self.connect_error.lock().expect("connect").as_ref() {
+                bail!("{error}");
+            }
+            Ok(())
+        }
+
+        async fn list_peers(&self) -> Result<Vec<String>> {
+            Ok(self.peers.lock().expect("peers").clone())
+        }
+
+        async fn open_channel(&self, pubkey: &str, funding_amount: u128) -> Result<String> {
+            self.opens
+                .lock()
+                .expect("opens")
+                .push((pubkey.to_string(), funding_amount));
+            if let Some(error) = self.open_error.lock().expect("open").as_ref() {
+                bail!("{error}");
+            }
+            self.pending.lock().expect("pending").push(FiberChannel {
+                pubkey: pubkey.to_string(),
+                state_name: "AwaitingChannelReady".into(),
+                local_balance: funding_amount,
+                offered_tlc_balance: 0,
+                enabled: true,
+                is_one_way: true,
+                is_acceptor: false,
+                is_udt: false,
+                failure_detail: None,
+            });
+            Ok("temp-channel".into())
         }
     }
 
@@ -869,14 +1096,12 @@ mod tests {
     }
 
     fn fake_engine(status: &str) -> (Engine<FakeFiber>, Arc<FakeFiber>) {
-        let fiber = Arc::new(FakeFiber {
-            status: StdMutex::new(status.to_string()),
-            removed: StdMutex::new(false),
-            preimages: StdMutex::new(HashSet::from(["hash".to_string()])),
-            payment_status: StdMutex::new("Inflight".to_string()),
-            payment_preimage: StdMutex::new(None),
-            parsed_amount: StdMutex::new(100_000_000),
-        });
+        let fiber = Arc::new(FakeFiber::new(status, 100_000_000));
+        fiber
+            .preimages
+            .lock()
+            .expect("preimages")
+            .insert("hash".into());
         let db = Arc::new(Db::open_in_memory().unwrap());
         db.insert_order(&Order {
             id: "order".into(),
@@ -919,6 +1144,7 @@ mod tests {
             payment_kind: "bank".into(),
             payment_label: "GTBank".into(),
             payment_currency: "NGN".into(),
+            buyer_fiber_addr: None,
         })
         .unwrap();
         db.insert_preimage("hash", "preimage").unwrap();
@@ -1213,14 +1439,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_buyer_buys_the_sellers_offer() {
-        let fiber = Arc::new(FakeFiber {
-            status: StdMutex::new("Open".into()),
-            removed: StdMutex::new(false),
-            preimages: StdMutex::new(HashSet::new()),
-            payment_status: StdMutex::new("Inflight".into()),
-            payment_preimage: StdMutex::new(None),
-            parsed_amount: StdMutex::new(100_000_000),
-        });
+        let fiber = Arc::new(FakeFiber::new("Open", 100_000_000));
         let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber.clone(), None);
         let posted = engine
             .handle(
@@ -1264,6 +1483,7 @@ mod tests {
                         fiber_pubkey: "fiber-seller".into(),
                         payment_method_id: method_id.clone(),
                         invoice: None,
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1281,6 +1501,7 @@ mod tests {
                         fiber_pubkey: "fiber-buyer".into(),
                         payment_method_id: method_id,
                         invoice: Some("buyer-invoice".into()),
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1326,6 +1547,7 @@ mod tests {
                     .with_trade(&trade_id)
                     .with_payload(FiatSentPayload {
                         invoice: "seller-invoice".into(),
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1340,6 +1562,7 @@ mod tests {
                     .with_trade(&trade_id)
                     .with_payload(FiatSentPayload {
                         invoice: "buyer-invoice".into(),
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1362,16 +1585,101 @@ mod tests {
         );
     }
 
+    async fn releasing_payout(engine: &Engine<FakeFiber>, fiber: &FakeFiber) {
+        engine
+            .db
+            .set_trade_state("trade", Phase::Releasing.as_str())
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", None)
+            .unwrap();
+        *fiber.get_payment_missing.lock().unwrap() = true;
+    }
+
+    #[tokio::test]
+    async fn payout_skips_jit_when_the_buyer_already_has_inbound() {
+        let (engine, fiber) = fake_engine("Received");
+        releasing_payout(&engine, &fiber).await;
+        let settled = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&settled, SETTLED));
+        assert!(fiber.opens.lock().unwrap().is_empty());
+        assert_eq!(*fiber.send_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn payout_opens_a_one_way_channel_when_the_buyer_has_no_inbound() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        engine
+            .db
+            .set_buyer_fiber_addr("trade", Some("/ip4/1.2.3.4/tcp/8228"))
+            .unwrap();
+        releasing_payout(&engine, &fiber).await;
+        let waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Releasing.as_str()
+        );
+        let opens = fiber.opens.lock().unwrap().clone();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].0, "fiber-buyer");
+        assert_eq!(opens[0].1, 10_000_000_000);
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            fiber.connects.lock().unwrap()[0],
+            (
+                Some("fiber-buyer".into()),
+                Some("/ip4/1.2.3.4/tcp/8228".into())
+            )
+        );
+
+        let still_waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(still_waiting.is_empty());
+        assert_eq!(fiber.opens.lock().unwrap().len(), 1);
+
+        let pending = fiber.pending.lock().unwrap().remove(0);
+        fiber.channels.lock().unwrap().push(FiberChannel {
+            state_name: "ChannelReady".into(),
+            local_balance: pending.local_balance,
+            ..pending
+        });
+        let settled = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&settled, SETTLED));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn payout_skips_connect_when_the_buyer_already_peered() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        fiber.peers.lock().unwrap().push("fiber-buyer".into());
+        releasing_payout(&engine, &fiber).await;
+        let waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert!(fiber.connects.lock().unwrap().is_empty());
+        assert_eq!(fiber.opens.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn payout_asks_for_a_new_invoice_when_the_buyer_node_is_offline() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        *fiber.connect_error.lock().unwrap() = Some("peer offline".into());
+        releasing_payout(&engine, &fiber).await;
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, NEW_INVOICE));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::AwaitingInvoice.as_str()
+        );
+    }
+
     #[tokio::test]
     async fn a_buy_post_cannot_be_created_or_taken() {
-        let fiber = Arc::new(FakeFiber {
-            status: StdMutex::new("Open".into()),
-            removed: StdMutex::new(false),
-            preimages: StdMutex::new(HashSet::new()),
-            payment_status: StdMutex::new("Inflight".into()),
-            payment_preimage: StdMutex::new(None),
-            parsed_amount: StdMutex::new(0),
-        });
+        let fiber = Arc::new(FakeFiber::new("Open", 0));
         let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber, None);
         let rejected = engine
             .handle(
@@ -1427,6 +1735,7 @@ mod tests {
                         fiber_pubkey: "fiber-seller".into(),
                         payment_method_id: "zelle".into(),
                         invoice: None,
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1438,14 +1747,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_post_must_be_sell() {
-        let fiber = Arc::new(FakeFiber {
-            status: StdMutex::new("Open".into()),
-            removed: StdMutex::new(false),
-            preimages: StdMutex::new(HashSet::new()),
-            payment_status: StdMutex::new("Inflight".into()),
-            payment_preimage: StdMutex::new(None),
-            parsed_amount: StdMutex::new(0),
-        });
+        let fiber = Arc::new(FakeFiber::new("Open", 0));
         let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber, None);
         let rejected = engine
             .handle(
@@ -1470,14 +1772,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_poster_can_cancel_an_open_post() {
-        let fiber = Arc::new(FakeFiber {
-            status: StdMutex::new("Open".into()),
-            removed: StdMutex::new(false),
-            preimages: StdMutex::new(HashSet::new()),
-            payment_status: StdMutex::new("Inflight".into()),
-            payment_preimage: StdMutex::new(None),
-            parsed_amount: StdMutex::new(0),
-        });
+        let fiber = Arc::new(FakeFiber::new("Open", 0));
         let engine = Engine::new(Arc::new(Db::open_in_memory().unwrap()), fiber, None);
         let posted = engine
             .handle(
@@ -1593,6 +1888,7 @@ mod tests {
                         fiber_pubkey: twine_pk,
                         payment_method_id: method_id,
                         invoice: Some(payout.invoice),
+                        fiber_addr: None,
                     })
                     .unwrap(),
             )

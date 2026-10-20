@@ -1,10 +1,15 @@
+mod channel;
 mod invoice;
 mod node;
 mod payment;
 mod watchtower;
 
+pub use channel::{
+    BuyerInbound, ChannelRpc, FiberChannel, already_connected, already_opening, has_live_open,
+    jit_funding_amount, outbound_covers, route_not_ready,
+};
 pub use invoice::InvoiceRpc;
-pub use node::NodeRpc;
+pub use node::{FiberNodeInfo, NodeRpc};
 pub use payment::PaymentRpc;
 pub use watchtower::WatchtowerRpc;
 
@@ -39,7 +44,7 @@ pub struct ParsedInvoice {
     pub amount: Option<u128>,
 }
 
-pub trait FiberRpc: InvoiceRpc + WatchtowerRpc + PaymentRpc + NodeRpc {
+pub trait FiberRpc: InvoiceRpc + WatchtowerRpc + PaymentRpc + NodeRpc + ChannelRpc {
     fn currency(&self) -> &str;
 }
 
@@ -142,7 +147,7 @@ fn same_hash(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
-fn hex_amount(value: Option<&Value>) -> Result<Option<u128>> {
+pub(crate) fn hex_amount(value: Option<&Value>) -> Result<Option<u128>> {
     let Some(value) = value else {
         return Ok(None);
     };

@@ -1,7 +1,7 @@
 use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Outbound, Trade};
-use crate::{Envelope, Phase, Side, TakePayload, apply_take, unix_now};
+use crate::{Envelope, Phase, Side, TakePayload, apply_take, parse_fiber_addr, unix_now};
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -46,6 +46,10 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     if payload.fiber_pubkey.trim().is_empty() {
         return Ok(vec![cant_do(sender, None, "fiber pubkey is required")]);
     }
+    let fiber_addr = match parse_fiber_addr(payload.fiber_addr.as_deref()) {
+        Ok(addr) => addr,
+        Err(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
+    };
     let Some(method) = order
         .payment_methods
         .iter()
@@ -97,6 +101,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         payment_kind: method.kind.clone(),
         payment_label: method.label.clone(),
         payment_currency: method.currency.clone(),
+        buyer_fiber_addr: fiber_addr,
     };
     if let Err(error) = engine.db.commit_take(&trade) {
         return Ok(vec![cant_do(sender, None, &error.to_string())]);

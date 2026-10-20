@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
-use twine_daemon::fiber::{HttpFiber, NodeRpc, accept_node_pubkey};
+use twine_daemon::fiber::{FiberNodeInfo, HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{
     connect, decrypt_action, public_order_event, publish_event, publish_fiber_node,
     publish_outbounds, publish_payment_catalog, sender_hex, subscribe_actions,
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
         &config.invoice_currency,
         &config.rpc_token,
     )?);
-    pin_fiber_node(&db, fiber.as_ref()).await?;
+    let node = pin_fiber_node(&db, fiber.as_ref()).await?;
     let fiber_pubkey = db.fiber_pubkey()?;
     let engine = Engine::new(db, fiber, config.solver.clone());
     engine.arm_watchtower().await?;
@@ -53,9 +53,22 @@ async fn main() -> Result<()> {
     subscribe_actions(&client, keys.public_key()).await?;
     match fiber_pubkey {
         Some(pubkey) => {
-            info!(pubkey = %pubkey, "fiber node for the app");
-            if let Err(error) =
-                publish_fiber_node(&client, &keys, &pubkey, config.solver.as_deref()).await
+            if node.addresses.is_empty() {
+                warn!(
+                    pubkey = %pubkey,
+                    "fiber node has no public P2P address; local wallets cannot be dialed. Set announced_addrs"
+                );
+            } else {
+                info!(pubkey = %pubkey, addresses = ?node.addresses, "fiber node for the app");
+            }
+            if let Err(error) = publish_fiber_node(
+                &client,
+                &keys,
+                &pubkey,
+                config.solver.as_deref(),
+                &node.addresses,
+            )
+            .await
             {
                 warn!(%error, "fiber node announcement failed");
             }
@@ -131,18 +144,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn pin_fiber_node(db: &Db, fiber: &HttpFiber) -> Result<()> {
-    let current = fiber
-        .node_pubkey()
+async fn pin_fiber_node(db: &Db, fiber: &HttpFiber) -> Result<FiberNodeInfo> {
+    let info = fiber
+        .node_info()
         .await
         .context("Fiber RPC node_info failed")?;
     let open = db.trades_in_states(Phase::watched_phases())?.len();
     let saved = db.fiber_pubkey()?;
-    if accept_node_pubkey(saved.as_deref(), &current, open)? {
-        db.set_fiber_pubkey(&current)?;
-        info!(pubkey = %current, "pinned fiber node");
+    if accept_node_pubkey(saved.as_deref(), &info.pubkey, open)? {
+        db.set_fiber_pubkey(&info.pubkey)?;
+        info!(pubkey = %info.pubkey, "pinned fiber node");
     } else {
-        info!(pubkey = %current, open_holds = open, "fiber node");
+        info!(pubkey = %info.pubkey, open_holds = open, "fiber node");
     }
-    Ok(())
+    Ok(info)
 }

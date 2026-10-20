@@ -44,6 +44,9 @@ pub(crate) async fn on_fiat_sent<F: FiberRpc + 'static>(
     {
         return Ok(vec![cant_do(sender, Some(trade_id), &reason)]);
     }
+    if let Err(reason) = engine.remember_fiber_addr(&trade.id, payload.fiber_addr.as_deref())? {
+        return Ok(vec![cant_do(sender, Some(trade_id), &reason)]);
+    }
     let order = engine.require_order(&trade.order_id)?;
     if let Some(outbound) = engine.refund_due_outbound(&order, &trade).await? {
         return Ok(outbound);
