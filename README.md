@@ -222,13 +222,15 @@ Keep spare CKB on the Twine Fiber node. On release, if the buyer cannot receive,
 
 ## Run locally
 
-From the repository root, in this order. Each step writes a file the next step reads. You need a Rust toolchain that supports edition 2024 (`rustup`), Docker, [ckb-cli 2.0.0](https://github.com/nervosnetwork/ckb-cli/releases/tag/v2.0.0), and `openssl`.
+From the repository root, in this order. Each step writes a file the next step reads. You need a Rust toolchain that supports edition 2024 (`rustup`), Docker, [ckb-cli 2.0.0](https://github.com/nervosnetwork/ckb-cli/releases/tag/v2.0.0), `openssl`, and `python3`.
 
 The same commands work on macOS, Linux, and Windows. They publish ports. `--network host` is not used: Docker Desktop does not put a container's loopback on the host, so a container started that way is not reachable from the machine.
 
 The blocks below are bash. On Windows, run them in [Git Bash](https://git-scm.com/install/windows) or WSL, from the repository root. PowerShell and Command Prompt will not run them. Git Bash rewrites Unix paths, so set `MSYS_NO_PATHCONV=1` in that window before any `docker run`. Docker Desktop must be running, and the drive that holds this repo must be shared with it.
 
-Use the published image `nervos/fiber:0.9.1`. Image build, `fnn-cli`, and store migration are in [docker/README.md](docker/README.md).
+Use the published image `nervos/fiber:0.9.1`. [docker/Dockerfile](docker/Dockerfile) builds that same tag when `FIBER_REF` is left unset. Image build, `fnn-cli`, and store migration are in [docker/README.md](docker/README.md).
+
+The first start copies the image's config to `fiber-node/config.yml` when that file is missing. The `listening_addr` and announced-address lines edited below are the same lines in [config/testnet/config.yml](config/testnet/config.yml) and [config/mainnet/config.yml](config/mainnet/config.yml).
 
 ### 1. CKB key
 
@@ -296,11 +298,34 @@ Copy `pubkey`. The token in the next step binds itself to it.
 
 For mainnet, add `-e FIBER_CONFIG_TEMPLATE=/usr/local/share/fiber/config/mainnet/config.yml` to that `docker run` before the first start, then set `ckb.rpc_url` in `fiber-node/config.yml` to a CKB RPC this machine can reach, and set `FIBER_NETWORK=mainnet` in `.env`. A store cannot change chains. To switch, stop the container, move `fiber-node/` aside, and start again.
 
-When wallets on another machine open a channel here, uncomment `announced_addrs` in `fiber-node/config.yml` and set a reachable address. Local nodes connect outbound to this address. The restart in step 5 picks it up:
+When wallets on another machine open a channel here, set a reachable address in `fiber-node/config.yml`. `announced_addrs` is already in the file. The address under it is commented, on both testnet and mainnet:
 
 ```yaml
   announced_addrs:
-    - "/ip4/YOUR-PUBLIC-IP/tcp/8228"
+    # - "/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8228"
+```
+
+Replace `YOUR_PUBLIC_IP` with this machine's public IPv4. Local nodes connect outbound to that address. The restart in step 5 picks it up.
+
+```bash
+PUBLIC_IP=YOUR_PUBLIC_IP
+PUBLIC_IP="$PUBLIC_IP" python3 - << 'PY'
+import os
+from pathlib import Path
+path = Path("fiber-node/config.yml")
+text = path.read_text()
+old = '# - "/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8228"'
+ip = os.environ["PUBLIC_IP"].strip()
+if not ip or ip == "YOUR_PUBLIC_IP":
+    raise SystemExit("set PUBLIC_IP to this machine's public IPv4")
+new = f'- "/ip4/{ip}/tcp/8228"'
+if old not in text:
+    if new in text:
+        raise SystemExit(0)
+    raise SystemExit("announced address line not found")
+path.write_text(text.replace(old, new, 1))
+PY
+grep -n -A4 announced_addrs fiber-node/config.yml
 ```
 
 ### 4. RPC token
@@ -340,21 +365,40 @@ chmod 600 "$HOME/twine-ckb/rpc-token"
 
 ### 5. Open RPC on this machine
 
-Write the biscuit public key into `fiber-node/config.yml` and bind RPC to `0.0.0.0:8227` inside the container. Fiber accepts that bind once the public key is in the file. Docker then publishes it on this machine's `127.0.0.1:8227`, which is `TWINE_RPC`. If the write is denied, put `sudo env PUB="$PUB"` in front of `python3` and drop the `PUB=` assignment already on that line.
+Write the biscuit public key into `fiber-node/config.yml` and bind RPC to `0.0.0.0:8227` inside the container. Fiber accepts that bind once the public key is in the file. Docker then publishes it on this machine's `127.0.0.1:8227`, which is `TWINE_RPC`. The mainnet template already contains a commented `biscuit_public_key` placeholder. This replaces that comment. Testnet has no placeholder, so the key is inserted under the RPC `listening_addr`. A key that is already uncommented is updated. If the write is denied, put `sudo env PUB="$PUB"` in front of `python3` and drop the `PUB=` assignment already on that line.
 
 ```bash
 PUB=$(awk -F': ' '/^Public key:/{print $2}' "$HOME/twine-ckb/biscuit-keypair.txt")
 PUB="$PUB" python3 - << 'PY'
 import os
+import re
 from pathlib import Path
 path = Path("fiber-node/config.yml")
 text = path.read_text()
+pub = os.environ["PUB"].strip()
+if not pub.startswith("ed25519/"):
+    raise SystemExit("public key is missing")
 old = 'listening_addr: "127.0.0.1:8227"'
-new = f'listening_addr: "0.0.0.0:8227"\n  biscuit_public_key: "{os.environ["PUB"]}"'
-if "biscuit_public_key:" not in text:
-    if old not in text:
+bound = 'listening_addr: "0.0.0.0:8227"'
+if old not in text and bound not in text:
+    raise SystemExit("rpc listening_addr not found")
+text = text.replace(old, bound, 1)
+active = re.compile(r'(?m)^(?P<indent>[ \t]*)biscuit_public_key:\s*".*"\s*$')
+commented = re.compile(r'(?m)^[ \t]*#[ \t]*biscuit_public_key:\s*".*"\s*$')
+if active.search(text):
+    text = active.sub(
+        lambda match: f'{match.group("indent")}biscuit_public_key: "{pub}"',
+        text,
+        count=1,
+    )
+elif commented.search(text):
+    text = commented.sub(f'  biscuit_public_key: "{pub}"', text, count=1)
+else:
+    needle = f'{bound}\n'
+    if needle not in text:
         raise SystemExit("rpc listening_addr not found")
-    path.write_text(text.replace(old, new, 1))
+    text = text.replace(needle, f'{needle}  biscuit_public_key: "{pub}"\n', 1)
+path.write_text(text)
 PY
 grep -n biscuit_public_key fiber-node/config.yml
 ```

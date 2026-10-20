@@ -4,18 +4,18 @@ Fiber release tags publish official container images to Docker Hub at `nervos/fi
 
 ## Build locally
 
-This directory is the [FiberDocker setup](https://github.com/nervosnetwork/fiber/tree/develop/docker), adapted so it can build from the Twine repo. Twine does not contain the `fnn` source, so the image checks out [nervosnetwork/fiber](https://github.com/nervosnetwork/fiber) `develop` and compiles `fiber-bin` and `fnn-cli` the same way upstream does. Config templates are copied from that checkout (`config/testnet`, `config/mainnet`).
+This directory is the [Fiber Docker setup](https://github.com/nervosnetwork/fiber/tree/v0.9.1/docker), adapted so it can build from the Twine repo. Twine does not contain the `fnn` source, so the image checks out [nervosnetwork/fiber](https://github.com/nervosnetwork/fiber) `v0.9.1` and compiles `fiber-bin` and `fnn-cli` the same way upstream does. Config templates are copied from that checkout (`config/testnet`, `config/mainnet`).
 
-`develop` currently tracks Fiber `0.10.0-rc1` and Rust `1.95.0`. Override the git ref with `FIBER_REF` (branch or tag).
+`v0.9.1` uses Rust `1.95.0`. That is the Fiber version the [run steps](../README.md#run-locally) use. Override the git ref with `FIBER_REF` (branch or tag).
 
 ```bash
 docker build -f docker/Dockerfile -t fiber:local .
-# docker build -f docker/Dockerfile --build-arg FIBER_REF=v0.9.1 -t fiber:local .
+# docker build -f docker/Dockerfile --build-arg FIBER_REF=develop -t fiber:local .
 ```
 
 ## Run the published image
 
-The node's CKB wallet, the two passwords, and how the daemon reaches RPC are in the [README](../README.md#fiber-node). Use `nervos/fiber:0.9.1` with this daemon. The key file is 64 hex characters with no `0x` prefix.
+The node's CKB wallet, the two passwords, and how the daemon reaches RPC are in [Run locally](../README.md#run-locally). Use `nervos/fiber:0.9.1` with this daemon. The key file is 64 hex characters with no `0x` prefix.
 
 ```bash
 mkdir -p ./fiber-node/ckb

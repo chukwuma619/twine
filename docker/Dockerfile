@@ -21,11 +21,11 @@ RUN apt-get update \
 WORKDIR /usr/src/fiber
 ENV CARGO_TARGET_DIR=/usr/src/fiber/target
 
-# develop's rust-toolchain.toml is 1.95.0, matching this image, and also lists
+# v0.9.1's rust-toolchain.toml is 1.95.0, matching this image, and also lists
 # the wasm target. Install that target up front. Leave the toolchain file in
 # the tree: deleting it makes git-version stamp fnn as dirty.
 ARG FIBER_REPO=https://github.com/nervosnetwork/fiber.git
-ARG FIBER_REF=develop
+ARG FIBER_REF=v0.9.1
 RUN git clone --depth 1 --branch "${FIBER_REF}" "${FIBER_REPO}" . \
     && rustup target add wasm32-unknown-unknown
 
