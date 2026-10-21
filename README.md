@@ -94,7 +94,7 @@ Clients encrypt actions to the daemon. The daemon encrypts replies back. Orders,
 | --- | --- | --- |
 | `4242` | `p` is the recipient | NIP-44 (v2) ciphertext. An action to the daemon, or a reply from it. |
 | `31420` | `d` is the order id | Public JSON order. Addressable. |
-| `31421` | `d` is `fiber-node` | Public JSON `{"pubkey":"<fnn pubkey>","addresses":["/ip4/.../tcp/8228"]}`. The app shows this so a wallet can connect and open a channel to the operator's node. |
+| `31421` | `d` is `fiber-node` | Public JSON `{"pubkey":"<fnn pubkey>","addresses":["/ip4/.../tcp/8230"]}`. The app shows this so a wallet can connect and open a channel to the operator's node. Port `8228` stays free for Fiber Studio. |
 | `31422` | `d` is `payment-methods` | Public JSON `{"methods":[...]}`. The app reads this for the currencies and methods on a new post. |
 | `4243` | `p` is the other trader, `t` is the trade id | NIP-44 chat between the two traders. The client uses this. The daemon does not subscribe to it. |
 
@@ -284,7 +284,7 @@ docker run -d --name fiber-node --restart unless-stopped \
   --env-file "$HOME/twine-ckb/fiber.env" \
   -e RUST_LOG=info \
   -v "$(pwd)/fiber-node:/fiber" \
-  -p 8228:8228 \
+  -p 8230:8230 \
   nervos/fiber:0.9.1
 ```
 
@@ -302,7 +302,7 @@ When wallets on another machine open a channel here, set a reachable address in 
 
 ```yaml
   announced_addrs:
-    # - "/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8228"
+    # - "/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8230"
 ```
 
 Replace `YOUR_PUBLIC_IP` with this machine's public IPv4. Local nodes connect outbound to that address. The restart in step 5 picks it up.
@@ -314,11 +314,11 @@ import os
 from pathlib import Path
 path = Path("fiber-node/config.yml")
 text = path.read_text()
-old = '# - "/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8228"'
+old = '# - "/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8230"'
 ip = os.environ["PUBLIC_IP"].strip()
 if not ip or ip == "YOUR_PUBLIC_IP":
     raise SystemExit("set PUBLIC_IP to this machine's public IPv4")
-new = f'- "/ip4/{ip}/tcp/8228"'
+new = f'- "/ip4/{ip}/tcp/8230"'
 if old not in text:
     if new in text:
         raise SystemExit(0)
@@ -408,7 +408,7 @@ PY
 grep -n biscuit_public_key fiber-node/config.yml
 ```
 
-Replace the container so both ports are published. The peer port stays on `8228`. RPC is only on this machine's loopback.
+Replace the container so both ports are published. The peer port is `8230`, which leaves `8228` free for Fiber Studio. RPC is only on this machine's loopback.
 
 ```bash
 docker rm -f fiber-node
@@ -417,7 +417,7 @@ docker run -d --name fiber-node --restart unless-stopped \
   -e RUST_LOG=info \
   -v "$(pwd)/fiber-node:/fiber" \
   -p 127.0.0.1:8229:8229 \
-  -p 8228:8228 \
+  -p 8230:8230 \
   nervos/fiber:0.9.1
 ```
 

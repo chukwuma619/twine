@@ -26,7 +26,7 @@ docker run --rm -it \
   -e FIBER_SECRET_KEY_PASSWORD='YOUR_PASSWORD' \
   -e RUST_LOG='info' \
   -v "$(pwd)/fiber-node:/fiber" \
-  -p 8228:8228 \
+  -p 8230:8230 \
   nervos/fiber:<release-tag>
 ```
 

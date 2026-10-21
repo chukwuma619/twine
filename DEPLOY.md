@@ -1,6 +1,6 @@
 # Deploy
 
-A Twine host runs two processes on one machine: a Fiber node (`nervos/fiber:0.9.1`) and `twine-daemon`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8228**. Fiber's JSON-RPC stays on `127.0.0.1:8229`, which leaves `8227` free for Fiber Studio.
+A Twine host runs two processes on one machine: a Fiber node (`nervos/fiber:0.9.1`) and `twine-daemon`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8230**. Fiber's JSON-RPC stays on `127.0.0.1:8229`. Ports `8227` and `8228` stay free for Fiber Studio.
 
 systemd passes the daemon its environment from `/opt/twine/.env`. Variable meanings are in the [README](README.md#configuration).
 
@@ -19,7 +19,7 @@ A current Ubuntu VPS with systemd is enough. Add 4 GB of swap before the Rust co
 | Port | Bind | Why |
 | --- | --- | --- |
 | 22/tcp | public | SSH |
-| 8228/tcp | public | Fiber peer-to-peer. Wallets open channels here. |
+| 8230/tcp | public | Fiber peer-to-peer. Wallets open channels here. |
 | 8229/tcp | `127.0.0.1` | Fiber JSON-RPC. The daemon is the only client. |
 
 The daemon has no listening port. It opens outbound websockets to `TWINE_RELAYS`, and the Fiber node opens outbound HTTPS to its CKB RPC.
@@ -41,7 +41,7 @@ sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 sudo ufw allow OpenSSH
-sudo ufw allow 8228/tcp
+sudo ufw allow 8230/tcp
 sudo ufw enable
 ```
 
@@ -107,7 +107,7 @@ EOF
 chmod 600 /opt/twine/secrets/fiber.env
 ```
 
-The image binds RPC to `127.0.0.1:8227` inside the container. The RPC section below moves that bind to `127.0.0.1:8229` before the daemon starts, so `8227` stays free for Fiber Studio. `--network host` puts that address on the VPS, which is where `TWINE_RPC` points. Host networking also makes the firewall rules above apply to 8228. `8229` is loopback-only, so it is not opened in the firewall.
+The image binds RPC to `127.0.0.1:8227` and the peer port to `8228`. Move the peer bind to `8230` before the first start, and the RPC section below moves RPC to `127.0.0.1:8229`. That leaves `8227` and `8228` free for Fiber Studio. `--network host` puts those addresses on the VPS, which is where `TWINE_RPC` points. Host networking also makes the firewall rule above apply to `8230`. `8229` is loopback-only, so it is not opened in the firewall.
 
 The command below starts testnet. For mainnet, add `-e FIBER_CONFIG_TEMPLATE=/usr/local/share/fiber/config/mainnet/config.yml` before the first start, then set `ckb.rpc_url` in `fiber-node/config.yml` to a CKB RPC this machine can reach, and set `FIBER_NETWORK=mainnet` in the daemon env below. A store cannot change chains. To switch, stop the container, move `fiber-node/` aside, and start again.
 
@@ -134,7 +134,8 @@ Set the address wallets use to open a channel. Local buyer and seller nodes conn
 
 ```bash
 PUBLIC_IP=YOUR_PUBLIC_IP
-sudo sed -i "s|# - \"/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8228\"|- \"/ip4/${PUBLIC_IP}/tcp/8228\"|" fiber-node/config.yml
+sudo sed -i 's|/ip4/0.0.0.0/tcp/8228|/ip4/0.0.0.0/tcp/8230|' fiber-node/config.yml
+sudo sed -i "s|# - \"/ip4/YOUR-FIBER-NODE-PUBLIC-IP/tcp/8228\"|- \"/ip4/${PUBLIC_IP}/tcp/8230\"|" fiber-node/config.yml
 sudo grep -n -A4 announced_addrs fiber-node/config.yml
 ```
 
