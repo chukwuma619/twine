@@ -343,7 +343,7 @@ pub(crate) mod support {
     use std::sync::Arc;
     use std::time::Duration;
 
-    pub const DEFAULT_RPC: &str = "http://127.0.0.1:8227";
+    pub const DEFAULT_RPC: &str = "http://127.0.0.1:8229";
 
     pub struct FiberNode {
         pub rpc: Arc<HttpFiber>,

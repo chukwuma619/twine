@@ -1,6 +1,6 @@
 # Deploy
 
-A Twine host runs two processes on one machine: a Fiber node (`nervos/fiber:0.9.1`) and `twine-daemon`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8228**. Fiber's JSON-RPC stays on `127.0.0.1:8227`.
+A Twine host runs two processes on one machine: a Fiber node (`nervos/fiber:0.9.1`) and `twine-daemon`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8228**. Fiber's JSON-RPC stays on `127.0.0.1:8229`, which leaves `8227` free for Fiber Studio.
 
 systemd passes the daemon its environment from `/opt/twine/.env`. Variable meanings are in the [README](README.md#configuration).
 
@@ -20,7 +20,7 @@ A current Ubuntu VPS with systemd is enough. Add 4 GB of swap before the Rust co
 | --- | --- | --- |
 | 22/tcp | public | SSH |
 | 8228/tcp | public | Fiber peer-to-peer. Wallets open channels here. |
-| 8227/tcp | `127.0.0.1` | Fiber JSON-RPC. The daemon is the only client. |
+| 8229/tcp | `127.0.0.1` | Fiber JSON-RPC. The daemon is the only client. |
 
 The daemon has no listening port. It opens outbound websockets to `TWINE_RELAYS`, and the Fiber node opens outbound HTTPS to its CKB RPC.
 
@@ -107,7 +107,7 @@ EOF
 chmod 600 /opt/twine/secrets/fiber.env
 ```
 
-The image binds RPC to `127.0.0.1:8227` inside the container. `--network host` puts that address on the VPS, which is where `TWINE_RPC` points. Host networking also makes the firewall rules above apply to 8227 and 8228.
+The image binds RPC to `127.0.0.1:8227` inside the container. The RPC section below moves that bind to `127.0.0.1:8229` before the daemon starts, so `8227` stays free for Fiber Studio. `--network host` puts that address on the VPS, which is where `TWINE_RPC` points. Host networking also makes the firewall rules above apply to 8228. `8229` is loopback-only, so it is not opened in the firewall.
 
 The command below starts testnet. For mainnet, add `-e FIBER_CONFIG_TEMPLATE=/usr/local/share/fiber/config/mainnet/config.yml` before the first start, then set `ckb.rpc_url` in `fiber-node/config.yml` to a CKB RPC this machine can reach, and set `FIBER_NETWORK=mainnet` in the daemon env below. A store cannot change chains. To switch, stop the container, move `fiber-node/` aside, and start again.
 
@@ -181,7 +181,8 @@ Write the biscuit public key under `rpc.listening_addr` and restart Fiber:
 
 ```bash
 PUB=$(awk -F': ' '/^Public key:/{print $2}' secrets/biscuit-keypair.txt)
-sudo sed -i "/listening_addr: \"127.0.0.1:8227\"/a\\  biscuit_public_key: \"${PUB}\"" fiber-node/config.yml
+sudo sed -i 's/listening_addr: "127.0.0.1:8227"/listening_addr: "127.0.0.1:8229"/' fiber-node/config.yml
+sudo sed -i "/listening_addr: \"127.0.0.1:8229\"/a\\  biscuit_public_key: \"${PUB}\"" fiber-node/config.yml
 sudo grep -n biscuit_public_key fiber-node/config.yml
 sudo docker restart fiber-node
 ```
@@ -189,7 +190,7 @@ sudo docker restart fiber-node
 `grep` prints `biscuit_public_key`. After the restart (give the key decrypt half a minute), RPC accepts the token:
 
 ```bash
-curl -sS http://127.0.0.1:8227 \
+curl -sS http://127.0.0.1:8229 \
   -H "Authorization: Bearer $(tr -d '\n' < /opt/twine/secrets/rpc-token)" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}'
@@ -215,7 +216,7 @@ FIBER_NETWORK=testnet
 RUST_LOG=info
 TWINE_NOSTR_SECRET=${NOSTR_SECRET}
 TWINE_RELAYS=wss://relay.damus.io,wss://nos.lol
-TWINE_RPC=http://127.0.0.1:8227
+TWINE_RPC=http://127.0.0.1:8229
 TWINE_RPC_TOKEN=${RPC_TOKEN}
 TWINE_DB=/opt/twine/twine.db
 EOF

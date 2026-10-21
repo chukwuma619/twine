@@ -36,11 +36,11 @@ On first start, the image copies the bundled testnet config to `/fiber/config.ym
 
 The image also includes `fnn-cli` for administration tasks.
 
-The RPC service listens on `127.0.0.1:8227` in the bundled configs, so publishing port `8227` from the container is not enough by itself. If you need remote RPC access, update `rpc.listening_addr` in your mounted config first.
+The RPC service listens on `127.0.0.1:8227` in the bundled image configs. Twine moves that bind to `8229` and publishes `127.0.0.1:8229`, so Fiber Studio can keep `8227`. Publishing the port is not enough by itself: `rpc.listening_addr` in the mounted config has to match. See [Run locally](../README.md#run-locally).
 
 ## Use `fnn-cli` with Docker
 
-If the node is already running in a container, the simplest way to use `fnn-cli` is to execute it inside the same container so it can talk to the default `127.0.0.1:8227` RPC endpoint:
+If the node is already running in a container, the simplest way to use `fnn-cli` is to execute it inside the same container so it can talk to the node's RPC endpoint (`127.0.0.1:8229` after the [run steps](../README.md#5-open-rpc-on-this-machine)):
 
 ```bash
 docker exec -it fiber-node fnn-cli info

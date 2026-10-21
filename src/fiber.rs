@@ -6,7 +6,7 @@ mod watchtower;
 
 pub use channel::{
     BuyerInbound, ChannelRpc, FiberChannel, already_connected, already_opening, has_live_open,
-    jit_funding_amount, outbound_covers, route_not_ready,
+    jit_funding_amount, outbound_covers, pending_will_cover, route_not_ready,
 };
 pub use invoice::InvoiceRpc;
 pub use node::{FiberNodeInfo, NodeRpc};
@@ -174,9 +174,9 @@ mod tests {
 
     #[test]
     fn biscuit_header_is_a_bearer_token() {
-        let fiber = HttpFiber::new("http://127.0.0.1:8227", "Fibt", "abc.def").unwrap();
+        let fiber = HttpFiber::new("http://127.0.0.1:8229", "Fibt", "abc.def").unwrap();
         assert_eq!(fiber.auth, "Bearer abc.def");
-        assert!(HttpFiber::new("http://127.0.0.1:8227", "Fibt", "  ").is_err());
+        assert!(HttpFiber::new("http://127.0.0.1:8229", "Fibt", "  ").is_err());
     }
 
     #[test]

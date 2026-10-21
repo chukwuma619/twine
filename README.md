@@ -200,7 +200,7 @@ Export the variables below before `cargo run`. The [run](#run-locally) section w
 | --- | --- | --- |
 | `TWINE_NOSTR_SECRET` | yes | Daemon Nostr key. Hex or `nsec`. Startup logs the matching `npub`. People paste that `npub` and `TWINE_RELAYS` into the app. |
 | `TWINE_RELAYS` | yes | Comma-separated websocket URLs. At least one. |
-| `TWINE_RPC` | yes | Fiber JSON-RPC URL. Locally this is `http://127.0.0.1:8227`. |
+| `TWINE_RPC` | yes | Fiber JSON-RPC URL. Locally this is `http://127.0.0.1:8229`, so port 8227 stays free for Fiber Studio. |
 | `TWINE_RPC_TOKEN` | yes | Biscuit for that RPC, sent as `Authorization: Bearer`. |
 | `FIBER_NETWORK` | no | `testnet` (default) or `mainnet`. Selects invoice currency `Fibt` or `Fibb`. |
 | `TWINE_SOLVER` | no | Hex Nostr pubkey allowed to send `resolve`. Empty means disputes are refused. |
@@ -365,7 +365,7 @@ chmod 600 "$HOME/twine-ckb/rpc-token"
 
 ### 5. Open RPC on this machine
 
-Write the biscuit public key into `fiber-node/config.yml` and bind RPC to `0.0.0.0:8227` inside the container. Fiber accepts that bind once the public key is in the file. Docker then publishes it on this machine's `127.0.0.1:8227`, which is `TWINE_RPC`. The mainnet template already contains a commented `biscuit_public_key` placeholder. This replaces that comment. Testnet has no placeholder, so the key is inserted under the RPC `listening_addr`. A key that is already uncommented is updated. If the write is denied, put `sudo env PUB="$PUB"` in front of `python3` and drop the `PUB=` assignment already on that line.
+Write the biscuit public key into `fiber-node/config.yml` and bind RPC to `0.0.0.0:8229` inside the container. Fiber accepts that bind once the public key is in the file. Docker then publishes it on this machine's `127.0.0.1:8229`, which is `TWINE_RPC`. Port `8227` stays free for Fiber Studio. The image still ships `127.0.0.1:8227`; this step moves that bind to `8229`. The mainnet template already contains a commented `biscuit_public_key` placeholder. This replaces that comment. Testnet has no placeholder, so the key is inserted under the RPC `listening_addr`. A key that is already uncommented is updated. If the write is denied, put `sudo env PUB="$PUB"` in front of `python3` and drop the `PUB=` assignment already on that line.
 
 ```bash
 PUB=$(awk -F': ' '/^Public key:/{print $2}' "$HOME/twine-ckb/biscuit-keypair.txt")
@@ -378,11 +378,16 @@ text = path.read_text()
 pub = os.environ["PUB"].strip()
 if not pub.startswith("ed25519/"):
     raise SystemExit("public key is missing")
-old = 'listening_addr: "127.0.0.1:8227"'
-bound = 'listening_addr: "0.0.0.0:8227"'
-if old not in text and bound not in text:
+candidates = [
+    'listening_addr: "127.0.0.1:8227"',
+    'listening_addr: "0.0.0.0:8227"',
+    'listening_addr: "127.0.0.1:8229"',
+]
+bound = 'listening_addr: "0.0.0.0:8229"'
+if bound not in text and not any(item in text for item in candidates):
     raise SystemExit("rpc listening_addr not found")
-text = text.replace(old, bound, 1)
+for item in candidates:
+    text = text.replace(item, bound, 1)
 active = re.compile(r'(?m)^(?P<indent>[ \t]*)biscuit_public_key:\s*".*"\s*$')
 commented = re.compile(r'(?m)^[ \t]*#[ \t]*biscuit_public_key:\s*".*"\s*$')
 if active.search(text):
@@ -411,7 +416,7 @@ docker run -d --name fiber-node --restart unless-stopped \
   --env-file "$HOME/twine-ckb/fiber.env" \
   -e RUST_LOG=info \
   -v "$(pwd)/fiber-node:/fiber" \
-  -p 127.0.0.1:8227:8227 \
+  -p 127.0.0.1:8229:8229 \
   -p 8228:8228 \
   nervos/fiber:0.9.1
 ```
@@ -419,7 +424,7 @@ docker run -d --name fiber-node --restart unless-stopped \
 Give the key decrypt half a minute, then call RPC with the token. A JSON `node_info` result means the token matches the public key. After this, `fnn-cli info` needs `--auth-token`.
 
 ```bash
-curl -sS http://127.0.0.1:8227 \
+curl -sS http://127.0.0.1:8229 \
   -H "Authorization: Bearer $(tr -d '\n' < "$HOME/twine-ckb/rpc-token")" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}'
@@ -438,7 +443,7 @@ FIBER_NETWORK=testnet
 RUST_LOG=info
 TWINE_NOSTR_SECRET=${NOSTR_SECRET}
 TWINE_RELAYS=wss://relay.damus.io,wss://nos.lol
-TWINE_RPC=http://127.0.0.1:8227
+TWINE_RPC=http://127.0.0.1:8229
 TWINE_RPC_TOKEN=${RPC_TOKEN}
 EOF
 chmod 600 .env

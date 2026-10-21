@@ -138,9 +138,18 @@ impl FiberChannel {
 pub fn outbound_covers(channels: &[FiberChannel], amount: u128) -> bool {
     channels
         .iter()
-        .map(FiberChannel::usable_outbound)
-        .sum::<u128>()
-        >= amount
+        .any(|channel| channel.usable_outbound() >= amount)
+}
+
+pub fn pending_will_cover(channels: &[FiberChannel], amount: u128) -> bool {
+    channels.iter().any(|channel| {
+        channel.is_pending()
+            && !(channel.is_one_way && channel.is_acceptor)
+            && channel
+                .local_balance
+                .saturating_sub(channel.offered_tlc_balance)
+                >= amount
+    })
 }
 
 pub fn has_live_open(channels: &[FiberChannel]) -> bool {
@@ -315,7 +324,47 @@ mod tests {
         };
         assert!(pending.is_pending());
         assert_eq!(pending.usable_outbound(), 0);
+        assert!(pending_will_cover(&[pending.clone()], 100_000_000));
+        assert!(!pending_will_cover(&[pending.clone()], 100_000_001));
         assert!(has_live_open(&[pending]));
+    }
+
+    #[test]
+    fn split_channels_do_not_cover_one_payment() {
+        let left = FiberChannel {
+            pubkey: "02ab".into(),
+            state_name: "ChannelReady".into(),
+            local_balance: 60_000_000,
+            offered_tlc_balance: 0,
+            enabled: true,
+            is_one_way: true,
+            is_acceptor: false,
+            is_udt: false,
+            failure_detail: None,
+        };
+        let right = FiberChannel {
+            local_balance: 40_000_000,
+            ..left.clone()
+        };
+        assert!(!outbound_covers(&[left.clone(), right], 100_000_000));
+        assert!(outbound_covers(&[left], 60_000_000));
+    }
+
+    #[test]
+    fn a_buyer_funded_pending_channel_will_not_pay() {
+        let pending = FiberChannel {
+            pubkey: "02ab".into(),
+            state_name: "NegotiatingFunding".into(),
+            local_balance: 500_000_000,
+            offered_tlc_balance: 0,
+            enabled: true,
+            is_one_way: true,
+            is_acceptor: true,
+            is_udt: false,
+            failure_detail: None,
+        };
+        assert!(pending.is_pending());
+        assert!(!pending_will_cover(&[pending], 1));
     }
 
     #[test]

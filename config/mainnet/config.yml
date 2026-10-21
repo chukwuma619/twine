@@ -100,7 +100,7 @@ rpc:
   #   - pubsub
   #   - dev         # debug builds only
   #   - prof        # requires the pprof feature
-  listening_addr: "127.0.0.1:8227"
+  listening_addr: "127.0.0.1:8229"
 
 ckb:
   # Replace this with a trusted mainnet CKB RPC endpoint before starting FNN.

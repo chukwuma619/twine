@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::fiber::{
     BuyerInbound, FiberRpc, ParsedInvoice, already_connected, already_opening, has_live_open,
-    jit_funding_amount, outbound_covers, route_not_ready,
+    jit_funding_amount, outbound_covers, pending_will_cover, route_not_ready,
 };
 use crate::nostr::publish_outbounds;
 use crate::types::{Order, Trade};
@@ -9,8 +9,8 @@ use crate::{
     Actor, CANCELED, CANT_DO, CantDoPayload, ClientAction, Decision, EXPIRED, Envelope,
     FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound,
     PAY_INVOICE, PayInvoicePayload, Phase, REFUNDING, SETTLED, WAITING_FIAT, WaitingFiatPayload,
-    apply_clock, apply_expired, apply_hold_received, apply_release_failed, apply_release_succeeded,
-    fiber_addr_is_reachable, parse_fiber_addr, trade_actor, unix_now,
+    action_deadline, apply_clock, apply_expired, apply_hold_received, apply_release_failed,
+    apply_release_succeeded, fiber_addr_is_reachable, parse_fiber_addr, trade_actor, unix_now,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
@@ -453,6 +453,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
             return self.fail_payout(&trade, "payout invoice hash does not match the hold");
         }
         match self.fiber.get_payment(&payment_hash).await {
+            Err(error) if payment_missing(&error) && payout_window_closed(&trade, &order) => {
+                self.refund_past_deadline(&trade).await
+            }
             Err(error) if payment_missing(&error) => {
                 match self.ensure_buyer_inbound(&trade).await? {
                     Ok(BuyerInbound::Ready) => self.send_recorded_payout(&trade, &invoice).await,
@@ -461,6 +464,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 }
             }
             Err(error) => Err(error),
+            Ok(payment) if payment.status == "Failed" && payout_window_closed(&trade, &order) => {
+                self.refund_past_deadline(&trade).await
+            }
             Ok(payment) => {
                 self.finish_recorded_payout(&trade, &payment.status, payment.preimage)
                     .await
@@ -479,7 +485,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             return Ok(Ok(BuyerInbound::Ready));
         }
         let pending = self.fiber.list_channels(Some(pubkey), true).await?;
-        if has_live_open(&pending) {
+        if pending_will_cover(&pending, trade.shannons) {
             return Ok(Ok(BuyerInbound::Opening));
         }
         if !self.buyer_is_peered(pubkey).await
@@ -492,11 +498,20 @@ impl<F: FiberRpc + 'static> Engine<F> {
         let funding = jit_funding_amount(trade.shannons);
         match self.fiber.open_channel(pubkey, funding).await {
             Ok(_) => Ok(Ok(BuyerInbound::Opening)),
-            Err(error) if already_opening(&error) => Ok(Ok(BuyerInbound::Opening)),
-            Err(error) => Ok(Err(format!(
-                "cannot open inbound to the buyer: {error}. Keep the node online, connected to this hub, and set to auto-accept"
-            ))),
+            Err(error) if already_opening(&error) => {
+                let pending = self.fiber.list_channels(Some(pubkey), true).await?;
+                if has_live_open(&pending) {
+                    return Ok(Ok(BuyerInbound::Opening));
+                }
+                Ok(Err(buyer_open_failed(&error)))
+            }
+            Err(error) => Ok(Err(buyer_open_failed(&error))),
         }
+    }
+
+    async fn refund_past_deadline(&self, trade: &Trade) -> Result<Vec<Outbound>> {
+        warn!(trade_id = %trade.id, "payout window closed; refunding the seller");
+        self.begin_refund(trade).await
     }
 
     async fn buyer_is_peered(&self, pubkey: &str) -> bool {
@@ -849,6 +864,18 @@ fn payment_missing(error: &anyhow::Error) -> bool {
     text.contains("not found") || text.contains("no such")
 }
 
+fn payout_window_closed(trade: &Trade, order: &Order) -> bool {
+    trade
+        .hold_received_at
+        .is_some_and(|received_at| unix_now() >= action_deadline(received_at, order.hold_secs))
+}
+
+fn buyer_open_failed(error: &anyhow::Error) -> String {
+    format!(
+        "cannot open inbound to the buyer: {error}. Keep the node online, connected to this hub, and set to auto-accept"
+    )
+}
+
 fn payout_invoice_ok(
     parsed: &ParsedInvoice,
     currency: &str,
@@ -877,9 +904,9 @@ mod tests {
     };
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
-        FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewOrderPayload, OrderStatus, PAY_INVOICE,
-        PAYMENT_WINDOW_SECS, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE, RESOLVE,
-        ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
+        FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewInvoicePayload, NewOrderPayload, OrderStatus,
+        PAY_INVOICE, PAYMENT_WINDOW_SECS, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE,
+        RESOLVE, ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
@@ -1675,6 +1702,147 @@ mod tests {
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::AwaitingInvoice.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn payout_opens_when_no_single_channel_covers_the_trade() {
+        let (engine, fiber) = fake_engine("Received");
+        let mut channels = fiber.channels.lock().unwrap();
+        channels.clear();
+        channels.push(ready_inbound(60_000_000));
+        channels.push(ready_inbound(60_000_000));
+        drop(channels);
+        releasing_payout(&engine, &fiber).await;
+        let waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert_eq!(fiber.opens.lock().unwrap().len(), 1);
+        assert_eq!(fiber.opens.lock().unwrap()[0].1, 10_000_000_000);
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Releasing.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_opens_past_a_pending_channel_that_cannot_cover() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        fiber.pending.lock().unwrap().push(FiberChannel {
+            local_balance: 1,
+            state_name: "NegotiatingFunding".into(),
+            ..ready_inbound(1)
+        });
+        releasing_payout(&engine, &fiber).await;
+        let waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert_eq!(fiber.opens.lock().unwrap().len(), 1);
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn payout_waits_when_a_pending_channel_can_cover() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        fiber.pending.lock().unwrap().push(FiberChannel {
+            state_name: "AwaitingChannelReady".into(),
+            ..ready_inbound(100_000_000)
+        });
+        releasing_payout(&engine, &fiber).await;
+        let waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert!(fiber.opens.lock().unwrap().is_empty());
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Releasing.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_rejects_an_already_error_when_nothing_is_opening() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        *fiber.open_error.lock().unwrap() = Some("peer is already shutting down".into());
+        releasing_payout(&engine, &fiber).await;
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, NEW_INVOICE));
+        let reason = outbound.iter().find_map(|item| match item {
+            Outbound::Reply { envelope, .. } if envelope.action == NEW_INVOICE => {
+                let payload: NewInvoicePayload = envelope.decode_payload().unwrap();
+                Some(payload.reason)
+            }
+            _ => None,
+        });
+        assert!(reason.unwrap().contains("shutting down"));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::AwaitingInvoice.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_waits_when_open_is_rejected_because_one_is_live() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        fiber.pending.lock().unwrap().push(FiberChannel {
+            local_balance: 1,
+            state_name: "NegotiatingFunding".into(),
+            ..ready_inbound(1)
+        });
+        *fiber.open_error.lock().unwrap() = Some("channel already pending".into());
+        releasing_payout(&engine, &fiber).await;
+        let waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert_eq!(fiber.opens.lock().unwrap().len(), 1);
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Releasing.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_refunds_instead_of_opening_inside_the_safety_window() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        engine
+            .db
+            .set_hold_received_at("trade", unix_now() - crate::HOLD_SECS as i64)
+            .unwrap();
+        releasing_payout(&engine, &fiber).await;
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, REFUNDING));
+        assert!(fiber.opens.lock().unwrap().is_empty());
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Refunding.as_str()
+        );
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_payment_already_sent_still_settles_inside_the_safety_window() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_hold_received_at("trade", unix_now() - crate::HOLD_SECS as i64)
+            .unwrap();
+        engine
+            .db
+            .set_trade_state("trade", Phase::Releasing.as_str())
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", Some("hash"))
+            .unwrap();
+        *fiber.payment_status.lock().unwrap() = "Success".into();
+        *fiber.payment_preimage.lock().unwrap() = Some("preimage".into());
+        let settled = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&settled, SETTLED));
+        assert!(fiber.opens.lock().unwrap().is_empty());
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
     }
 
     #[tokio::test]
