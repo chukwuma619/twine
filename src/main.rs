@@ -37,8 +37,9 @@ async fn main() -> Result<()> {
         &config.invoice_currency,
         &config.rpc_token,
     )?);
-    let node = pin_fiber_node(&db, fiber.as_ref()).await?;
+    pin_fiber_node(&db, fiber.as_ref()).await?;
     let fiber_pubkey = db.fiber_pubkey()?;
+    let fiber_addresses = db.fiber_addresses()?;
     let engine = Engine::new(db, fiber, config.solver.clone());
     engine.arm_watchtower().await?;
     let client = connect(&keys, &config.relays).await?;
@@ -53,20 +54,20 @@ async fn main() -> Result<()> {
     subscribe_actions(&client, keys.public_key()).await?;
     match fiber_pubkey {
         Some(pubkey) => {
-            if node.addresses.is_empty() {
+            if fiber_addresses.is_empty() {
                 warn!(
                     pubkey = %pubkey,
-                    "fiber node has no public P2P address; local wallets cannot be dialed. Set announced_addrs"
+                    "fiber node has no public multiaddr; Fiber Studio cannot dial it. Set announced_addrs"
                 );
             } else {
-                info!(pubkey = %pubkey, addresses = ?node.addresses, "fiber node for the app");
+                info!(pubkey = %pubkey, addresses = ?fiber_addresses, "fiber node for the app");
             }
             if let Err(error) = publish_fiber_node(
                 &client,
                 &keys,
                 &pubkey,
                 config.solver.as_deref(),
-                &node.addresses,
+                &fiber_addresses,
             )
             .await
             {
@@ -152,10 +153,10 @@ async fn pin_fiber_node(db: &Db, fiber: &HttpFiber) -> Result<FiberNodeInfo> {
     let open = db.trades_in_states(Phase::watched_phases())?.len();
     let saved = db.fiber_pubkey()?;
     if accept_node_pubkey(saved.as_deref(), &info.pubkey, open)? {
-        db.set_fiber_pubkey(&info.pubkey)?;
-        info!(pubkey = %info.pubkey, "pinned fiber node");
+        info!(pubkey = %info.pubkey, addresses = ?info.addresses, "pinned fiber node");
     } else {
-        info!(pubkey = %info.pubkey, open_holds = open, "fiber node");
+        info!(pubkey = %info.pubkey, addresses = ?info.addresses, open_holds = open, "fiber node");
     }
+    db.set_fiber_node(&info.pubkey, &info.addresses)?;
     Ok(info)
 }

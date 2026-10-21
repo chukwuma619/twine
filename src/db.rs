@@ -112,12 +112,17 @@ impl Db {
             );
             CREATE TABLE IF NOT EXISTS fiber_node (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                pubkey TEXT NOT NULL
+                pubkey TEXT NOT NULL,
+                addresses TEXT NOT NULL DEFAULT '[]'
             );
             ",
         )?;
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN hold_created_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN buyer_fiber_addr TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE fiber_node ADD COLUMN addresses TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
         sync_supported(&conn)?;
         Ok(())
     }
@@ -537,12 +542,30 @@ impl Db {
         Ok(value)
     }
 
-    pub fn set_fiber_pubkey(&self, pubkey: &str) -> Result<()> {
+    pub fn fiber_addresses(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db");
+        let raw: Option<String> = conn
+            .query_row("SELECT addresses FROM fiber_node WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        decode_fiber_addresses(raw.as_deref())
+    }
+
+    /// An empty address list keeps the previous multiaddrs when the pubkey is unchanged.
+    pub fn set_fiber_node(&self, pubkey: &str, addresses: &[String]) -> Result<()> {
+        let same_node = self.fiber_pubkey()?.as_deref() == Some(pubkey);
+        let kept = if addresses.is_empty() && same_node {
+            self.fiber_addresses()?
+        } else {
+            addresses.to_vec()
+        };
+        let encoded = serde_json::to_string(&kept).context("fiber node multiaddrs")?;
         let conn = self.conn.lock().expect("db");
         conn.execute(
-            "INSERT INTO fiber_node (id, pubkey) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET pubkey = excluded.pubkey",
-            params![pubkey],
+            "INSERT INTO fiber_node (id, pubkey, addresses) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET pubkey = excluded.pubkey, addresses = excluded.addresses",
+            params![pubkey, encoded],
         )?;
         Ok(())
     }
@@ -552,6 +575,13 @@ impl Db {
         conn.execute("DELETE FROM trades WHERE id = ?1", params![id])?;
         Ok(())
     }
+}
+
+fn decode_fiber_addresses(raw: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(raw).context("fiber node multiaddrs")
 }
 
 fn sync_supported(conn: &Connection) -> Result<()> {
@@ -799,6 +829,24 @@ mod tests {
             payment_currency: "NGN".into(),
             buyer_fiber_addr: None,
         }
+    }
+
+    #[test]
+    fn fiber_node_keeps_multiaddrs_with_the_pubkey() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.fiber_pubkey().unwrap().is_none());
+        assert!(db.fiber_addresses().unwrap().is_empty());
+
+        let multiaddr = "/ip4/203.0.113.10/tcp/8230/p2p/Qmabc".to_string();
+        db.set_fiber_node("02abc", &[multiaddr.clone()]).unwrap();
+        assert_eq!(db.fiber_pubkey().unwrap().as_deref(), Some("02abc"));
+        assert_eq!(db.fiber_addresses().unwrap(), vec![multiaddr]);
+
+        db.set_fiber_node("02abc", &[]).unwrap();
+        assert_eq!(db.fiber_addresses().unwrap().len(), 1);
+
+        db.set_fiber_node("02def", &[]).unwrap();
+        assert!(db.fiber_addresses().unwrap().is_empty());
     }
 
     #[test]

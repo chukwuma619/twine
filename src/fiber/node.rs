@@ -63,5 +63,14 @@ mod tests {
         .unwrap();
         assert_eq!(info.pubkey, "02abc");
         assert_eq!(info.addresses, vec!["/ip4/203.0.113.10/tcp/8228"]);
+        let with_peer = parse_node_info(&json!({
+            "pubkey": "02abc",
+            "addresses": ["/ip4/203.0.113.10/tcp/8230/p2p/Qmabc"]
+        }))
+        .unwrap();
+        assert_eq!(
+            with_peer.addresses,
+            vec!["/ip4/203.0.113.10/tcp/8230/p2p/Qmabc"]
+        );
     }
 }

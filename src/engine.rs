@@ -547,16 +547,16 @@ impl<F: FiberRpc + 'static> Engine<F> {
 
     async fn hub_connect_hint(&self) -> String {
         let Ok(info) = self.fiber.node_info().await else {
-            return "If the node is on a laptop or home network, connect it outbound to this hub. A local listen address is not reachable from Twine".into();
+            return "If the node is on a laptop or home network, connect it to this hub in Fiber Studio. A local listen address is not reachable from Twine".into();
         };
         if info.addresses.is_empty() {
             return format!(
-                "If the node is on a laptop or home network, connect it outbound to this hub pubkey {}. A local listen address is not reachable from Twine",
+                "If the node is on a laptop or home network, connect it in Fiber Studio to this hub pubkey {}. A local listen address is not reachable from Twine",
                 info.pubkey
             );
         }
         format!(
-            "If the node is on a laptop or home network, connect it outbound to this hub: fnn-cli peer connect_peer --pubkey {} --address '{}' --save true",
+            "If the node is on a laptop or home network, connect it in Fiber Studio: Network → Add saved peer, pubkey {}, multiaddr {}",
             info.pubkey, info.addresses[0]
         )
     }
