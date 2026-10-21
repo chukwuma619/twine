@@ -570,11 +570,48 @@ impl Db {
         Ok(())
     }
 
+    /// Updates multiaddrs only when `pubkey` is the pinned node.
+    /// An empty list keeps the addresses already stored.
+    pub fn update_pinned_addresses(&self, pubkey: &str, addresses: &[String]) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let Some((saved, _)) = fiber_node_row(&conn)? else {
+            return Ok(());
+        };
+        if saved != pubkey || addresses.is_empty() {
+            return Ok(());
+        }
+        write_fiber_node(&conn, &saved, addresses)
+    }
+
     pub fn delete_trade(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute("DELETE FROM trades WHERE id = ?1", params![id])?;
         Ok(())
     }
+}
+
+fn fiber_node_row(conn: &Connection) -> Result<Option<(String, Vec<String>)>> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT pubkey, addresses FROM fiber_node WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((pubkey, raw)) => Ok(Some((pubkey, decode_fiber_addresses(Some(raw.as_str()))?))),
+        None => Ok(None),
+    }
+}
+
+fn write_fiber_node(conn: &Connection, pubkey: &str, addresses: &[String]) -> Result<()> {
+    let encoded = serde_json::to_string(addresses).context("fiber node multiaddrs")?;
+    conn.execute(
+        "INSERT INTO fiber_node (id, pubkey, addresses) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET pubkey = excluded.pubkey, addresses = excluded.addresses",
+        params![pubkey, encoded],
+    )?;
+    Ok(())
 }
 
 fn decode_fiber_addresses(raw: Option<&str>) -> Result<Vec<String>> {
@@ -847,6 +884,27 @@ mod tests {
 
         db.set_fiber_node("02def", &[]).unwrap();
         assert!(db.fiber_addresses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinned_address_refresh_cannot_replace_the_pubkey() {
+        let db = Db::open_in_memory().unwrap();
+        let kept = "/ip4/203.0.113.10/tcp/8230/p2p/Qmabc".to_string();
+        db.set_fiber_node("02abc", &[kept.clone()]).unwrap();
+
+        db.update_pinned_addresses("02def", &["/ip4/198.51.100.2/tcp/8230".into()])
+            .unwrap();
+        assert_eq!(db.fiber_pubkey().unwrap().as_deref(), Some("02abc"));
+        assert_eq!(db.fiber_addresses().unwrap(), vec![kept]);
+
+        db.update_pinned_addresses("02abc", &[]).unwrap();
+        assert_eq!(db.fiber_addresses().unwrap().len(), 1);
+
+        let refreshed = "/ip4/198.51.100.8/tcp/8230/p2p/Qmdef".to_string();
+        db.update_pinned_addresses("02abc", &[refreshed.clone()])
+            .unwrap();
+        assert_eq!(db.fiber_pubkey().unwrap().as_deref(), Some("02abc"));
+        assert_eq!(db.fiber_addresses().unwrap(), vec![refreshed]);
     }
 
     #[test]

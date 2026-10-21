@@ -153,10 +153,12 @@ async fn pin_fiber_node(db: &Db, fiber: &HttpFiber) -> Result<FiberNodeInfo> {
     let open = db.trades_in_states(Phase::watched_phases())?.len();
     let saved = db.fiber_pubkey()?;
     if accept_node_pubkey(saved.as_deref(), &info.pubkey, open)? {
+        db.set_fiber_node(&info.pubkey, &info.addresses)?;
         info!(pubkey = %info.pubkey, addresses = ?info.addresses, "pinned fiber node");
     } else {
+        // Already this pubkey. Refresh multiaddrs without replacing the pin.
+        db.update_pinned_addresses(&info.pubkey, &info.addresses)?;
         info!(pubkey = %info.pubkey, addresses = ?info.addresses, open_holds = open, "fiber node");
     }
-    db.set_fiber_node(&info.pubkey, &info.addresses)?;
     Ok(info)
 }

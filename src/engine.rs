@@ -556,7 +556,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             );
         }
         format!(
-            "If the node is on a laptop or home network, connect it in Fiber Studio: Network → Add saved peer, pubkey {}, multiaddr {}",
+            "If the node is on a laptop or home network, connect it in Fiber Studio: Network, Add saved peer, then Add & connect. Pubkey {}, multiaddr {}",
             info.pubkey, info.addresses[0]
         )
     }
