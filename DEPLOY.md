@@ -154,10 +154,9 @@ biscuit keypair | tee secrets/biscuit-keypair.txt
 chmod 600 secrets/biscuit-keypair.txt
 ```
 
-The `Private key:` line signs tokens. The `Public key:` line starts with `ed25519/`. Set `FNN_PUBKEY` to the Fiber `pubkey` from `fnn-cli info`.
+The `Private key:` line signs tokens. The `Public key:` line starts with `ed25519/`. `node("")` is the local watchtower id. Fiber parses that fact as base58, so a hex pubkey makes `create_preimage` return Unauthorized.
 
 ```bash
-FNN_PUBKEY=YOUR_FNN_PUBKEY
 cat > secrets/permissions.bc << EOF
 read("node");
 read("invoices");
@@ -169,7 +168,7 @@ write("channels");
 read("peers");
 write("peers");
 write("watchtower");
-node("$FNN_PUBKEY");
+node("");
 EOF
 PRIV=$(awk -F': ' '/^Private key:/{print $2}' secrets/biscuit-keypair.txt)
 biscuit generate --private-key "$PRIV" secrets/permissions.bc \
