@@ -29,6 +29,7 @@ impl PaymentRpc for HttpFiber {
                 .to_string(),
             status: result["status"].as_str().unwrap_or("Created").to_string(),
             preimage: preimage_field(&result),
+            failed_error: failed_error_field(&result),
         })
     }
 
@@ -43,13 +44,22 @@ impl PaymentRpc for HttpFiber {
                 .ok_or_else(|| anyhow!("get_payment missing status"))?
                 .to_string(),
             preimage: preimage_field(&result),
+            failed_error: failed_error_field(&result),
         })
     }
 }
 
 fn preimage_field(result: &serde_json::Value) -> Option<String> {
+    text_field(result, "payment_preimage")
+}
+
+fn failed_error_field(result: &serde_json::Value) -> Option<String> {
+    text_field(result, "failed_error")
+}
+
+fn text_field(result: &serde_json::Value, key: &str) -> Option<String> {
     result
-        .get("payment_preimage")
+        .get(key)
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -68,5 +78,17 @@ mod tests {
         );
         assert!(preimage_field(&json!({"status": "Success"})).is_none());
         assert!(preimage_field(&json!({"payment_preimage": ""})).is_none());
+    }
+
+    #[test]
+    fn failed_error_is_kept_for_a_route_retry() {
+        assert_eq!(
+            failed_error_field(&json!({
+                "failed_error": " Build payment route error: PathFind error: no path found "
+            }))
+            .as_deref(),
+            Some("Build payment route error: PathFind error: no path found")
+        );
+        assert!(failed_error_field(&json!({"status": "Failed"})).is_none());
     }
 }

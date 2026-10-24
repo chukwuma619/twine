@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::fiber::{
     BuyerInbound, FiberRpc, ParsedInvoice, already_connected, already_opening, has_live_open,
-    jit_funding_amount, outbound_covers, pending_will_cover, route_not_ready,
+    jit_funding_amount, outbound_covers, payment_route_failed, pending_will_cover, route_not_ready,
 };
 use crate::nostr::publish_outbounds;
 use crate::types::{Order, Trade};
@@ -90,7 +90,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 hub.polling.clone(),
             );
         }
-        if phase == Phase::Releasing {
+        if phase == Phase::Releasing || phase == Phase::AwaitingInvoice {
             self.spawn_poll(
                 PollKind::Payout,
                 hub.client,
@@ -149,7 +149,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         };
         let payouts = self
             .db
-            .trades_in_states(&[Phase::Releasing])?
+            .trades_in_states(&[Phase::Releasing, Phase::AwaitingInvoice])?
             .into_iter()
             .map(|trade| trade.id)
             .collect();
@@ -406,6 +406,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
         let Some(mut trade) = self.db.get_trade(trade_id)? else {
             bail!("trade {trade_id} not found");
         };
+        if trade.phase()? == Phase::AwaitingInvoice {
+            return self.recover_awaiting_payout(&trade).await;
+        }
         if trade.phase()? != Phase::Releasing {
             return Ok(Vec::new());
         }
@@ -457,20 +460,74 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 self.refund_past_deadline(&trade).await
             }
             Err(error) if payment_missing(&error) => {
-                match self.ensure_buyer_inbound(&trade).await? {
-                    Ok(BuyerInbound::Ready) => self.send_recorded_payout(&trade, &invoice).await,
-                    Ok(BuyerInbound::Opening) => Ok(Vec::new()),
-                    Err(reason) => self.fail_payout(&trade, &reason),
-                }
+                self.pay_when_inbound_ready(&trade, &invoice).await
             }
             Err(error) => Err(error),
             Ok(payment) if payment.status == "Failed" && payout_window_closed(&trade, &order) => {
                 self.refund_past_deadline(&trade).await
             }
+            // Fiber records "no path" as Failed. That is not a spent invoice:
+            // open enough inbound and send the same payment again.
+            Ok(payment)
+                if payment.status == "Failed"
+                    && payment_route_failed(payment.failed_error.as_deref()) =>
+            {
+                self.pay_when_inbound_ready(&trade, &invoice).await
+            }
             Ok(payment) => {
                 self.finish_recorded_payout(&trade, &payment.status, payment.preimage)
                     .await
             }
+        }
+    }
+
+    /// A payout that already failed the route can still be sitting on Fiber as Success
+    /// after the trade asked for another invoice. Read that payment and settle it.
+    /// A route failure goes back to releasing so the same invoice is paid once a channel fits.
+    async fn recover_awaiting_payout(&self, trade: &Trade) -> Result<Vec<Outbound>> {
+        let Some(hash) = trade.hold_payment_hash.clone() else {
+            return Ok(Vec::new());
+        };
+        let Some(invoice) = trade
+            .payout_invoice
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let payment = match self.fiber.get_payment(&hash).await {
+            Ok(payment) => payment,
+            Err(error) if payment_missing(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let paid = payment.status == "Success";
+        let route_failed =
+            payment.status == "Failed" && payment_route_failed(payment.failed_error.as_deref());
+        if !paid && !route_failed {
+            return Ok(Vec::new());
+        }
+        if route_failed {
+            let order = self.require_order(&trade.order_id)?;
+            if payout_window_closed(trade, &order) {
+                return Ok(Vec::new());
+            }
+        }
+        self.db
+            .set_trade_state(&trade.id, Phase::Releasing.as_str())?;
+        self.db.set_payout(&trade.id, &invoice, Some(&hash))?;
+        if paid {
+            return self
+                .finish_recorded_payout(trade, &payment.status, payment.preimage)
+                .await;
+        }
+        self.pay_when_inbound_ready(trade, &invoice).await
+    }
+
+    async fn pay_when_inbound_ready(&self, trade: &Trade, invoice: &str) -> Result<Vec<Outbound>> {
+        match self.ensure_buyer_inbound(trade).await? {
+            Ok(BuyerInbound::Ready) => self.send_recorded_payout(trade, invoice).await,
+            Ok(BuyerInbound::Opening) => Ok(Vec::new()),
+            Err(reason) => self.fail_payout(trade, &reason),
         }
     }
 
@@ -565,6 +622,17 @@ impl<F: FiberRpc + 'static> Engine<F> {
         // A transport error may mean the payment landed. Leave the hash in place
         // and let the next poll read it. Do not fail the payout and do not send again.
         match self.fiber.send_payment(invoice).await {
+            Ok(payment)
+                if payment.status == "Failed"
+                    && payment_route_failed(payment.failed_error.as_deref()) =>
+            {
+                warn!(
+                    trade_id = %trade.id,
+                    error = payment.failed_error.as_deref().unwrap_or("no path"),
+                    "payout route not ready; waiting to send again"
+                );
+                Ok(Vec::new())
+            }
             Ok(payment) => {
                 self.finish_recorded_payout(trade, &payment.status, payment.preimage)
                     .await
@@ -784,7 +852,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
                         {
                             true
                         }
-                        (PollKind::Payout, Some(Phase::Releasing)) => true,
+                        (PollKind::Payout, Some(Phase::Releasing | Phase::AwaitingInvoice)) => true,
                         _ => false,
                     },
                     _ => false,
@@ -917,6 +985,7 @@ mod tests {
         preimages: StdMutex<HashSet<String>>,
         payment_status: StdMutex<String>,
         payment_preimage: StdMutex<Option<String>>,
+        payment_failed_error: StdMutex<Option<String>>,
         parsed_amount: StdMutex<u128>,
         channels: StdMutex<Vec<FiberChannel>>,
         pending: StdMutex<Vec<FiberChannel>>,
@@ -952,6 +1021,7 @@ mod tests {
                 preimages: StdMutex::new(HashSet::new()),
                 payment_status: StdMutex::new("Inflight".to_string()),
                 payment_preimage: StdMutex::new(None),
+                payment_failed_error: StdMutex::new(None),
                 parsed_amount: StdMutex::new(parsed_amount),
                 channels: StdMutex::new(vec![ready_inbound(1_000_000_000)]),
                 pending: StdMutex::new(Vec::new()),
@@ -1034,6 +1104,7 @@ mod tests {
                 payment_hash: "hash".into(),
                 status: "Success".into(),
                 preimage: Some("preimage".into()),
+                failed_error: None,
             })
         }
         async fn get_payment(&self, payment_hash: &str) -> Result<PaymentInfo> {
@@ -1044,6 +1115,7 @@ mod tests {
                 payment_hash: payment_hash.to_string(),
                 status: self.payment_status.lock().expect("payment").clone(),
                 preimage: self.payment_preimage.lock().expect("preimage").clone(),
+                failed_error: self.payment_failed_error.lock().expect("failed").clone(),
             })
         }
     }
@@ -1842,6 +1914,94 @@ mod tests {
         let settled = engine.on_payout_status("trade").await.unwrap();
         assert!(replies_contain(&settled, SETTLED));
         assert!(fiber.opens.lock().unwrap().is_empty());
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+    }
+
+    fn recorded_payout(
+        engine: &Engine<FakeFiber>,
+        fiber: &FakeFiber,
+        status: &str,
+        error: Option<&str>,
+    ) {
+        engine
+            .db
+            .set_trade_state("trade", Phase::Releasing.as_str())
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", Some("hash"))
+            .unwrap();
+        *fiber.payment_status.lock().unwrap() = status.into();
+        *fiber.payment_failed_error.lock().unwrap() = error.map(str::to_string);
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_opens_inbound_instead_of_asking_for_a_new_invoice() {
+        let (engine, fiber) = fake_engine("Received");
+        fiber.channels.lock().unwrap().clear();
+        recorded_payout(
+            &engine,
+            &fiber,
+            "Failed",
+            Some("Build payment route error: Failed to build route, PathFind error: no path found"),
+        );
+        let waiting = engine.on_payout_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert_eq!(fiber.opens.lock().unwrap().len(), 1);
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Releasing.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_is_sent_again_when_inbound_already_covers() {
+        let (engine, fiber) = fake_engine("Received");
+        recorded_payout(
+            &engine,
+            &fiber,
+            "Failed",
+            Some("PathFind error: no path found"),
+        );
+        let settled = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&settled, SETTLED));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 1);
+        assert!(fiber.opens.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_payout_that_is_not_a_route_still_asks_for_a_new_invoice() {
+        let (engine, fiber) = fake_engine("Received");
+        recorded_payout(&engine, &fiber, "Failed", Some("invoice expired"));
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, NEW_INVOICE));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::AwaitingInvoice.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payout_that_succeeded_after_a_route_failure_settles() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_trade_state("trade", Phase::AwaitingInvoice.as_str())
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", None)
+            .unwrap();
+        *fiber.payment_status.lock().unwrap() = "Success".into();
+        *fiber.payment_preimage.lock().unwrap() = Some("preimage".into());
+        let settled = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&settled, SETTLED));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Settled.as_str()
+        );
         assert_eq!(*fiber.send_count.lock().unwrap(), 0);
     }
 

@@ -173,10 +173,22 @@ pub fn already_connected(error: &anyhow::Error) -> bool {
 }
 
 pub fn route_not_ready(error: &anyhow::Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
+    route_failure_text(&error.to_string())
+}
+
+/// A stored `Failed` payment can be sent again when Fiber had no path.
+/// An expired invoice or a hash mismatch stays a real failure.
+pub fn payment_route_failed(failed_error: Option<&str>) -> bool {
+    failed_error.is_some_and(route_failure_text)
+}
+
+fn route_failure_text(error: &str) -> bool {
+    let text = error.to_ascii_lowercase();
     text.contains("failed to build route")
         || text.contains("no route")
+        || text.contains("no path")
         || text.contains("route not found")
+        || text.contains("insufficient balance")
 }
 
 fn parse_peers(result: &Value) -> Result<Vec<String>> {
@@ -390,5 +402,17 @@ mod tests {
         assert_eq!(jit_funding_amount(100_000_000), 10_000_000_000);
         assert_eq!(jit_funding_amount(1), 10_000_000_000);
         assert_eq!(jit_funding_amount(5_000_000_000), 14_900_000_000);
+    }
+
+    #[test]
+    fn a_missing_path_can_be_retried() {
+        assert!(payment_route_failed(Some(
+            "Build payment route error: Failed to build route, PathFind error: no path found"
+        )));
+        assert!(payment_route_failed(Some(
+            "Insufficient balance: max outbound liquidity"
+        )));
+        assert!(!payment_route_failed(Some("invoice expired")));
+        assert!(!payment_route_failed(None));
     }
 }

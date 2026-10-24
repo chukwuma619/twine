@@ -6,7 +6,7 @@ mod watchtower;
 
 pub use channel::{
     BuyerInbound, ChannelRpc, FiberChannel, already_connected, already_opening, has_live_open,
-    jit_funding_amount, outbound_covers, pending_will_cover, route_not_ready,
+    jit_funding_amount, outbound_covers, payment_route_failed, pending_will_cover, route_not_ready,
 };
 pub use invoice::InvoiceRpc;
 pub use node::{FiberNodeInfo, NodeRpc};
@@ -35,6 +35,7 @@ pub struct PaymentInfo {
     pub payment_hash: String,
     pub status: String,
     pub preimage: Option<String>,
+    pub failed_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
