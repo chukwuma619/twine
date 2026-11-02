@@ -43,20 +43,6 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         Ok(value) => value,
         Err(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
     };
-    let Some(method) = order
-        .payment_methods
-        .iter()
-        .find(|method| method.id == payload.payment_method_id)
-    else {
-        return Ok(vec![cant_do(sender, None, "unknown payment method")]);
-    };
-    if method.currency != order.fiat_currency.trim() {
-        return Ok(vec![cant_do(
-            sender,
-            None,
-            "payment method does not match this currency",
-        )]);
-    }
     let invoice = payload
         .invoice
         .as_deref()
@@ -85,10 +71,6 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         payout_payment_hash: None,
         hold_received_at: None,
         hold_created_at: Some(created_at),
-        payment_method_id: method.id.clone(),
-        payment_kind: method.kind.clone(),
-        payment_label: method.label.clone(),
-        payment_currency: method.currency.clone(),
         buyer_fiber_addr: None,
     };
     if let Err(error) = engine.db.commit_take(&trade) {

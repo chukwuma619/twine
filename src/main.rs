@@ -8,7 +8,7 @@ use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{FiberNodeInfo, HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{
     connect, decrypt_action, public_order_event, publish_event, publish_fiber_node,
-    publish_outbounds, publish_payment_catalog, sender_hex, subscribe_actions,
+    publish_outbounds, sender_hex, subscribe_actions,
 };
 use twine_daemon::{Config, KIND_ACTION, Phase};
 
@@ -75,14 +75,6 @@ async fn main() -> Result<()> {
             }
         }
         None => warn!("fiber node is not pinned"),
-    }
-    match engine.db.supported_payment_methods() {
-        Ok(methods) => {
-            if let Err(error) = publish_payment_catalog(&client, &keys, &methods).await {
-                warn!(%error, "payment catalog announcement failed");
-            }
-        }
-        Err(error) => warn!(%error, "payment catalog announcement failed"),
     }
     match engine.db.orders() {
         Ok(orders) => {

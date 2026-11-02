@@ -1,7 +1,4 @@
-use crate::{
-    Order, OrderStatus, PaymentKind, PaymentMethod, Phase, SUPPORTED_PAYMENT_METHODS,
-    SupportedPaymentMethod, Trade, i64_from_shannons,
-};
+use crate::{Order, OrderStatus, Phase, Trade, i64_from_shannons};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 #[cfg(unix)]
@@ -11,8 +8,7 @@ use std::sync::Mutex;
 
 const TRADE_COLUMNS: &str = "id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber, \
      fiat_amount, shannons, state, hold_payment_hash, hold_invoice, payout_invoice, \
-     payout_payment_hash, hold_received_at, hold_created_at, payment_method_id, payment_kind, \
-     payment_label, payment_currency, buyer_fiber_addr";
+     payout_payment_hash, hold_received_at, hold_created_at, buyer_fiber_addr";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -67,19 +63,6 @@ impl Db {
                 status TEXT NOT NULL,
                 hold_secs INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS supported_payment_methods (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                label TEXT NOT NULL,
-                currency TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS payment_methods (
-                order_id TEXT NOT NULL,
-                method_id TEXT NOT NULL,
-                PRIMARY KEY (order_id, method_id),
-                FOREIGN KEY(order_id) REFERENCES orders(id),
-                FOREIGN KEY(method_id) REFERENCES supported_payment_methods(id)
-            );
             CREATE TABLE IF NOT EXISTS trades (
                 id TEXT PRIMARY KEY,
                 order_id TEXT NOT NULL,
@@ -96,10 +79,6 @@ impl Db {
                 payout_payment_hash TEXT,
                 hold_received_at INTEGER,
                 hold_created_at INTEGER,
-                payment_method_id TEXT NOT NULL,
-                payment_kind TEXT NOT NULL,
-                payment_label TEXT NOT NULL,
-                payment_currency TEXT NOT NULL,
                 buyer_fiber_addr TEXT,
                 FOREIGN KEY(order_id) REFERENCES orders(id)
             );
@@ -119,17 +98,21 @@ impl Db {
         )?;
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN hold_created_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN buyer_fiber_addr TEXT", []);
+        let _ = conn.execute("DROP TABLE IF EXISTS payment_methods", []);
+        let _ = conn.execute("DROP TABLE IF EXISTS supported_payment_methods", []);
+        for column in [
+            "payment_method_id",
+            "payment_kind",
+            "payment_label",
+            "payment_currency",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE trades DROP COLUMN {column}"), []);
+        }
         let _ = conn.execute(
             "ALTER TABLE fiber_node ADD COLUMN addresses TEXT NOT NULL DEFAULT '[]'",
             [],
         );
-        sync_supported(&conn)?;
         Ok(())
-    }
-
-    pub fn supported_payment_methods(&self) -> Result<Vec<SupportedPaymentMethod>> {
-        let conn = self.conn.lock().expect("db");
-        load_supported(&conn)
     }
 
     pub fn mark_event(&self, event_id: &str) -> Result<bool> {
@@ -164,9 +147,6 @@ impl Db {
                 i64::try_from(order.hold_secs).context("hold does not fit sqlite integer")?,
             ],
         )?;
-        for method in &order.payment_methods {
-            insert_method(&tx, &order.id, method)?;
-        }
         tx.commit()?;
         Ok(())
     }
@@ -191,7 +171,6 @@ impl Db {
                     price_per_ckb: row.get(6)?,
                     min: row.get(7)?,
                     max: row.get(8)?,
-                    payment_methods: Vec::new(),
                     status: row.get(9)?,
                     hold_secs: read_u64(row.get(10)?, 10)?,
                     reserved_shannons: 0,
@@ -201,7 +180,6 @@ impl Db {
         let Some(mut order) = order else {
             return Ok(None);
         };
-        order.payment_methods = load_methods(&conn, id)?;
         order.reserved_shannons = reserved_shannons_for(&conn, id)?;
         Ok(Some(order))
     }
@@ -243,9 +221,8 @@ impl Db {
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
                 payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
-                payment_method_id, payment_kind, payment_label, payment_currency,
                 buyer_fiber_addr
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 trade.id,
                 trade.order_id,
@@ -262,10 +239,6 @@ impl Db {
                 trade.payout_payment_hash,
                 trade.hold_received_at,
                 trade.hold_created_at,
-                trade.payment_method_id,
-                trade.payment_kind,
-                trade.payment_label,
-                trade.payment_currency,
                 trade.buyer_fiber_addr,
             ],
         )?;
@@ -352,9 +325,8 @@ impl Db {
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
                 payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
-                payment_method_id, payment_kind, payment_label, payment_currency,
                 buyer_fiber_addr
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 trade.id,
                 trade.order_id,
@@ -371,10 +343,6 @@ impl Db {
                 trade.payout_payment_hash,
                 trade.hold_received_at,
                 trade.hold_created_at,
-                trade.payment_method_id,
-                trade.payment_kind,
-                trade.payment_label,
-                trade.payment_currency,
                 trade.buyer_fiber_addr,
             ],
         )?;
@@ -612,96 +580,6 @@ fn decode_fiber_addresses(raw: Option<&str>) -> Result<Vec<String>> {
     serde_json::from_str(raw).context("fiber node multiaddrs")
 }
 
-fn sync_supported(conn: &Connection) -> Result<()> {
-    for method in SUPPORTED_PAYMENT_METHODS {
-        if PaymentKind::parse(method.kind).is_none() {
-            bail!(
-                "payment method {} has unknown kind {}",
-                method.id,
-                method.kind
-            );
-        }
-        if !currency_code(method.currency) {
-            bail!(
-                "payment method {} has unknown currency {}",
-                method.id,
-                method.currency
-            );
-        }
-        conn.execute(
-            "INSERT INTO supported_payment_methods (id, kind, label, currency) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, label = excluded.label, currency = excluded.currency",
-            params![method.id, method.kind, method.label, method.currency],
-        )?;
-    }
-    let ids: Vec<&str> = SUPPORTED_PAYMENT_METHODS
-        .iter()
-        .map(|method| method.id)
-        .collect();
-    if ids.is_empty() {
-        conn.execute("DELETE FROM supported_payment_methods", [])?;
-        return Ok(());
-    }
-    let marks = vec!["?"; ids.len()].join(",");
-    let sql = format!("DELETE FROM supported_payment_methods WHERE id NOT IN ({marks})");
-    conn.execute(&sql, rusqlite::params_from_iter(ids.iter()))
-        .context("cannot remove a payment method that an order still uses")?;
-    Ok(())
-}
-
-fn currency_code(value: &str) -> bool {
-    value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())
-}
-
-fn load_supported(conn: &Connection) -> Result<Vec<SupportedPaymentMethod>> {
-    let mut stmt = conn
-        .prepare("SELECT id, kind, label, currency FROM supported_payment_methods ORDER BY id")?;
-    let rows = stmt.query_map([], |row| {
-        Ok(SupportedPaymentMethod {
-            id: row.get(0)?,
-            kind: row.get(1)?,
-            label: row.get(2)?,
-            currency: row.get(3)?,
-        })
-    })?;
-    let mut methods = Vec::new();
-    for row in rows {
-        methods.push(row?);
-    }
-    Ok(methods)
-}
-
-fn insert_method(conn: &Connection, order_id: &str, method: &PaymentMethod) -> Result<()> {
-    conn.execute(
-        "INSERT INTO payment_methods (order_id, method_id) VALUES (?1, ?2)",
-        params![order_id, method.id],
-    )?;
-    Ok(())
-}
-
-fn load_methods(conn: &Connection, order_id: &str) -> Result<Vec<PaymentMethod>> {
-    let mut stmt = conn.prepare(
-        "SELECT supported.id, supported.kind, supported.label, supported.currency
-         FROM payment_methods payment
-         JOIN supported_payment_methods supported ON supported.id = payment.method_id
-         WHERE payment.order_id = ?1
-         ORDER BY supported.id",
-    )?;
-    let rows = stmt.query_map(params![order_id], |row| {
-        Ok(PaymentMethod {
-            id: row.get(0)?,
-            kind: row.get(1)?,
-            label: row.get(2)?,
-            currency: row.get(3)?,
-        })
-    })?;
-    let mut methods = Vec::new();
-    for row in rows {
-        methods.push(row?);
-    }
-    Ok(methods)
-}
-
 fn open_states() -> Vec<&'static str> {
     Phase::open_phases()
         .iter()
@@ -799,11 +677,7 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         payout_payment_hash: row.get(12)?,
         hold_received_at: row.get(13)?,
         hold_created_at: row.get(14)?,
-        payment_method_id: row.get(15)?,
-        payment_kind: row.get(16)?,
-        payment_label: row.get(17)?,
-        payment_currency: row.get(18)?,
-        buyer_fiber_addr: row.get(19)?,
+        buyer_fiber_addr: row.get(15)?,
     })
 }
 
@@ -822,12 +696,6 @@ mod tests {
             price_per_ckb: "1000".into(),
             min: "1000".into(),
             max: "10000".into(),
-            payment_methods: vec![PaymentMethod {
-                id: "gtbank".into(),
-                kind: "bank".into(),
-                label: "GTBank".into(),
-                currency: "NGN".into(),
-            }],
             status: OrderStatus::Open.as_str().into(),
             hold_secs: 36 * 3_600,
             reserved_shannons: 0,
@@ -851,10 +719,6 @@ mod tests {
             payout_payment_hash: None,
             hold_received_at: None,
             hold_created_at: None,
-            payment_method_id: "gtbank".into(),
-            payment_kind: "bank".into(),
-            payment_label: "GTBank".into(),
-            payment_currency: "NGN".into(),
             buyer_fiber_addr: None,
         }
     }
@@ -906,24 +770,7 @@ mod tests {
         let orders = db.orders().unwrap();
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].id, "order");
-        assert_eq!(orders[0].payment_methods[0].id, "gtbank");
-    }
-
-    #[test]
-    fn the_catalog_is_the_two_configured_methods() {
-        let db = Db::open_in_memory().unwrap();
-        let methods = db.supported_payment_methods().unwrap();
-        assert_eq!(
-            methods
-                .iter()
-                .map(|method| method.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["gtbank", "zelle"]
-        );
-        assert_eq!(methods[0].kind, "bank");
-        assert_eq!(methods[0].currency, "NGN");
-        assert_eq!(methods[1].kind, "wallet");
-        assert_eq!(methods[1].currency, "USD");
+        assert_eq!(orders[0].fiat_currency, "NGN");
     }
 
     #[test]

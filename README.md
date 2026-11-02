@@ -12,10 +12,10 @@ To run this on your own machine, follow [Run locally](#run-locally) from the top
 
 A post offers CKB. The poster is the seller. The taker is the buyer. There is no buy post, and there is no automatic matching: someone picks a post. Anyone except the poster can take it. A post has at most one open trade. The next take waits until that trade is settled, canceled, or expired.
 
-1. Someone posts CKB for sale: price, currency, size, and payment methods.
-2. Someone else takes it: a fiat amount inside the post's min and max, their Fiber pubkey, one payment method, and a Fiber invoice that should receive the CKB.
+1. Someone posts CKB for sale: price, currency, and size.
+2. Someone else takes it: a fiat amount inside the post's min and max, and a Fiber invoice that should receive the CKB.
 3. The daemon creates a hold invoice under that payout invoice's payment hash. It does not learn the preimage. Both people get `pay-invoice`.
-4. The seller pays the hold from their own Fiber node. The daemon waits until Fiber reports it `Received`, then sends `waiting-fiat`. That message names the payment method. Account numbers are not stored here. Traders share them in client chat.
+4. The seller pays the hold from their own Fiber node. The daemon waits until Fiber reports it `Received`, then sends `waiting-fiat`. The seller writes the account details in the client chat. The daemon does not store them.
 5. The buyer sends fiat outside Twine and marks it sent. The payout invoice is already the one from take, so this message can leave `invoice` empty. A replacement must use the same payment hash.
 6. The seller releases. The daemon records the hold hash, pays the buyer's invoice, and only then reads the preimage Fiber learned from that payment. It registers that preimage with the watchtower and settles the hold. Both people get `settled`.
 7. If the buyer does not pay in time, or a later phase hits the safety deadline below, Fiber refunds the seller. The slice goes back on the post when the hold expires.
@@ -72,32 +72,22 @@ All of these are fixed in `src/constant.rs`.
 
 `1` CKB is `100_000_000` shannons. Fiat and CKB amounts in messages are decimal strings. The daemon rounds a conversion that lands between shannons half-up to the nearest shannon.
 
-### Payment methods
+### How the buyer pays
 
-The catalog lives in `SUPPORTED_PAYMENT_METHODS`. This build ships with two:
-
-| id | kind | label | currency |
-| --- | --- | --- | --- |
-| `gtbank` | `bank` | GTBank | `NGN` |
-| `zelle` | `wallet` | Zelle | `USD` |
-
-A post names up to five ids. Each id must be in the catalog, and its currency must be the post's fiat currency. The public order shows `id`, `kind`, `label`, and `currency`. The daemon does not store account details.
-
-Add or remove methods by editing that list and restarting. Startup writes the list into SQLite and deletes catalog rows that are no longer in it. A method that an open post still references cannot be removed.
+The seller types the account details into the trade and sends them. The buyer sees that text. The daemon does not store it, and it is not on the public order.
 
 ## Nostr
 
-Clients encrypt actions to the daemon. The daemon encrypts replies back. Orders, the Fiber node pubkey, and the payment catalog are public. The event kinds below are application constants, not NIPs.
+Clients encrypt actions to the daemon. The daemon encrypts replies back. Orders and the Fiber node pubkey are public. The event kinds below are application constants, not NIPs.
 
 | Kind | Tag | Content |
 | --- | --- | --- |
 | `4242` | `p` is the recipient | NIP-44 (v2) ciphertext. An action to the daemon, or a reply from it. |
 | `31420` | `d` is the order id | Public JSON order. Addressable. |
 | `31421` | `d` is `fiber-node` | Public JSON `{"pubkey":"<fnn pubkey>","addresses":["/ip4/.../tcp/8230"]}`. A wallet that needs a peer can connect here. A trade does not read it. Port `8228` stays free for Fiber Studio. |
-| `31422` | `d` is `payment-methods` | Public JSON `{"methods":[...]}`. The app reads this for the currencies and methods on a new post. |
 | `4243` | `p` is the other trader, `t` is the trade id | NIP-44 chat between the two traders. The client uses this. The daemon does not subscribe to it. |
 
-On startup the daemon connects to `TWINE_RELAYS`, subscribes to kind `4242` events tagged to its own pubkey, logs its `npub`, announces the Fiber node and the payment catalog, and republishes every stored order. One relay accepting an event is enough. A relay that already stored it treats a retry as a duplicate. An event id that was already handled is ignored.
+On startup the daemon connects to `TWINE_RELAYS`, subscribes to kind `4242` events tagged to its own pubkey, logs its `npub`, announces the Fiber node, and republishes every stored order. One relay accepting an event is enough. A relay that already stored it treats a retry as a duplicate. An event id that was already handled is ignored.
 
 `pay-invoice` and `waiting-fiat` include `seller_nostr` and `buyer_nostr` so each client can find the other.
 
@@ -124,8 +114,7 @@ Actions and replies are JSON, then NIP-44 encrypted:
   "fiat_currency": "NGN",
   "price_per_ckb": "1500",
   "min": "1000",
-  "max": "9000",
-  "payment_methods": [{ "method_id": "gtbank" }]
+  "max": "9000"
 }
 ```
 
@@ -135,7 +124,6 @@ Actions and replies are JSON, then NIP-44 encrypted:
 {
   "order_id": "<order id>",
   "fiat_amount": "1000",
-  "payment_method_id": "gtbank",
   "invoice": "<buyer payout invoice>"
 }
 ```
@@ -155,7 +143,7 @@ The rest:
 | Action | Who receives it | Payload |
 | --- | --- | --- |
 | `pay-invoice` | Seller and buyer | `invoice`, `amount_shannons`, `order_id`, `seller_nostr`, `buyer_nostr` |
-| `waiting-fiat` | Seller and buyer | `fiat_amount`, `fiat_currency`, `reference` (the trade id), `kind`, `label`, `currency`, `seller_nostr`, `buyer_nostr` |
+| `waiting-fiat` | Seller and buyer | `fiat_amount`, `fiat_currency`, `reference` (the trade id), `seller_nostr`, `buyer_nostr` |
 | `fiat-sent-ok` | Seller and buyer | none |
 | `new-invoice` | Seller and buyer | `reason` |
 | `disputed` | Seller and buyer | none |
@@ -179,9 +167,6 @@ A public order is published alongside the replies that change the book (`new-ord
   "price_per_ckb": "1500",
   "min": "1000",
   "max": "9000",
-  "payment_methods": [
-    { "id": "gtbank", "kind": "bank", "label": "GTBank", "currency": "NGN" }
-  ],
   "hold_hours": 36,
   "status": "open"
 }
@@ -441,7 +426,7 @@ Startup logs the daemon `npub` and the Fiber pubkey. The daemon exits when no re
 
 ## Persistence
 
-SQLite holds orders, the payment catalog, trades, a payout preimage after the buyer has been paid, processed Nostr event ids, and the pinned Fiber pubkey. On Unix the file is created mode `0600`. The preimage is deleted from the database after settle. The watchtower copy stays, because a force-close of an older commitment can still need it. Keep the database with the node it was pinned to. `.env`, `*.db`, and `fiber-node/` are gitignored.
+SQLite holds orders, trades, a payout preimage after the buyer has been paid, processed Nostr event ids, and the pinned Fiber pubkey. On Unix the file is created mode `0600`. The preimage is deleted from the database after settle. The watchtower copy stays, because a force-close of an older commitment can still need it. Keep the database with the node it was pinned to. `.env`, `*.db`, and `fiber-node/` are gitignored.
 
 ## Tests
 
@@ -466,6 +451,6 @@ cargo test -- --ignored
 | `src/nostr.rs` | Connect, encrypt, publish. |
 | `src/fiber/` | JSON-RPC for invoices, payments, the node pubkey, and the watchtower. |
 | `src/db.rs` | SQLite. |
-| `src/constant.rs` | Time limits, catalog, and event kinds. |
+| `src/constant.rs` | Time limits and event kinds. |
 | `docker/` | Fiber node image. |
 | `DEPLOY.md` | VPS install for this daemon and a Fiber node. |

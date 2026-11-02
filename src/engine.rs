@@ -850,7 +850,7 @@ mod tests {
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
         FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewInvoicePayload, NewOrderPayload, OrderStatus,
-        PAY_INVOICE, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE, SAFETY_SECS,
+        PAY_INVOICE, REFUNDING, RELEASE, SAFETY_SECS,
         RESOLVE, ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
@@ -1011,12 +1011,6 @@ mod tests {
             price_per_ckb: "1000".into(),
             min: "1000".into(),
             max: "10000".into(),
-            payment_methods: vec![PaymentMethod {
-                id: "gtbank".into(),
-                kind: "bank".into(),
-                label: "GTBank".into(),
-                currency: "NGN".into(),
-            }],
             status: OrderStatus::Open.as_str().into(),
             hold_secs: crate::HOLD_SECS,
             reserved_shannons: 0,
@@ -1038,10 +1032,6 @@ mod tests {
             payout_payment_hash: None,
             hold_received_at: None,
             hold_created_at: Some(unix_now()),
-            payment_method_id: "gtbank".into(),
-            payment_kind: "bank".into(),
-            payment_label: "GTBank".into(),
-            payment_currency: "NGN".into(),
             buyer_fiber_addr: None,
         })
         .unwrap();
@@ -1064,8 +1054,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(details.label, "GTBank");
-        assert_eq!(details.currency, "NGN");
+        assert_eq!(details.fiat_currency, "NGN");
         assert_eq!(details.reference, "trade");
         assert_eq!(details.seller_nostr, "seller");
         assert_eq!(details.buyer_nostr, "buyer");
@@ -1353,7 +1342,6 @@ mod tests {
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_methods: vec![PaymentMethodInput::new("gtbank")],
                     })
                     .unwrap(),
             )
@@ -1367,11 +1355,8 @@ mod tests {
         assert_eq!(public.maker_nostr_pubkey, "seller");
         let published = serde_json::to_string(public).unwrap();
         assert!(!published.contains("maker_fiber_pubkey"));
-        assert!(published.contains("GTBank"));
-        assert_eq!(public.payment_methods[0].label, "GTBank");
-        assert_eq!(public.payment_methods[0].currency, "NGN");
+        assert_eq!(public.fiat_currency, "NGN");
         let order_id = public.order_id.clone();
-        let method_id = public.payment_methods[0].id.clone();
 
         let own = engine
             .handle(
@@ -1380,7 +1365,6 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id: order_id.clone(),
                         fiat_amount: "1000".into(),
-                        payment_method_id: method_id.clone(),
                         invoice: None,
                     })
                     .unwrap(),
@@ -1396,7 +1380,6 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id,
                         fiat_amount: "1000".into(),
-                        payment_method_id: method_id,
                         invoice: Some("buyer-invoice".into()),
                     })
                     .unwrap(),
@@ -1428,9 +1411,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(details.reference, trade_id);
-        assert_eq!(details.kind, "bank");
-        assert_eq!(details.label, "GTBank");
-        assert_eq!(details.currency, "NGN");
+        assert_eq!(details.fiat_currency, "NGN");
         assert_eq!(details.seller_nostr, "seller");
         assert_eq!(details.buyer_nostr, "buyer");
         assert!(details.pay_by.is_some());
@@ -1668,7 +1649,6 @@ mod tests {
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_methods: vec![PaymentMethodInput::new("zelle")],
                     })
                     .unwrap(),
             )
@@ -1689,12 +1669,6 @@ mod tests {
                 price_per_ckb: "1000".into(),
                 min: "1000".into(),
                 max: "10000".into(),
-                payment_methods: vec![PaymentMethod {
-                    id: "zelle".into(),
-                    kind: "wallet".into(),
-                    label: "Zelle".into(),
-                    currency: "USD".into(),
-                }],
                 status: OrderStatus::Open.as_str().into(),
                 hold_secs: 36 * 3_600,
                 reserved_shannons: 0,
@@ -1707,7 +1681,6 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id: "buy-1".into(),
                         fiat_amount: "1000".into(),
-                        payment_method_id: "zelle".into(),
                         invoice: None,
                     })
                     .unwrap(),
@@ -1733,7 +1706,6 @@ mod tests {
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_methods: vec![PaymentMethodInput::new("gtbank")],
                     })
                     .unwrap(),
             )
@@ -1757,7 +1729,6 @@ mod tests {
                         price_per_ckb: "1000".into(),
                         min: "1000".into(),
                         max: "10000".into(),
-                        payment_methods: vec![PaymentMethodInput::new("zelle")],
                     })
                     .unwrap(),
             )
@@ -1832,15 +1803,6 @@ mod tests {
     async fn pay_invoice_never_includes_preimage() {
         let ctx = TestContext::new().await;
         let order_id = open_order(&ctx.engine, "seller").await;
-        let method_id = ctx
-            .engine
-            .db
-            .get_order(&order_id)
-            .unwrap()
-            .unwrap()
-            .payment_methods[0]
-            .id
-            .clone();
         let payout = ctx
             .fiber
             .new_payout_invoice(100_000_000, "twine payout", 36 * 3_600 * 1_000)
@@ -1854,7 +1816,6 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id,
                         fiat_amount: "1000".into(),
-                        payment_method_id: method_id,
                         invoice: Some(payout.invoice),
                     })
                     .unwrap(),

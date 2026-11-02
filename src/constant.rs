@@ -1,5 +1,3 @@
-use crate::types::ConfiguredPaymentMethod;
-
 /// 1 CKB = 100_000_000 shannons.
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
@@ -11,25 +9,6 @@ pub const fn hold_secs(hours: u64) -> u64 {
 }
 
 pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
-
-/// A post may name at most this many catalog ids.
-pub const MAX_PAYMENT_METHODS: usize = 5;
-
-/// A post can use a method only when its currency matches the post.
-pub const SUPPORTED_PAYMENT_METHODS: &[ConfiguredPaymentMethod] = &[
-    ConfiguredPaymentMethod {
-        id: "gtbank",
-        kind: "bank",
-        label: "GTBank",
-        currency: "NGN",
-    },
-    ConfiguredPaymentMethod {
-        id: "zelle",
-        kind: "wallet",
-        label: "Zelle",
-        currency: "USD",
-    },
-];
 
 /// How long an unpaid hold invoice stays open for the seller to lock.
 pub const INVOICE_EXPIRY_SECS: u64 = 60 * 60;
@@ -62,11 +41,6 @@ pub const KIND_ORDER: u16 = 31420;
 pub const KIND_FIBER_NODE: u16 = 31421;
 
 pub const FIBER_NODE_TAG: &str = "fiber-node";
-
-/// Public addressable payment catalog. The `d` tag is [PAYMENT_CATALOG_TAG]. Not a NIP.
-pub const KIND_CATALOG: u16 = 31422;
-
-pub const PAYMENT_CATALOG_TAG: &str = "payment-methods";
 
 pub const NEW_ORDER: &str = "new-order";
 pub const TAKE: &str = "take";
