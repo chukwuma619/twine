@@ -1,16 +1,11 @@
-mod channel;
 mod invoice;
 mod node;
 mod payment;
 mod watchtower;
 
-pub use channel::{
-    BuyerInbound, ChannelRpc, FiberChannel, already_connected, already_opening, has_live_open,
-    jit_funding_amount, outbound_covers, payment_route_failed, pending_will_cover, route_not_ready,
-};
 pub use invoice::InvoiceRpc;
 pub use node::{FiberNodeInfo, NodeRpc};
-pub use payment::PaymentRpc;
+pub use payment::{PaymentRpc, payment_route_failed, route_not_ready};
 pub use watchtower::WatchtowerRpc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -45,7 +40,7 @@ pub struct ParsedInvoice {
     pub amount: Option<u128>,
 }
 
-pub trait FiberRpc: InvoiceRpc + WatchtowerRpc + PaymentRpc + NodeRpc + ChannelRpc {
+pub trait FiberRpc: InvoiceRpc + WatchtowerRpc + PaymentRpc + NodeRpc {
     fn currency(&self) -> &str;
 }
 

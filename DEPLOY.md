@@ -163,10 +163,6 @@ read("invoices");
 write("invoices");
 read("payments");
 write("payments");
-read("channels");
-write("channels");
-read("peers");
-write("peers");
 write("watchtower");
 node("");
 EOF
@@ -255,7 +251,7 @@ sudo journalctl -u twine -f
 
 Ctrl-C stops the log and leaves the service running. Startup logs the daemon `npub` and the Fiber pubkey. People paste that `npub` and the `TWINE_RELAYS` list into the app. The daemon also publishes the Fiber pubkey so a wallet can open a channel.
 
-Fund the Fiber node so sellers can lock (inbound room) and buyers can be paid (outbound liquidity toward buyers). On release the daemon opens a Twine-funded one-way channel to a buyer who cannot receive yet, at least 100 CKB so a default Fiber node auto-accepts. The RPC token must be able to `list_channels`, `list_peers`, `connect_peer`, and `open_channel`. Local wallets must already be connected to this hub. A channel the buyer funds alone cannot receive the payout. See [Fiber channels](README.md#fiber-channels).
+Fund the Fiber node so sellers can pay the hold and the desk can pay a buyer invoice that already has a route. The daemon does not open a channel to the buyer. A wallet with no way to receive has to get its own inbound and send the same invoice again. See [Fiber channels](README.md#fiber-channels).
 
 The daemon exits when no relay connects, the RPC token is empty, or `FIBER_NETWORK` is not `testnet` or `mainnet`. systemd starts it again after 5 seconds. If it starts while Fiber is still decrypting its key, those attempts fail and the retry picks up once RPC answers.
 

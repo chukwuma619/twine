@@ -131,7 +131,7 @@ Actions and replies are JSON, then NIP-44 encrypted:
 }
 ```
 
-`take` buys from that post. `invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to. `fiber_addr` is optional and must be a **public** Fiber listen multiaddr. Loopback and LAN addresses are refused. A local node should connect outbound to the hub instead.
+`take` buys from that post. `invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to. `fiber_addr` is optional. The daemon stores a public multiaddr and does not dial it. Loopback and LAN addresses are refused.
 
 ```json
 {
@@ -211,14 +211,9 @@ Export the variables below before `cargo run`. The [run](#run-locally) section w
 
 ## Fiber channels
 
-Traders open a Fiber channel to this node's pubkey (kind `31421`). Twine does not mint channel balance. Payments need directional liquidity ([Fiber overview](https://www.fiber.world/docs/concept/liquidity/overview)): outbound to send, inbound to receive. Capacity is not the same as usable send or receive.
+The daemon pays the buyer's invoice. It does not open a channel, and it does not fund one. A wallet that cannot receive has to get its own inbound, then send the same invoice again.
 
-| Leg | Who | Liquidity |
-| --- | --- | --- |
-| Lock | Seller → Twine Fiber | Seller outbound (open and fund). Twine inbound room. |
-| Payout | Twine Fiber → buyer | Twine outbound toward the buyer. Buyer inbound: funds on the operator's side that can flow to them. A buyer-funded channel alone cannot receive. |
-
-Keep spare CKB on the Twine Fiber node. On release, if the buyer cannot receive, the daemon opens a private one-way channel (`open_channel` with `one_way: true`) funded with the trade plus at least 100 CKB so a default Fiber node auto-accepts. The buyer node must stay online, connected to this hub, and auto-accept. A laptop node does not need a public IP: connect outbound to `announced_addrs`. Loopback and LAN listen addresses are refused. A seller lock on one channel does not create outbound on the buyer's. Multi-hop through another hub only works if this node has a funded path there.
+Sellers pay the hold to this node's pubkey (kind `31421`). The desk node needs a path for that payment to arrive, and a path out to the buyer's invoice. No path asks the buyer for the invoice again. The channels on the desk node are ones the operator opens. They are not created inside a trade.
 
 ## Run locally
 
@@ -330,7 +325,7 @@ grep -n -A4 announced_addrs fiber-node/config.yml
 
 ### 4. RPC token
 
-`biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.9.1 checks. The Fiber node checks the biscuit against `rpc.biscuit_public_key`. The token needs `read` and `write` on `invoices`, `payments`, `channels`, and `peers`, `read("node")`, `write("watchtower")`, and `node("")`. Fiber parses that fact as a base58 node id and uses it as the watchtower scope for `create_preimage`. The local node stores its own channels under the empty id, so the fact has to be `node("")`. A hex pubkey is not base58, and Fiber answers `Unauthorized` before the hold can settle. Fiber's [biscuit auth](https://github.com/nervosnetwork/fiber/blob/v0.9.1/docs/biscuit-auth.md) describes the format.
+`biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.9.1 checks. The Fiber node checks the biscuit against `rpc.biscuit_public_key`. The token needs `read` and `write` on `invoices` and `payments`, `read("node")`, `write("watchtower")`, and `node("")`. Fiber parses that fact as a base58 node id and uses it as the watchtower scope for `create_preimage`. The local node stores its own channels under the empty id, so the fact has to be `node("")`. A hex pubkey is not base58, and Fiber answers `Unauthorized` before the hold can settle. Fiber's [biscuit auth](https://github.com/nervosnetwork/fiber/blob/v0.9.1/docs/biscuit-auth.md) describes the format.
 
 ```bash
 cargo install biscuit-cli --version 0.6.0-beta.2 --locked
@@ -348,10 +343,6 @@ read("invoices");
 write("invoices");
 read("payments");
 write("payments");
-read("channels");
-write("channels");
-read("peers");
-write("peers");
 write("watchtower");
 node("");
 EOF
