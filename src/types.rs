@@ -1,6 +1,6 @@
 use crate::constant::{
-    CANCEL, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER, PAYMENT_WINDOW_SECS,
-    PAYOUT_INVOICE, RELEASE, RESOLVE, SAFETY_SECS, TAKE,
+    CANCEL, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER, PAYOUT_INVOICE, RELEASE,
+    RESOLVE, SAFETY_SECS, TAKE,
 };
 use crate::util::shannons_to_ckb_string;
 use anyhow::{Result, anyhow};
@@ -481,7 +481,7 @@ impl WaitingFiatPayload {
             currency: trade.payment_currency.clone(),
             seller_nostr: trade.seller_nostr.clone(),
             buyer_nostr: trade.buyer_nostr.clone(),
-            pay_by: Some(received_at + PAYMENT_WINDOW_SECS as i64),
+            pay_by: Some(received_at + hold_secs as i64 - SAFETY_SECS as i64),
             release_by: trade.release_by(hold_secs),
         }
     }
@@ -540,7 +540,7 @@ impl TradeSnapshot {
             payout_invoice: trade.payout_invoice.clone(),
             lock_by: trade.lock_by(),
             hold_ends_at: trade.hold_ends_at(hold_secs),
-            pay_by: trade.pay_by(),
+            pay_by: trade.pay_by(hold_secs),
             release_by: trade.release_by(hold_secs),
         }
     }
@@ -634,9 +634,10 @@ impl Trade {
         self.hold_created_at.map(|at| at + hold_secs as i64)
     }
 
-    pub fn pay_by(&self) -> Option<i64> {
+    /// Same instant as [crate::action_deadline]: the buyer marks fiat sent before this.
+    pub fn pay_by(&self, hold_secs: u64) -> Option<i64> {
         self.hold_received_at
-            .map(|at| at + PAYMENT_WINDOW_SECS as i64)
+            .map(|at| at + hold_secs as i64 - SAFETY_SECS as i64)
     }
 
     pub fn release_by(&self, hold_secs: u64) -> Option<i64> {

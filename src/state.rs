@@ -1,4 +1,4 @@
-use crate::constant::{PAYMENT_WINDOW_SECS, SAFETY_SECS};
+use crate::constant::SAFETY_SECS;
 use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
 /// The poster owns the order. Only they can cancel it before someone takes it.
@@ -35,11 +35,11 @@ pub fn apply_clock(phase: Phase, now: i64, received_at: Option<i64>, hold_secs: 
     let Some(received_at) = received_at else {
         return Decision::NoOp;
     };
-    let payment_end = received_at + PAYMENT_WINDOW_SECS as i64;
     let action_end = action_deadline(received_at, hold_secs);
     match phase {
-        Phase::WaitingFiat if now >= payment_end => Decision::Ok(Phase::Refunding),
-        Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed if now >= action_end => {
+        Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed
+            if now >= action_end =>
+        {
             Decision::Ok(Phase::Refunding)
         }
         _ => Decision::NoOp,
@@ -194,7 +194,6 @@ pub fn apply_expired(phase: Phase) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::PAYMENT_WINDOW_SECS;
     use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
     fn seller() -> Actor {
@@ -361,28 +360,18 @@ mod tests {
     }
 
     #[test]
-    fn payment_window_and_hold_refund_without_settling() {
+    fn hold_deadline_refunds_without_settling() {
         let received = 1_000;
         let hold = 36 * 3_600;
+        let deadline = action_deadline(received, hold);
         assert_eq!(
-            apply_clock(
-                Phase::WaitingFiat,
-                received + PAYMENT_WINDOW_SECS as i64 - 1,
-                Some(received),
-                hold
-            ),
+            apply_clock(Phase::WaitingFiat, deadline - 1, Some(received), hold),
             Decision::NoOp
         );
         assert_eq!(
-            apply_clock(
-                Phase::WaitingFiat,
-                received + PAYMENT_WINDOW_SECS as i64,
-                Some(received),
-                hold
-            ),
+            apply_clock(Phase::WaitingFiat, deadline, Some(received), hold),
             Decision::Ok(Phase::Refunding)
         );
-        let deadline = action_deadline(received, hold);
         assert_eq!(
             apply_clock(Phase::Disputed, deadline - 1, Some(received), hold),
             Decision::NoOp

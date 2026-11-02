@@ -32,7 +32,7 @@ The operator does not custody trader keys. The solver (`TWINE_SOLVER`) is a Nost
 | --- | --- |
 | `waiting-invoice` | The buyer has not sent the payout invoice, so no hold exists yet. A new sell post does not stay here: `take` includes the invoice. |
 | `waiting-hold` | Hold invoice exists. The seller has not locked it yet. The daemon does not know the preimage. |
-| `waiting-fiat` | Hold is locked. The buyer has the payment window to pay and name a payout invoice. |
+| `waiting-fiat` | Hold is locked. The buyer pays and sends `fiat-sent` before the safety deadline. |
 | `fiat-sent` | The buyer named a payout invoice. Waiting for the seller to release. |
 | `releasing` | The daemon is paying the buyer, then settling the hold. |
 | `awaiting-invoice` | The payout failed. The buyer must send another invoice with the same payment hash. |
@@ -66,8 +66,7 @@ All of these are fixed in `src/constant.rs`.
 | Constant | Value | Effect |
 | --- | --- | --- |
 | Hold | 36 hours | How long the seller's coins stay in the Fiber hold. Fiber accepts 16 to 48 hours. A received hold cannot be canceled, so this is also how long the coins can sit if the trade never finishes. |
-| Payment window | 15 minutes | After the hold is `Received`, the buyer must pay and send `fiat-sent`. After that the trade goes to `refunding`. |
-| Safety margin | 30 minutes | A payout or a buyer-wins resolution must start at least this long before the hold ends. `fiat-sent`, `awaiting-invoice`, and `disputed` refund the seller after that. |
+| Safety margin | 30 minutes | A payout or a buyer-wins resolution must start at least this long before the hold ends. `waiting-fiat`, `fiat-sent`, `awaiting-invoice`, and `disputed` refund the seller after that. |
 | Unpaid hold | 1 hour | An unpaid hold invoice expires. The slice returns to the post. |
 | Poll | 2 seconds | How often the daemon asks Fiber about an open hold or payout. |
 

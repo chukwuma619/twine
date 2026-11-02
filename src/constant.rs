@@ -12,9 +12,6 @@ pub const fn hold_secs(hours: u64) -> u64 {
 
 pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 
-/// How long the buyer has to pay after the seller locks.
-pub const PAYMENT_WINDOW_SECS: u64 = 15 * 60;
-
 /// A post may name at most this many catalog ids.
 pub const MAX_PAYMENT_METHODS: usize = 5;
 

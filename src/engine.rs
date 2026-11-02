@@ -850,7 +850,7 @@ mod tests {
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
         FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewInvoicePayload, NewOrderPayload, OrderStatus,
-        PAY_INVOICE, PAYMENT_WINDOW_SECS, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE,
+        PAY_INVOICE, PaymentMethod, PaymentMethodInput, REFUNDING, RELEASE, SAFETY_SECS,
         RESOLVE, ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
@@ -1075,7 +1075,10 @@ mod tests {
         assert!(trade.hold_received_at.is_some());
         engine
             .db
-            .set_hold_received_at("trade", unix_now() - (PAYMENT_WINDOW_SECS as i64) - 1)
+            .set_hold_received_at(
+                "trade",
+                unix_now() - (crate::HOLD_SECS as i64 - SAFETY_SECS as i64) - 1,
+            )
             .unwrap();
         let refunding = engine.on_hold_status("trade").await.unwrap();
         assert!(replies_contain(&refunding, REFUNDING));
