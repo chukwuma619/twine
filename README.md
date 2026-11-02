@@ -94,7 +94,7 @@ Clients encrypt actions to the daemon. The daemon encrypts replies back. Orders,
 | --- | --- | --- |
 | `4242` | `p` is the recipient | NIP-44 (v2) ciphertext. An action to the daemon, or a reply from it. |
 | `31420` | `d` is the order id | Public JSON order. Addressable. |
-| `31421` | `d` is `fiber-node` | Public JSON `{"pubkey":"<fnn pubkey>","addresses":["/ip4/.../tcp/8230"]}`. The app shows this so a wallet can connect and open a channel to the operator's node. Port `8228` stays free for Fiber Studio. |
+| `31421` | `d` is `fiber-node` | Public JSON `{"pubkey":"<fnn pubkey>","addresses":["/ip4/.../tcp/8230"]}`. A wallet that needs a peer can connect here. A trade does not read it. Port `8228` stays free for Fiber Studio. |
 | `31422` | `d` is `payment-methods` | Public JSON `{"methods":[...]}`. The app reads this for the currencies and methods on a new post. |
 | `4243` | `p` is the other trader, `t` is the trade id | NIP-44 chat between the two traders. The client uses this. The daemon does not subscribe to it. |
 
@@ -116,12 +116,11 @@ Actions and replies are JSON, then NIP-44 encrypted:
 
 ### Client actions
 
-`new-order` creates a sell post. `side` must be `sell`. Amounts are positive decimals. `min` must be less than or equal to `max`. `fiber_pubkey` is the poster's Fiber node.
+`new-order` creates a sell post. `side` must be `sell`. Amounts are positive decimals. `min` must be less than or equal to `max`. The post does not name a Fiber node.
 
 ```json
 {
   "side": "sell",
-  "fiber_pubkey": "<poster's fnn pubkey>",
   "available_ckb": "10",
   "fiat_currency": "NGN",
   "price_per_ckb": "1500",
@@ -131,16 +130,14 @@ Actions and replies are JSON, then NIP-44 encrypted:
 }
 ```
 
-`take` buys from that post. `invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to. `fiber_addr` is optional. The daemon stores a public multiaddr and does not dial it. Loopback and LAN addresses are refused.
+`take` buys from that post. `invoice` is required. It is the buyer's payout invoice, and its payment hash is the one the hold is locked to.
 
 ```json
 {
   "order_id": "<order id>",
   "fiat_amount": "1000",
-  "fiber_pubkey": "<taker's fnn pubkey>",
   "payment_method_id": "gtbank",
-  "invoice": "<buyer payout invoice>",
-  "fiber_addr": "/ip4/1.2.3.4/tcp/8228"
+  "invoice": "<buyer payout invoice>"
 }
 ```
 
@@ -148,7 +145,7 @@ The rest:
 
 | Action | Who | Payload |
 | --- | --- | --- |
-| `fiat-sent` | Buyer | `{ "invoice", "fiber_addr"? }`. Leave `invoice` empty when `take` already stored it. A replacement must use the same payment hash. |
+| `fiat-sent` | Buyer | `{ "invoice" }`. Leave `invoice` empty when `take` already stored it. A replacement must use the same payment hash. |
 | `release` | Seller | None. Only after a payout invoice is stored. |
 | `cancel` | Poster, or either party | A post uses `{ "order_id" }` and no `trade_id`. A trade sets `trade_id` on the envelope. |
 | `dispute` | Either party | Optional `{ "invoice", "conversation_key" }`. |
@@ -178,7 +175,6 @@ A public order is published alongside the replies that change the book (`new-ord
   "order_id": "<uuid>",
   "side": "sell",
   "maker_nostr_pubkey": "<hex pubkey>",
-  "maker_fiber_pubkey": "<fnn pubkey>",
   "available_ckb": "10",
   "fiat_currency": "NGN",
   "price_per_ckb": "1500",
@@ -213,7 +209,7 @@ Export the variables below before `cargo run`. The [run](#run-locally) section w
 
 The daemon pays the buyer's invoice. It does not open a channel, and it does not fund one. A wallet that cannot receive has to get its own inbound, then send the same invoice again.
 
-Sellers pay the hold to this node's pubkey (kind `31421`). The desk node needs a path for that payment to arrive, and a path out to the buyer's invoice. No path asks the buyer for the invoice again. The channels on the desk node are ones the operator opens. They are not created inside a trade.
+Sellers pay the hold invoice. The desk node needs a path for that payment to arrive, and a path out to the buyer's invoice. No path asks the buyer for the invoice again. The channels on the desk node are ones the operator opens. They are not created inside a trade. Kind `31421` publishes this node's pubkey and addresses for a wallet that needs a peer.
 
 ## Run locally
 

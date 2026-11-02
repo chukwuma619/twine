@@ -1,7 +1,7 @@
 use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Outbound, Trade};
-use crate::{Envelope, Phase, Side, TakePayload, apply_take, parse_fiber_addr, unix_now};
+use crate::{Envelope, Phase, Side, TakePayload, apply_take, unix_now};
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -43,13 +43,6 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         Ok(value) => value,
         Err(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
     };
-    if payload.fiber_pubkey.trim().is_empty() {
-        return Ok(vec![cant_do(sender, None, "fiber pubkey is required")]);
-    }
-    let fiber_addr = match parse_fiber_addr(payload.fiber_addr.as_deref()) {
-        Ok(addr) => addr,
-        Err(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
-    };
     let Some(method) = order
         .payment_methods
         .iter()
@@ -74,20 +67,15 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         return Ok(vec![cant_do(sender, None, "payout invoice is required")]);
     };
     let trade_id = Uuid::new_v4().to_string();
-    let (seller_nostr, seller_fiber, buyer_nostr, buyer_fiber) = (
-        order.maker_nostr.clone(),
-        order.maker_fiber.clone(),
-        sender.to_string(),
-        payload.fiber_pubkey,
-    );
+    let (seller_nostr, buyer_nostr) = (order.maker_nostr.clone(), sender.to_string());
     let created_at = unix_now();
     let trade = Trade {
         id: trade_id.clone(),
         order_id: order.id.clone(),
         seller_nostr,
-        seller_fiber,
+        seller_fiber: String::new(),
         buyer_nostr,
-        buyer_fiber,
+        buyer_fiber: String::new(),
         fiat_amount: payload.fiat_amount,
         shannons,
         state: Phase::WaitingInvoice.as_str().into(),
@@ -101,7 +89,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         payment_kind: method.kind.clone(),
         payment_label: method.label.clone(),
         payment_currency: method.currency.clone(),
-        buyer_fiber_addr: fiber_addr,
+        buyer_fiber_addr: None,
     };
     if let Err(error) = engine.db.commit_take(&trade) {
         return Ok(vec![cant_do(sender, None, &error.to_string())]);

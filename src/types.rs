@@ -280,7 +280,6 @@ impl Envelope {
 pub struct NewOrderPayload {
     /// `sell`. A post offers CKB.
     pub side: String,
-    pub fiber_pubkey: String,
     pub available_ckb: String,
     pub fiat_currency: String,
     pub price_per_ckb: String,
@@ -339,27 +338,21 @@ impl PaymentMethod {
     }
 }
 
-/// Someone joining a sell post. `fiber_pubkey` is the taker's Fiber key.
-/// The taker buys CKB. `payment_method_id` is one method named on the post.
+/// Someone joining a sell post. The taker buys CKB.
+/// `payment_method_id` is one method named on the post.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakePayload {
     pub order_id: String,
     pub fiat_amount: String,
-    pub fiber_pubkey: String,
     pub payment_method_id: String,
     /// Buyer's payout invoice. Required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoice: Option<String>,
-    /// Public Fiber listen multiaddr. Loopback and LAN are refused.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fiber_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayoutInvoicePayload {
     pub invoice: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fiber_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,8 +371,6 @@ pub struct FiatSentPayload {
     /// Empty keeps the invoice already stored on the trade.
     #[serde(default)]
     pub invoice: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fiber_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,7 +436,6 @@ pub struct PublicOrder {
     pub order_id: String,
     pub side: String,
     pub maker_nostr_pubkey: String,
-    pub maker_fiber_pubkey: String,
     pub available_ckb: String,
     pub fiat_currency: String,
     pub price_per_ckb: String,
@@ -583,7 +573,6 @@ impl Order {
             order_id: self.id.clone(),
             side: self.side.clone(),
             maker_nostr_pubkey: self.maker_nostr.clone(),
-            maker_fiber_pubkey: self.maker_fiber.clone(),
             available_ckb: shannons_to_ckb_string(self.available_shannons),
             fiat_currency: self.fiat_currency.clone(),
             price_per_ckb: self.price_per_ckb.clone(),
@@ -672,7 +661,6 @@ mod tests {
         let env = Envelope::new(NEW_ORDER)
             .with_payload(NewOrderPayload {
                 side: "sell".into(),
-                fiber_pubkey: "pk".into(),
                 available_ckb: "10".into(),
                 fiat_currency: "NGN".into(),
                 price_per_ckb: "1500".into(),
@@ -693,13 +681,13 @@ mod tests {
         let sell = sample_order("sell", "seller", "fiber-seller");
         assert_eq!(sell.public().side, "sell");
         assert_eq!(sell.public().maker_nostr_pubkey, "seller");
-        assert_eq!(sell.public().maker_fiber_pubkey, "fiber-seller");
+        let published = serde_json::to_string(&sell.public()).unwrap();
+        assert!(!published.contains("maker_fiber_pubkey"));
         assert_eq!(sell.public().hold_hours, 16);
         assert_eq!(sell.public().status, "open");
         let mut closed = sample_order("sell", "seller", "fiber-seller");
         closed.status = "canceled".into();
         assert_eq!(closed.public().status, "canceled");
-        let published = serde_json::to_string(&sell.public()).unwrap();
         assert!(published.contains("GTBank"));
         assert!(published.contains("NGN"));
         let buy = sample_order("buy", "buyer", "fiber-buyer");

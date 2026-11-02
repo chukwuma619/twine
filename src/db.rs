@@ -493,15 +493,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_buyer_fiber_addr(&self, id: &str, addr: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().expect("db");
-        conn.execute(
-            "UPDATE trades SET buyer_fiber_addr = ?1 WHERE id = ?2",
-            params![addr, id],
-        )?;
-        Ok(())
-    }
-
     pub fn insert_preimage(&self, payment_hash: &str, preimage: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         conn.execute(

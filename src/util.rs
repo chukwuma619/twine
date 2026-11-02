@@ -61,13 +61,9 @@ pub fn validate_new_order(
     min: &str,
     max: &str,
     fiat_currency: &str,
-    fiber_pubkey: &str,
 ) -> Result<u128, AmountError> {
     if fiat_currency.trim().is_empty() {
         return Err(AmountError::Invalid("fiat_currency"));
-    }
-    if fiber_pubkey.trim().is_empty() {
-        return Err(AmountError::Invalid("fiber_pubkey"));
     }
     let available = parse_decimal(available_ckb, "available_ckb")?;
     if available.is_zero() {
@@ -288,9 +284,9 @@ mod tests {
 
     #[test]
     fn new_order_requires_positive_book() {
-        assert!(validate_new_order("10", "1500", "1000", "9000", "NGN", "pk").is_ok());
-        assert!(validate_new_order("0", "1500", "1000", "9000", "NGN", "pk").is_err());
-        assert!(validate_new_order("10", "1500", "9000", "1000", "NGN", "pk").is_err());
+        assert!(validate_new_order("10", "1500", "1000", "9000", "NGN").is_ok());
+        assert!(validate_new_order("0", "1500", "1000", "9000", "NGN").is_err());
+        assert!(validate_new_order("10", "1500", "9000", "1000", "NGN").is_err());
     }
 
     fn catalog() -> Vec<SupportedPaymentMethod> {
@@ -385,18 +381,13 @@ pub(crate) mod support {
         }
     }
 
-    pub async fn open_order(
-        engine: &Engine<HttpFiber>,
-        seller: &str,
-        fiber_pubkey: &str,
-    ) -> String {
+    pub async fn open_order(engine: &Engine<HttpFiber>, seller: &str) -> String {
         let outbound = engine
             .handle(
                 seller,
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
                         side: "sell".into(),
-                        fiber_pubkey: fiber_pubkey.into(),
                         available_ckb: "10".into(),
                         fiat_currency: "NGN".into(),
                         price_per_ckb: "1000".into(),
@@ -418,7 +409,6 @@ pub(crate) mod support {
         engine: &Engine<HttpFiber>,
         buyer: &str,
         order_id: &str,
-        fiber_pubkey: &str,
     ) -> (String, String, String) {
         let method_id = engine
             .db
@@ -440,10 +430,8 @@ pub(crate) mod support {
                     .with_payload(TakePayload {
                         order_id: order_id.into(),
                         fiat_amount: "1000".into(),
-                        fiber_pubkey: fiber_pubkey.into(),
                         payment_method_id: method_id,
                         invoice: Some(payout.invoice),
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -474,7 +462,6 @@ pub(crate) mod support {
                     .with_trade(trade_id)
                     .with_payload(FiatSentPayload {
                         invoice: invoice.into(),
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )

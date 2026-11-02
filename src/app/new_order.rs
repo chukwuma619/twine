@@ -25,7 +25,6 @@ pub(crate) async fn on_new_order<F: FiberRpc + 'static>(
         &payload.min,
         &payload.max,
         &payload.fiat_currency,
-        &payload.fiber_pubkey,
     ) {
         Ok(value) => value,
         Err(error) => return Ok(vec![cant_do(sender, None, &error.to_string())]),
@@ -41,7 +40,7 @@ pub(crate) async fn on_new_order<F: FiberRpc + 'static>(
         id: Uuid::new_v4().to_string(),
         side: Side::Sell.as_str().to_string(),
         maker_nostr: sender.to_string(),
-        maker_fiber: payload.fiber_pubkey,
+        maker_fiber: String::new(),
         available_shannons: available,
         fiat_currency: payload.fiat_currency,
         price_per_ckb: payload.price_per_ckb,

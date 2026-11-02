@@ -7,7 +7,7 @@ use crate::{
     FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound,
     PAY_INVOICE, PayInvoicePayload, Phase, REFUNDING, SETTLED, WAITING_FIAT, WaitingFiatPayload,
     action_deadline, apply_clock, apply_expired, apply_hold_received, apply_release_failed,
-    apply_release_succeeded, parse_fiber_addr, trade_actor, unix_now,
+    apply_release_succeeded, trade_actor, unix_now,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
@@ -692,20 +692,6 @@ impl<F: FiberRpc + 'static> Engine<F> {
             .ok_or_else(|| anyhow!("order {id} not found"))
     }
 
-    pub(crate) fn remember_fiber_addr(
-        &self,
-        trade_id: &str,
-        addr: Option<&str>,
-    ) -> Result<Result<(), String>> {
-        match parse_fiber_addr(addr) {
-            Ok(None) => Ok(Ok(())),
-            Ok(Some(addr)) => {
-                self.db.set_buyer_fiber_addr(trade_id, Some(&addr))?;
-                Ok(Ok(()))
-            }
-            Err(reason) => Ok(Err(reason)),
-        }
-    }
     fn spawn_poll(
         &self,
         kind: PollKind,
@@ -1359,7 +1345,6 @@ mod tests {
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
                         side: "sell".into(),
-                        fiber_pubkey: "fiber-seller".into(),
                         available_ckb: "10".into(),
                         fiat_currency: "NGN".into(),
                         price_per_ckb: "1000".into(),
@@ -1377,8 +1362,8 @@ mod tests {
         assert_eq!(public.hold_hours, 36);
         assert_eq!(public.side, "sell");
         assert_eq!(public.maker_nostr_pubkey, "seller");
-        assert_eq!(public.maker_fiber_pubkey, "fiber-seller");
         let published = serde_json::to_string(public).unwrap();
+        assert!(!published.contains("maker_fiber_pubkey"));
         assert!(published.contains("GTBank"));
         assert_eq!(public.payment_methods[0].label, "GTBank");
         assert_eq!(public.payment_methods[0].currency, "NGN");
@@ -1392,10 +1377,8 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id: order_id.clone(),
                         fiat_amount: "1000".into(),
-                        fiber_pubkey: "fiber-seller".into(),
                         payment_method_id: method_id.clone(),
                         invoice: None,
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1410,10 +1393,8 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id,
                         fiat_amount: "1000".into(),
-                        fiber_pubkey: "fiber-buyer".into(),
                         payment_method_id: method_id,
                         invoice: Some("buyer-invoice".into()),
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1459,7 +1440,6 @@ mod tests {
                     .with_trade(&trade_id)
                     .with_payload(FiatSentPayload {
                         invoice: "seller-invoice".into(),
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1474,7 +1454,6 @@ mod tests {
                     .with_trade(&trade_id)
                     .with_payload(FiatSentPayload {
                         invoice: "buyer-invoice".into(),
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1681,7 +1660,6 @@ mod tests {
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
                         side: "buy".into(),
-                        fiber_pubkey: "fiber-buyer".into(),
                         available_ckb: "10".into(),
                         fiat_currency: "USD".into(),
                         price_per_ckb: "1000".into(),
@@ -1726,10 +1704,8 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id: "buy-1".into(),
                         fiat_amount: "1000".into(),
-                        fiber_pubkey: "fiber-seller".into(),
                         payment_method_id: "zelle".into(),
                         invoice: None,
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1749,7 +1725,6 @@ mod tests {
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
                         side: "swap".into(),
-                        fiber_pubkey: "fiber".into(),
                         available_ckb: "10".into(),
                         fiat_currency: "NGN".into(),
                         price_per_ckb: "1000".into(),
@@ -1774,7 +1749,6 @@ mod tests {
                 Envelope::new(NEW_ORDER)
                     .with_payload(NewOrderPayload {
                         side: "sell".into(),
-                        fiber_pubkey: "fiber-buyer".into(),
                         available_ckb: "10".into(),
                         fiat_currency: "USD".into(),
                         price_per_ckb: "1000".into(),
@@ -1839,9 +1813,8 @@ mod tests {
     #[ignore = "requires a running Fiber node (TWINE_RPC)"]
     async fn take_creates_hold_and_registers_preimage() {
         let ctx = TestContext::new().await;
-        let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
-        let (trade_id, invoice, amount) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller").await;
+        let (trade_id, invoice, amount) = take(&ctx.engine, "buyer", &order_id).await;
         assert!(!invoice.is_empty());
         assert_eq!(amount, "100000000");
         let trade = ctx.engine.db.get_trade(&trade_id).unwrap().unwrap();
@@ -1855,8 +1828,7 @@ mod tests {
     #[ignore = "requires a running Fiber node (TWINE_RPC)"]
     async fn pay_invoice_never_includes_preimage() {
         let ctx = TestContext::new().await;
-        let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller").await;
         let method_id = ctx
             .engine
             .db
@@ -1879,10 +1851,8 @@ mod tests {
                     .with_payload(TakePayload {
                         order_id,
                         fiat_amount: "1000".into(),
-                        fiber_pubkey: twine_pk,
                         payment_method_id: method_id,
                         invoice: Some(payout.invoice),
-                        fiber_addr: None,
                     })
                     .unwrap(),
             )
@@ -1898,9 +1868,8 @@ mod tests {
     #[ignore = "requires a running Fiber node (TWINE_RPC)"]
     async fn cancel_open_hold() {
         let ctx = TestContext::new().await;
-        let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
-        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller").await;
+        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id).await;
         let hash = ctx
             .engine
             .db
@@ -1976,9 +1945,8 @@ mod tests {
     #[ignore = "requires a running Fiber node (TWINE_RPC)"]
     async fn lock_poll_and_release_pay_the_buyer_first() {
         let ctx = TestContext::new().await;
-        let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
-        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller").await;
+        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id).await;
         let hash = ctx
             .engine
             .db
@@ -2017,9 +1985,8 @@ mod tests {
     #[ignore = "requires a running Fiber node (TWINE_RPC)"]
     async fn reject_cancel_after_hold_received() {
         let ctx = TestContext::new().await;
-        let twine_pk = ctx.fiber.node_pubkey().await.unwrap();
-        let order_id = open_order(&ctx.engine, "seller", &twine_pk).await;
-        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id, &twine_pk).await;
+        let order_id = open_order(&ctx.engine, "seller").await;
+        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id).await;
         let hash = ctx
             .engine
             .db
