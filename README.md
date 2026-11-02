@@ -428,7 +428,7 @@ cat > .env << EOF
 FIBER_NETWORK=testnet
 RUST_LOG=info
 TWINE_NOSTR_SECRET=${NOSTR_SECRET}
-TWINE_RELAYS=wss://relay.damus.io,wss://nos.lol
+TWINE_RELAYS=wss://relay.backr.site
 TWINE_RPC=http://127.0.0.1:8229
 TWINE_RPC_TOKEN=${RPC_TOKEN}
 EOF
