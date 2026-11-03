@@ -143,6 +143,32 @@ pub fn public_order_event(keys: &Keys, order: &PublicOrder) -> Result<Event> {
     )
 }
 
+/// Relays that stored this one attempt. Empty means none did.
+pub async fn accepted_relays(client: &Client, event: &Event) -> Result<BTreeSet<String>> {
+    let output = client
+        .send_event(event)
+        .ok_timeout(RELAY_OK_TIMEOUT)
+        .await?;
+    for (url, error) in &output.failed {
+        warn!(%url, %error, "relay rejected event");
+    }
+    if output.success.is_empty() {
+        bail!("no relay accepted the event");
+    }
+    Ok(output.success.keys().map(|url| url.to_string()).collect())
+}
+
+/// Relays that accepted every publish so far. A relay that missed one stays out.
+pub fn relays_with_everything(
+    so_far: Option<BTreeSet<String>>,
+    accepted: BTreeSet<String>,
+) -> BTreeSet<String> {
+    match so_far {
+        Some(prev) => prev.intersection(&accepted).cloned().collect(),
+        None => accepted,
+    }
+}
+
 /// Retries until one relay accepts the event. A relay that already stored it treats the retry as a duplicate.
 pub async fn publish_event(client: &Client, event: &Event) -> Result<()> {
     for attempt in 1..=PUBLISH_ATTEMPTS {
@@ -212,6 +238,17 @@ pub async fn publish_fiber_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relays_with_everything_keeps_only_the_overlap() {
+        let both = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        let second = BTreeSet::from(["b".to_string(), "c".to_string()]);
+        let first = relays_with_everything(None, both);
+        assert_eq!(
+            relays_with_everything(Some(first), second),
+            BTreeSet::from(["b".to_string()])
+        );
+    }
 
     #[test]
     fn action_filter_matches_only_the_daemon_inbox() {

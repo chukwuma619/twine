@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
@@ -8,8 +8,8 @@ use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{FiberNodeInfo, HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{
-    connect, connected_relay_urls, decrypt_action, ensure_action_subscription, public_order_event,
-    publish_event, publish_fiber_node, publish_outbounds, sender_hex,
+    accepted_relays, connect, connected_relay_urls, decrypt_action, ensure_action_subscription,
+    fiber_node_event, public_order_event, publish_outbounds, relays_with_everything, sender_hex,
 };
 use twine_daemon::{Config, KIND_ACTION, Phase};
 
@@ -122,7 +122,8 @@ fn spawn_relay_maintenance(client: Client, keys: Keys, db: Arc<Db>, solver: Opti
             }
             if !up.is_empty() && !up.is_subset(&published_to) {
                 match publish_presence(&client, &keys, &db, solver.as_deref()).await {
-                    Ok(()) => published_to.extend(up),
+                    Ok(None) => published_to.extend(up),
+                    Ok(Some(urls)) => published_to.extend(urls),
                     Err(error) => {
                         warn!(%error, "republish after connect failed; will retry");
                         published_to.clear();
@@ -134,16 +135,19 @@ fn spawn_relay_maintenance(client: Client, keys: Keys, db: Arc<Db>, solver: Opti
     });
 }
 
+/// `None` when there was nothing to publish. `Some` is the relays that stored
+/// every event. A relay that missed one is left out so the next pass tries it.
 async fn publish_presence(
     client: &Client,
     keys: &Keys,
     db: &Db,
     solver: Option<&str>,
-) -> Result<()> {
-    let mut failed = false;
-    match db.fiber_pubkey() {
-        Ok(Some(pubkey)) => {
-            let addresses = db.fiber_addresses().unwrap_or_default();
+) -> Result<Option<BTreeSet<String>>> {
+    let mut accepted = None;
+    let mut sent = false;
+    match db.fiber_pubkey()? {
+        Some(pubkey) => {
+            let addresses = db.fiber_addresses()?;
             if addresses.is_empty() {
                 warn!(
                     pubkey = %pubkey,
@@ -152,44 +156,35 @@ async fn publish_presence(
             } else {
                 info!(pubkey = %pubkey, addresses = ?addresses, "fiber node for the app");
             }
-            if let Err(error) = publish_fiber_node(client, keys, &pubkey, solver, &addresses).await
-            {
-                warn!(%error, "fiber node announcement failed");
-                failed = true;
+            let event = fiber_node_event(keys, &pubkey, solver, &addresses)?;
+            let urls = accepted_relays(client, &event).await?;
+            accepted = Some(relays_with_everything(accepted, urls));
+            sent = true;
+        }
+        None => warn!("fiber node is not pinned"),
+    }
+    for order in db.orders()? {
+        let order_id = order.id.clone();
+        // Read again immediately before signing. A trade can commit while an
+        // earlier order in this batch is still waiting on a relay.
+        let Some(order) = db.get_order(&order_id)? else {
+            continue;
+        };
+        let event = match public_order_event(keys, &order.public()) {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(%error, %order_id, "order event failed");
+                continue;
             }
-        }
-        Ok(None) => warn!("fiber node is not pinned"),
-        Err(error) => {
-            warn!(%error, "fiber node lookup failed");
-            failed = true;
-        }
+        };
+        let urls = accepted_relays(client, &event).await?;
+        accepted = Some(relays_with_everything(accepted, urls));
+        sent = true;
     }
-    match db.orders() {
-        Ok(orders) => {
-            for order in orders {
-                let order_id = order.id.clone();
-                let event = match public_order_event(keys, &order.public()) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        warn!(%error, %order_id, "order event failed");
-                        continue;
-                    }
-                };
-                if let Err(error) = publish_event(client, &event).await {
-                    warn!(%error, %order_id, "order never reached a relay");
-                    failed = true;
-                }
-            }
-        }
-        Err(error) => {
-            warn!(%error, "could not load orders to republish");
-            failed = true;
-        }
+    if !sent {
+        return Ok(None);
     }
-    if failed {
-        bail!("republish failed");
-    }
-    Ok(())
+    Ok(accepted)
 }
 
 async fn pin_fiber_node(db: &Db, fiber: &HttpFiber) -> Result<FiberNodeInfo> {
