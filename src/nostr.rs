@@ -3,13 +3,16 @@ use crate::{Envelope, FIBER_NODE_TAG, KIND_ACTION, KIND_FIBER_NODE, KIND_ORDER};
 use anyhow::{Context, Result, bail};
 use nostr::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tracing::{info, warn};
 
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_RETRY: Duration = Duration::from_secs(5);
 const RELAY_OK_TIMEOUT: Duration = Duration::from_secs(4);
 const PUBLISH_ATTEMPTS: u32 = 5;
 const PUBLISH_RETRY: Duration = Duration::from_secs(5);
+const ACTION_SUBSCRIPTION: &str = "twine-actions";
 
 pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
     let client = Client::builder()
@@ -18,6 +21,7 @@ pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
     for relay in relays {
         client
             .add_relay(relay)
+            .retry_interval(RELAY_RETRY)
             .await
             .with_context(|| format!("invalid relay {relay}"))?;
     }
@@ -34,13 +38,60 @@ pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
         }
     }
     if connected == 0 {
-        bail!("no nostr relay connected");
+        warn!("no nostr relay connected yet; the pool will keep retrying");
     }
     Ok(client)
 }
 
-pub async fn subscribe_actions(client: &Client, daemon: PublicKey) -> Result<()> {
-    let output = client.subscribe(action_filter(daemon)).await?;
+pub async fn connected_relay_urls(client: &Client) -> BTreeSet<String> {
+    let mut urls = BTreeSet::new();
+    for (url, relay) in client.relays().await {
+        if relay.status().is_connected() {
+            urls.insert(url.to_string());
+        }
+    }
+    urls
+}
+
+fn is_action_filter(filter: &Filter, daemon: &PublicKey) -> bool {
+    filter
+        .kinds
+        .as_ref()
+        .is_some_and(|kinds| kinds.contains(&Kind::from(KIND_ACTION)))
+        && filter.extract_public_keys().contains(daemon)
+}
+
+/// Subscribes any connected relay that is missing the action filter.
+pub async fn ensure_action_subscription(client: &Client, daemon: PublicKey) -> Result<()> {
+    let id = SubscriptionId::new(ACTION_SUBSCRIPTION);
+    let existing = client.subscriptions().await;
+    let covered = existing.get(&id);
+    let mut missing = Vec::new();
+    for (url, relay) in client.relays().await {
+        if !relay.status().is_connected() {
+            continue;
+        }
+        let ready = covered.is_some_and(|by_relay| {
+            by_relay.get(&url).is_some_and(|filters| {
+                filters
+                    .iter()
+                    .any(|filter| is_action_filter(filter, &daemon))
+            })
+        });
+        if !ready {
+            missing.push(url);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let filter = action_filter(daemon);
+    let target = ReqTarget::manual(
+        missing
+            .iter()
+            .map(|url| (url.clone(), vec![filter.clone()])),
+    );
+    let output = client.subscribe(target).with_id(id).await?;
     for (url, error) in &output.failed {
         warn!(%url, %error, "action subscription failed");
     }
@@ -161,6 +212,19 @@ pub async fn publish_fiber_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_filter_matches_only_the_daemon_inbox() {
+        let daemon = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+        let filter = action_filter(daemon);
+        assert!(is_action_filter(&filter, &daemon));
+        assert!(!is_action_filter(&filter, &other));
+        assert!(!is_action_filter(
+            &Filter::new().kind(Kind::from(KIND_ORDER)).pubkey(daemon),
+            &daemon
+        ));
+    }
 
     #[test]
     fn fiber_node_event_is_signed_by_the_daemon() {

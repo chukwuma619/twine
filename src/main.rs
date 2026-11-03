@@ -1,14 +1,15 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nostr_sdk::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{info, warn};
 use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{FiberNodeInfo, HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{
-    connect, decrypt_action, public_order_event, publish_event, publish_fiber_node,
-    publish_outbounds, sender_hex, subscribe_actions,
+    connect, connected_relay_urls, decrypt_action, ensure_action_subscription, public_order_event,
+    publish_event, publish_fiber_node, publish_outbounds, sender_hex,
 };
 use twine_daemon::{Config, KIND_ACTION, Phase};
 
@@ -38,8 +39,6 @@ async fn main() -> Result<()> {
         &config.rpc_token,
     )?);
     pin_fiber_node(&db, fiber.as_ref()).await?;
-    let fiber_pubkey = db.fiber_pubkey()?;
-    let fiber_addresses = db.fiber_addresses()?;
     let engine = Engine::new(db, fiber, config.solver.clone());
     engine.arm_watchtower().await?;
     let client = connect(&keys, &config.relays).await?;
@@ -51,54 +50,16 @@ async fn main() -> Result<()> {
         engine.watch(&trade_id)?;
     }
 
-    subscribe_actions(&client, keys.public_key()).await?;
-    match fiber_pubkey {
-        Some(pubkey) => {
-            if fiber_addresses.is_empty() {
-                warn!(
-                    pubkey = %pubkey,
-                    "fiber node has no public multiaddr; Fiber Studio cannot dial it. Set announced_addrs"
-                );
-            } else {
-                info!(pubkey = %pubkey, addresses = ?fiber_addresses, "fiber node for the app");
-            }
-            if let Err(error) = publish_fiber_node(
-                &client,
-                &keys,
-                &pubkey,
-                config.solver.as_deref(),
-                &fiber_addresses,
-            )
-            .await
-            {
-                warn!(%error, "fiber node announcement failed");
-            }
-        }
-        None => warn!("fiber node is not pinned"),
-    }
-    match engine.db.orders() {
-        Ok(orders) => {
-            let client = client.clone();
-            let keys = keys.clone();
-            tokio::spawn(async move {
-                for order in orders {
-                    let order_id = order.id.clone();
-                    let event = match public_order_event(&keys, &order.public()) {
-                        Ok(event) => event,
-                        Err(error) => {
-                            warn!(%error, %order_id, "order event failed");
-                            continue;
-                        }
-                    };
-                    if let Err(error) = publish_event(&client, &event).await {
-                        warn!(%error, %order_id, "order never reached a relay");
-                    }
-                }
-            });
-        }
-        Err(error) => warn!(%error, "could not load orders to republish"),
-    }
     let mut notifications = client.notifications();
+    if let Err(error) = ensure_action_subscription(&client, keys.public_key()).await {
+        warn!(%error, "action subscription failed; will retry");
+    }
+    spawn_relay_maintenance(
+        client.clone(),
+        keys.clone(),
+        engine.db.clone(),
+        config.solver.clone(),
+    );
 
     while let Some(notification) = notifications.next().await {
         let ClientNotification::Event { event, .. } = notification else {
@@ -133,6 +94,100 @@ async fn main() -> Result<()> {
             }
             Err(error) => warn!(%error, "handle failed"),
         }
+    }
+    Ok(())
+}
+
+const RELAY_MAINTENANCE: Duration = Duration::from_secs(5);
+
+fn spawn_relay_maintenance(client: Client, keys: Keys, db: Arc<Db>, solver: Option<String>) {
+    tokio::spawn(async move {
+        let mut published_to = BTreeSet::new();
+        let mut reported_down = false;
+        loop {
+            client.connect().await;
+            let up = connected_relay_urls(&client).await;
+            if up.is_empty() {
+                published_to.clear();
+                if !reported_down {
+                    warn!("no nostr relay connected; keeping the retry loop");
+                    reported_down = true;
+                }
+            } else if reported_down {
+                info!(relays = up.len(), "nostr relays connected again");
+                reported_down = false;
+            }
+            if let Err(error) = ensure_action_subscription(&client, keys.public_key()).await {
+                warn!(%error, "action subscription failed; will retry");
+            }
+            if !up.is_empty() && !up.is_subset(&published_to) {
+                match publish_presence(&client, &keys, &db, solver.as_deref()).await {
+                    Ok(()) => published_to.extend(up),
+                    Err(error) => {
+                        warn!(%error, "republish after connect failed; will retry");
+                        published_to.clear();
+                    }
+                }
+            }
+            tokio::time::sleep(RELAY_MAINTENANCE).await;
+        }
+    });
+}
+
+async fn publish_presence(
+    client: &Client,
+    keys: &Keys,
+    db: &Db,
+    solver: Option<&str>,
+) -> Result<()> {
+    let mut failed = false;
+    match db.fiber_pubkey() {
+        Ok(Some(pubkey)) => {
+            let addresses = db.fiber_addresses().unwrap_or_default();
+            if addresses.is_empty() {
+                warn!(
+                    pubkey = %pubkey,
+                    "fiber node has no public multiaddr; Fiber Studio cannot dial it. Set announced_addrs"
+                );
+            } else {
+                info!(pubkey = %pubkey, addresses = ?addresses, "fiber node for the app");
+            }
+            if let Err(error) = publish_fiber_node(client, keys, &pubkey, solver, &addresses).await
+            {
+                warn!(%error, "fiber node announcement failed");
+                failed = true;
+            }
+        }
+        Ok(None) => warn!("fiber node is not pinned"),
+        Err(error) => {
+            warn!(%error, "fiber node lookup failed");
+            failed = true;
+        }
+    }
+    match db.orders() {
+        Ok(orders) => {
+            for order in orders {
+                let order_id = order.id.clone();
+                let event = match public_order_event(keys, &order.public()) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        warn!(%error, %order_id, "order event failed");
+                        continue;
+                    }
+                };
+                if let Err(error) = publish_event(client, &event).await {
+                    warn!(%error, %order_id, "order never reached a relay");
+                    failed = true;
+                }
+            }
+        }
+        Err(error) => {
+            warn!(%error, "could not load orders to republish");
+            failed = true;
+        }
+    }
+    if failed {
+        bail!("republish failed");
     }
     Ok(())
 }
