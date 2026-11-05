@@ -242,7 +242,6 @@ mod tests {
         assert!(validate_new_order("0", "1500", "1000", "9000", "NGN").is_err());
         assert!(validate_new_order("10", "1500", "9000", "1000", "NGN").is_err());
     }
-
 }
 
 /// Live Fiber helpers for engine tests. A node must be running at `TWINE_RPC`.

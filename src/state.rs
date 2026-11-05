@@ -46,10 +46,7 @@ pub fn apply_clock(phase: Phase, now: i64, received_at: Option<i64>, hold_secs: 
     }
 }
 
-pub fn apply_take(phase: Phase, has_open_trade: bool) -> Decision {
-    if has_open_trade {
-        return Decision::Reject("order already has an open trade");
-    }
+pub fn apply_take(phase: Phase) -> Decision {
     match phase {
         Phase::Pending => Decision::Ok(Phase::WaitingHold),
         _ => Decision::Reject("order is not open for taking"),
@@ -205,17 +202,10 @@ mod tests {
     }
 
     #[test]
-    fn take_only_from_pending_without_open_trade() {
-        assert_eq!(
-            apply_take(Phase::Pending, false),
-            Decision::Ok(Phase::WaitingHold)
-        );
-        assert_eq!(
-            apply_take(Phase::Pending, true),
-            Decision::Reject("order already has an open trade")
-        );
+    fn take_only_from_pending() {
+        assert_eq!(apply_take(Phase::Pending), Decision::Ok(Phase::WaitingHold));
         assert!(matches!(
-            apply_take(Phase::WaitingHold, false),
+            apply_take(Phase::WaitingHold),
             Decision::Reject(_)
         ));
     }

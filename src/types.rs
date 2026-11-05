@@ -84,8 +84,8 @@ impl Phase {
         ]
     }
 
-    /// A slice is reserved. Includes `waiting-invoice`, where no hold exists yet
-    /// and the post still must not be taken or canceled.
+    /// A slice is reserved. Includes `waiting-invoice`, where no hold exists yet.
+    /// Another take can use the CKB still available. The post cannot be canceled.
     pub fn open_phases() -> &'static [Phase] {
         &[
             Self::WaitingInvoice,

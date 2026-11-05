@@ -1,9 +1,7 @@
 use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Order, Outbound};
-use crate::{
-    Envelope, NewOrderPayload, OrderStatus, Side, validate_new_order,
-};
+use crate::{Envelope, NewOrderPayload, OrderStatus, Side, validate_new_order};
 use anyhow::Result;
 use uuid::Uuid;
 

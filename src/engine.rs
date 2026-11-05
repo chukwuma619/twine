@@ -850,8 +850,8 @@ mod tests {
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
         FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewInvoicePayload, NewOrderPayload, OrderStatus,
-        PAY_INVOICE, REFUNDING, RELEASE, SAFETY_SECS,
-        RESOLVE, ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
+        PAY_INVOICE, REFUNDING, RELEASE, RESOLVE, ResolvePayload, SAFETY_SECS, SETTLED, TAKE,
+        TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;

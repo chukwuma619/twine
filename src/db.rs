@@ -205,9 +205,6 @@ impl Db {
         let shannons = i64_from_shannons(trade.shannons)?;
         let conn = self.conn.lock().expect("db");
         let tx = conn.unchecked_transaction()?;
-        if open_trades_for(&tx, &trade.order_id)? > 0 {
-            bail!("order already has an open trade");
-        }
         let updated = tx.execute(
             "UPDATE orders SET available_shannons = available_shannons - ?1
              WHERE id = ?2 AND status = ?3 AND available_shannons >= ?1",
@@ -800,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_invoice_reserves_the_slice_and_blocks_the_post() {
+    fn waiting_invoice_reserves_its_slice_and_leaves_the_rest_open() {
         let db = Db::open_in_memory().unwrap();
         db.insert_order(&sample_order(200_000_000)).unwrap();
         let mut trade = sample_trade(100_000_000);
@@ -812,11 +809,14 @@ mod tests {
         assert_eq!(order.reserved_shannons, 100_000_000);
         assert!(db.open_trade_for_order("order").unwrap().is_some());
         assert!(db.cancel_order("order").is_err());
-        let second = Trade {
-            id: "trade-2".into(),
-            ..trade
-        };
-        assert!(db.commit_take(&second).is_err());
+        trade.id = "trade-2".into();
+        db.commit_take(&trade).unwrap();
+        let order = db.get_order("order").unwrap().unwrap();
+        assert_eq!(order.available_shannons, 0);
+        assert_eq!(order.reserved_shannons, 200_000_000);
+        trade.id = "trade-3".into();
+        let rejected = db.commit_take(&trade).unwrap_err();
+        assert!(rejected.to_string().contains("cannot fund"));
     }
 
     #[test]

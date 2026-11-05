@@ -33,8 +33,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     if side != Side::Sell {
         return Ok(vec![cant_do(sender, None, "only a sell post can be taken")]);
     }
-    let has_open = engine.db.open_trade_for_order(&order.id)?.is_some();
-    match apply_take(Phase::Pending, has_open) {
+    match apply_take(Phase::Pending) {
         crate::Decision::Ok(Phase::WaitingHold) => {}
         crate::Decision::Reject(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
         _ => return Ok(vec![cant_do(sender, None, "cannot take this order")]),

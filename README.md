@@ -10,7 +10,7 @@ To run this on your own machine, follow [Run locally](#run-locally) from the top
 
 ## How a trade works
 
-A post offers CKB. The poster is the seller. The taker is the buyer. There is no buy post, and there is no automatic matching: someone picks a post. Anyone except the poster can take it. A post has at most one open trade. The next take waits until that trade is settled, canceled, or expired.
+A post offers CKB. The poster is the seller. The taker is the buyer. There is no buy post, and there is no automatic matching: someone picks a post. Anyone except the poster can take it. Several trades can be open on one post. Each take reserves its own slice, and another take is accepted while enough CKB is still available.
 
 1. Someone posts CKB for sale: price, currency, and size.
 2. Someone else takes it: a fiat amount inside the post's min and max, and a Fiber invoice that should receive the CKB.
