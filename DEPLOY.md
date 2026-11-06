@@ -348,22 +348,22 @@ sudo journalctl -u twine-push -f
 
 `{"ok":true}` from `/health` means the process is up. Ctrl-C stops the log. A register from the app is `POST /register` with `{ "pubkey", "token" }`. Logout is `POST /unregister` with the same body. Tokens are rewritten to `TWINE_PUSH_TOKENS` after each change. Restarting the unit keeps them.
 
-Put Caddy in front so the app can use HTTPS. Install it, open 80 and 443, and replace `push.backr.site` if this host uses another name.
+Put TLS in front so the app can use HTTPS. This host already runs Caddy in Docker for `relay.backr.site` (`caddy:2`, config `/opt/twine/relay/Caddyfile`, host network). Add a site to that file. Do not `apt install caddy`: a second process will fail on port 2019 and the container will keep 80/443.
 
 ```bash
-sudo apt install -y caddy
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
-sudo tee /etc/caddy/Caddyfile > /dev/null << 'EOF'
+grep -q 'push.backr.site' /opt/twine/relay/Caddyfile || cat >> /opt/twine/relay/Caddyfile << 'EOF'
+
 push.backr.site {
 	reverse_proxy 127.0.0.1:8787
 }
 EOF
-sudo systemctl enable --now caddy
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 curl -sS https://push.backr.site/health
 ```
 
-Caddy fetches the certificate. `/health` over HTTPS should return `{"ok":true}`. Do not open 8787 on the firewall.
+Leave the `relay.backr.site` block in place. Caddy fetches the new certificate; `/health` over HTTPS should return `{"ok":true}`. A first curl during issuance can fail TLS; wait a few seconds and try again. Do not open 8787 on the firewall. If this machine has no Caddy yet, install one Caddy (Docker or apt, not both) and proxy `push.backr.site` to `127.0.0.1:8787`.
 
 ## Keep these together
 
