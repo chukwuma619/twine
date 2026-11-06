@@ -6,7 +6,7 @@ Fiber release tags publish official container images to Docker Hub at `nervos/fi
 
 This directory is the [Fiber Docker setup](https://github.com/nervosnetwork/fiber/tree/v0.9.1/docker), adapted so it can build from the Twine repo. Twine does not contain the `fnn` source, so the image checks out [nervosnetwork/fiber](https://github.com/nervosnetwork/fiber) `v0.9.1` and compiles `fiber-bin` and `fnn-cli` the same way upstream does. Config templates are copied from that checkout (`config/testnet`, `config/mainnet`).
 
-`v0.9.1` uses Rust `1.95.0`. That is the Fiber version the [run steps](../README.md#run-locally) use. Override the git ref with `FIBER_REF` (branch or tag).
+`v0.9.1` uses Rust `1.95.0`. That is the Fiber version a Twine host runs. Override the git ref with `FIBER_REF` (branch or tag). Host setup is [DEPLOY.md](../DEPLOY.md).
 
 ```bash
 docker build -f docker/Dockerfile -t fiber:local .
@@ -15,7 +15,7 @@ docker build -f docker/Dockerfile -t fiber:local .
 
 ## Run the published image
 
-The node's CKB wallet, the two passwords, and how the daemon reaches RPC are in [Run locally](../README.md#run-locally). Use `nervos/fiber:0.9.1` with this daemon. The key file is 64 hex characters with no `0x` prefix.
+The node's CKB wallet, the two passwords, and how the daemon reaches RPC are in [DEPLOY.md](../DEPLOY.md#ckb-key). Use `nervos/fiber:0.9.1` with this daemon. The key file is 64 hex characters with no `0x` prefix.
 
 ```bash
 mkdir -p ./fiber-node/ckb
@@ -36,11 +36,11 @@ On first start, the image copies the bundled testnet config to `/fiber/config.ym
 
 The image also includes `fnn-cli` for administration tasks.
 
-The RPC service listens on `127.0.0.1:8227` in the bundled image configs. Twine moves that bind to `8229` and publishes `127.0.0.1:8229`, so Fiber Studio can keep `8227`. Publishing the port is not enough by itself: `rpc.listening_addr` in the mounted config has to match. See [Run locally](../README.md#run-locally).
+The RPC service listens on `127.0.0.1:8227` in the bundled image configs. Twine moves that bind to `8229` and publishes `127.0.0.1:8229`, so Fiber Studio can keep `8227`. Publishing the port is not enough by itself: `rpc.listening_addr` in the mounted config has to match. See [DEPLOY.md](../DEPLOY.md#fiber-node).
 
 ## Use `fnn-cli` with Docker
 
-If the node is already running in a container, the simplest way to use `fnn-cli` is to execute it inside the same container so it can talk to the node's RPC endpoint (`127.0.0.1:8229` after the [run steps](../README.md#5-open-rpc-on-this-machine)):
+If the node is already running in a container, the simplest way to use `fnn-cli` is to execute it inside the same container so it can talk to the node's RPC endpoint (`127.0.0.1:8229` after the [host setup](../DEPLOY.md#fiber-node)):
 
 ```bash
 docker exec -it fiber-node fnn-cli info
