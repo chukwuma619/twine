@@ -14,6 +14,10 @@ const PUBLISH_ATTEMPTS: u32 = 5;
 const PUBLISH_RETRY: Duration = Duration::from_secs(5);
 const ACTION_SUBSCRIPTION: &str = "twine-actions";
 
+/// `disconnect_relay` reports Terminated while teardown is still in flight.
+/// A connect in that window is a no-op and the relay stays down.
+const RECONNECT_GRACE: Duration = Duration::from_millis(250);
+
 pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
     let client = Client::builder()
         .authenticator(SignerAuthenticator::new(keys.clone()))
@@ -22,6 +26,7 @@ pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
         client
             .add_relay(relay)
             .retry_interval(RELAY_RETRY)
+            .adjust_retry_interval(false)
             .await
             .with_context(|| format!("invalid relay {relay}"))?;
     }
@@ -41,6 +46,49 @@ pub async fn connect(keys: &Keys, relays: &[String]) -> Result<Client> {
         warn!("no nostr relay connected yet; the pool will keep retrying");
     }
     Ok(client)
+}
+
+pub fn action_subscription_id() -> SubscriptionId {
+    SubscriptionId::new(ACTION_SUBSCRIPTION)
+}
+
+/// Relays whose connection task is sleeping its retry interval.
+/// `Client::connect` does not wake these. It only starts a task when the
+/// status is Initialized, Terminated, or Sleeping.
+pub fn disconnected_relay_urls(
+    relays: impl IntoIterator<Item = (String, RelayStatus)>,
+) -> Vec<String> {
+    relays
+        .into_iter()
+        .filter(|(_, status)| *status == RelayStatus::Disconnected)
+        .map(|(url, _)| url)
+        .collect()
+}
+
+/// Bounce every disconnected relay so the next subscribe is not waiting
+/// behind a 5–60s SDK retry sleep.
+pub async fn wake_disconnected(client: &Client) -> usize {
+    let urls = disconnected_relay_urls(
+        client
+            .relays()
+            .await
+            .into_iter()
+            .map(|(url, relay)| (url.to_string(), relay.status())),
+    );
+    for url in &urls {
+        if let Err(error) = client.disconnect_relay(url.as_str()).await {
+            warn!(%url, %error, "disconnect before wake failed");
+        }
+    }
+    if !urls.is_empty() {
+        tokio::time::sleep(RECONNECT_GRACE).await;
+    }
+    for url in &urls {
+        if let Err(error) = client.connect_relay(url.as_str()).await {
+            warn!(%url, %error, "wake did not start");
+        }
+    }
+    urls.len()
 }
 
 pub async fn connected_relay_urls(client: &Client) -> BTreeSet<String> {
@@ -63,7 +111,7 @@ fn is_action_filter(filter: &Filter, daemon: &PublicKey) -> bool {
 
 /// Subscribes any connected relay that is missing the action filter.
 pub async fn ensure_action_subscription(client: &Client, daemon: PublicKey) -> Result<()> {
-    let id = SubscriptionId::new(ACTION_SUBSCRIPTION);
+    let id = action_subscription_id();
     let existing = client.subscriptions().await;
     let covered = existing.get(&id);
     let mut missing = Vec::new();
@@ -247,6 +295,18 @@ mod tests {
         assert_eq!(
             relays_with_everything(Some(first), second),
             BTreeSet::from(["b".to_string()])
+        );
+    }
+
+    #[test]
+    fn disconnected_relays_are_the_ones_connect_cannot_wake() {
+        assert_eq!(
+            disconnected_relay_urls([
+                ("wss://a".into(), RelayStatus::Connected),
+                ("wss://b".into(), RelayStatus::Disconnected),
+                ("wss://c".into(), RelayStatus::Terminated),
+            ]),
+            vec!["wss://b".to_string()]
         );
     }
 

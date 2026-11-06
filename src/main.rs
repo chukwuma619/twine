@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nostr_sdk::prelude::*;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
@@ -8,8 +8,9 @@ use twine_daemon::db::Db;
 use twine_daemon::engine::Engine;
 use twine_daemon::fiber::{FiberNodeInfo, HttpFiber, NodeRpc, accept_node_pubkey};
 use twine_daemon::nostr::{
-    accepted_relays, connect, connected_relay_urls, decrypt_action, ensure_action_subscription,
-    fiber_node_event, public_order_event, publish_outbounds, relays_with_everything, sender_hex,
+    accepted_relays, action_subscription_id, connect, connected_relay_urls, decrypt_action,
+    ensure_action_subscription, fiber_node_event, public_order_event, publish_outbounds,
+    relays_with_everything, sender_hex, wake_disconnected,
 };
 use twine_daemon::{Config, KIND_ACTION, Phase};
 
@@ -50,7 +51,6 @@ async fn main() -> Result<()> {
         engine.watch(&trade_id)?;
     }
 
-    let mut notifications = client.notifications();
     if let Err(error) = ensure_action_subscription(&client, keys.public_key()).await {
         warn!(%error, "action subscription failed; will retry");
     }
@@ -61,41 +61,67 @@ async fn main() -> Result<()> {
         config.solver.clone(),
     );
 
-    while let Some(notification) = notifications.next().await {
-        let ClientNotification::Event { event, .. } = notification else {
-            continue;
-        };
-        if event.kind != Kind::from(KIND_ACTION) {
-            continue;
-        }
-        if !event
-            .tags
-            .public_keys()
-            .any(|pubkey| pubkey == keys.public_key())
-        {
-            continue;
-        }
-        if !engine.db.mark_event(&event.id.to_hex())? {
-            continue;
-        }
-        let envelope = match decrypt_action(&keys, &event) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                warn!(%error, "rejecting event");
-                continue;
-            }
-        };
-        let sender = sender_hex(&event);
-        match engine.handle(&sender, envelope).await {
-            Ok(outbound) => {
-                if let Err(error) = publish_outbounds(&client, &keys, &outbound).await {
-                    warn!(%error, "publish failed");
+    loop {
+        let mut notifications = client.notifications();
+        while let Some(notification) = notifications.next().await {
+            match notification {
+                ClientNotification::Event { event, .. } => {
+                    if event.kind != Kind::from(KIND_ACTION) {
+                        continue;
+                    }
+                    if !event
+                        .tags
+                        .public_keys()
+                        .any(|pubkey| pubkey == keys.public_key())
+                    {
+                        continue;
+                    }
+                    if !engine.db.mark_event(&event.id.to_hex())? {
+                        continue;
+                    }
+                    let envelope = match decrypt_action(&keys, &event) {
+                        Ok(envelope) => envelope,
+                        Err(error) => {
+                            warn!(%error, "rejecting event");
+                            continue;
+                        }
+                    };
+                    let sender = sender_hex(&event);
+                    match engine.handle(&sender, envelope).await {
+                        Ok(outbound) => {
+                            if let Err(error) = publish_outbounds(&client, &keys, &outbound).await {
+                                warn!(%error, "publish failed");
+                            }
+                        }
+                        Err(error) => warn!(%error, "handle failed"),
+                    }
+                }
+                ClientNotification::Message { message, .. } => {
+                    let RelayMessage::Closed {
+                        subscription_id, ..
+                    } = message.as_ref()
+                    else {
+                        continue;
+                    };
+                    if subscription_id.as_ref() != &action_subscription_id() {
+                        continue;
+                    }
+                    warn!("action subscription closed; re-issuing");
+                    let _ = client.unsubscribe(&action_subscription_id()).await;
+                    if let Err(error) =
+                        ensure_action_subscription(&client, keys.public_key()).await
+                    {
+                        warn!(%error, "action subscription failed; will retry");
+                    }
+                }
+                ClientNotification::Shutdown => {
+                    bail!("nostr client shut down");
                 }
             }
-            Err(error) => warn!(%error, "handle failed"),
         }
+        warn!("nostr notification stream ended; opening another");
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 const RELAY_MAINTENANCE: Duration = Duration::from_secs(5);
@@ -105,6 +131,10 @@ fn spawn_relay_maintenance(client: Client, keys: Keys, db: Arc<Db>, solver: Opti
         let mut published_to = BTreeSet::new();
         let mut reported_down = false;
         loop {
+            let woken = wake_disconnected(&client).await;
+            if woken > 0 {
+                info!(relays = woken, "waking disconnected nostr relays");
+            }
             client.connect().await;
             let up = connected_relay_urls(&client).await;
             if up.is_empty() {
