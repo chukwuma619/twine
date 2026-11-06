@@ -1,8 +1,8 @@
 # Deploy
 
-A Twine host runs two processes on one machine: a Fiber node (`nervos/fiber:0.9.1`) and `twine-daemon`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8230**. Fiber's JSON-RPC stays on `127.0.0.1:8229`. Ports `8227` and `8228` stay free for Fiber Studio.
+A Twine host runs three processes on one machine: a Fiber node (`nervos/fiber:0.9.1`), `twine-daemon`, and `twine-push`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8230**. Fiber's JSON-RPC stays on `127.0.0.1:8229`. Ports `8227` and `8228` stay free for Fiber Studio. The app wakes from the background by registering at `https://push.backr.site`, which terminates TLS in front of `twine-push` on `127.0.0.1:8787`.
 
-systemd passes the daemon its environment from `/opt/twine/.env`. Variable meanings are in the [README](README.md#configuration).
+systemd passes the daemon its environment from `/opt/twine/.env`. `twine-push` loads `/opt/twine/push.env`. Variable meanings are in the [README](README.md#configuration).
 
 Paths below use `/opt/twine`. Keep `twine.db` next to the `fiber-node/` store it was pinned to.
 
@@ -19,10 +19,13 @@ A current Ubuntu VPS with systemd is enough. Add 4 GB of swap before the Rust co
 | Port | Bind | Why |
 | --- | --- | --- |
 | 22/tcp | public | SSH |
+| 80/tcp | public | ACME for the push hostname. Opened when `twine-push` is installed. |
+| 443/tcp | public | HTTPS for `twine-push`. The app posts FCM tokens here. |
 | 8230/tcp | public | Fiber peer-to-peer. Wallets open channels here. |
 | 8229/tcp | `127.0.0.1` | Fiber JSON-RPC. The daemon is the only client. |
+| 8787/tcp | `127.0.0.1` | `twine-push` HTTP. Caddy proxies 443 here. |
 
-The daemon has no listening port. It opens outbound websockets to `TWINE_RELAYS`, and the Fiber node opens outbound HTTPS to its CKB RPC.
+The daemon has no listening port. It opens outbound websockets to `TWINE_RELAYS`, and the Fiber node opens outbound HTTPS to its CKB RPC. `twine-push` also opens outbound websockets to those relays, and outbound HTTPS to Firebase.
 
 ## Prepare the VPS
 
@@ -257,6 +260,111 @@ The daemon exits when no relay connects, the RPC token is empty, or `FIBER_NETWO
 
 The first successful RPC call pins that Fiber pubkey in SQLite. Restarting against the same node is fine. A different node, while a hold is still open, is refused.
 
+## Already deployed
+
+A host that already has Fiber and `twine` running does not repeat the CKB key, Fiber, RPC token, or Daemon sections. Leave `/opt/twine/.env`, `twine.db`, and `fiber-node/` where they are. Rewriting `.env` would mint a new daemon `npub`.
+
+On the VPS:
+
+```bash
+cd /opt/twine
+git pull
+. "$HOME/.cargo/env"
+cargo build --release -j1
+sudo systemctl restart twine
+sudo journalctl -u twine -f
+```
+
+Ctrl-C stops the log. Continue at [Push doorbell](#push-doorbell): copy the service-account JSON, build `twine-push`, install its unit, and put Caddy in front. Point DNS for `push.backr.site` at this VPS first. Open 80 and 443 when Caddy is installed. Fiber stays on 0.9.1.
+
+Later pulls that already include `twine-push` are [Upgrade](#upgrade).
+
+## Push doorbell
+
+The phone cannot keep a websocket alive in the background. `twine-push` watches kinds `4242` and `4243` on `TWINE_RELAYS` and sends a content-free FCM message `{ "type": "trade_update" | "chat_wake" }` to each `#p` tag that has registered a token. It does not decrypt events. The app default is `https://push.backr.site`. A different hostname needs `--dart-define=TWINE_PUSH_URL=https://that-host` when the app is built.
+
+Point DNS for `push.backr.site` (or your hostname) at this VPS before requesting a certificate.
+
+Copy the Firebase **service account** JSON (the Admin SDK file with `private_key`, not `google-services.json`) onto the VPS. That file stays out of git.
+
+```bash
+scp twine-fcm.json USER@VPS:/opt/twine/secrets/fcm.json
+```
+
+On the VPS:
+
+```bash
+chmod 600 /opt/twine/secrets/fcm.json
+sudo mkdir -p /var/lib/twine-push
+sudo chown "$USER:$USER" /var/lib/twine-push
+chmod 700 /var/lib/twine-push
+```
+
+`twine-push` is its own crate. Build it after the daemon so the compile still fits in 4 GB plus swap.
+
+```bash
+. "$HOME/.cargo/env"
+cd /opt/twine/twine-push
+cargo build --release -j1
+```
+
+```bash
+umask 077
+cat > /opt/twine/push.env << EOF
+RUST_LOG=info
+TWINE_RELAYS=wss://relay.backr.site
+TWINE_PUSH_LISTEN=127.0.0.1:8787
+TWINE_PUSH_TOKENS=/var/lib/twine-push/tokens.json
+FCM_SERVICE_ACCOUNT=/opt/twine/secrets/fcm.json
+EOF
+chmod 600 /opt/twine/push.env
+```
+
+`TWINE_RELAYS` must be the same list the daemon uses. `FCM_SERVICE_ACCOUNT` can be the path to the JSON or the JSON itself. `GOOGLE_APPLICATION_CREDENTIALS` is accepted if `FCM_SERVICE_ACCOUNT` is unset. Without either, the process still listens and logs doorbells, but phones are not notified.
+
+```bash
+sudo tee /etc/systemd/system/twine-push.service > /dev/null << 'EOF'
+[Unit]
+Description=Twine push doorbell
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/twine/twine-push
+EnvironmentFile=/opt/twine/push.env
+ExecStart=/opt/twine/twine-push/target/release/twine-push
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now twine-push
+curl -sS http://127.0.0.1:8787/health
+sudo journalctl -u twine-push -f
+```
+
+`{"ok":true}` from `/health` means the process is up. Ctrl-C stops the log. A register from the app is `POST /register` with `{ "pubkey", "token" }`. Logout is `POST /unregister` with the same body. Tokens are rewritten to `TWINE_PUSH_TOKENS` after each change. Restarting the unit keeps them.
+
+Put Caddy in front so the app can use HTTPS. Install it, open 80 and 443, and replace `push.backr.site` if this host uses another name.
+
+```bash
+sudo apt install -y caddy
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo tee /etc/caddy/Caddyfile > /dev/null << 'EOF'
+push.backr.site {
+	reverse_proxy 127.0.0.1:8787
+}
+EOF
+sudo systemctl enable --now caddy
+curl -sS https://push.backr.site/health
+```
+
+Caddy fetches the certificate. `/health` over HTTPS should return `{"ok":true}`. Do not open 8787 on the firewall.
+
 ## Keep these together
 
 Copy this set off the machine before you rely on the host.
@@ -266,13 +374,31 @@ Copy this set off the machine before you rely on the host.
 | `/opt/twine/twine.db` | Orders, trades, catalog, pinned Fiber pubkey. Mode `0600`. |
 | `/opt/twine/fiber-node/` | Fiber store, config, and the encrypted CKB key. |
 | `/opt/twine/.env` | Daemon environment: Nostr secret and RPC token. |
+| `/opt/twine/push.env` | Push environment: listen address, token file, FCM path. |
+| `/opt/twine/secrets/fcm.json` | Firebase service account. Lets `twine-push` send FCM. |
+| `/var/lib/twine-push/tokens.json` | Device FCM tokens keyed by Nostr pubkey. |
 | `/opt/twine/secrets/fiber.env` | Password Fiber uses to decrypt its CKB key. |
 | `/opt/twine/secrets/rpc-token` | Biscuit the daemon sends to Fiber. |
 | `/opt/twine/secrets/biscuit-keypair.txt` | Biscuit private key. Needed to mint another token. |
 | `$HOME/twine-ckb/ckb-key` | Plaintext CKB key, on the computer that created it. |
 
-A restored database only works with the node it was pinned to.
+A restored database only works with the node it was pinned to. A restored token file is what keeps doorbells after a push restart. The service-account JSON is a private key; treat it like `.env`.
 
-Restart Fiber first, then `sudo systemctl restart twine`.
+Restart Fiber first, then `sudo systemctl restart twine`, then `sudo systemctl restart twine-push`.
 
-To upgrade the daemon, pull the repo, run `cargo build --release -j1` again, and restart the unit. Stay on `nervos/fiber:0.9.1` until a Fiber upgrade is intentional. Store migration for a Fiber version change is in [docker/README.md](docker/README.md).
+## Upgrade
+
+A host that already runs Fiber, `twine`, and `twine-push` only needs a pull and two compiles. Do not rewrite `.env` or `push.env`. Stay on `nervos/fiber:0.9.1` until a Fiber upgrade is intentional. Store migration for a Fiber version change is in [docker/README.md](docker/README.md).
+
+```bash
+cd /opt/twine
+git pull
+. "$HOME/.cargo/env"
+cargo build --release -j1
+cd /opt/twine/twine-push
+cargo build --release -j1
+sudo systemctl restart twine
+sudo systemctl restart twine-push
+```
+
+A host that has Fiber and `twine` but not `twine-push` yet is [Already deployed](#already-deployed).

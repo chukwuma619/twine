@@ -2,11 +2,11 @@
 
 Twine is a peer-to-peer CKB market. Fiat moves outside the protocol. CKB stays in each trader's Fiber wallet.
 
-This repository is the coordinator daemon (`twine-daemon`). It speaks Nostr to the [Flutter client](https://github.com/chukwuma619/twine_app) and JSON-RPC to one Fiber node (`fnn`). It never holds a user's Fiber key. Each trader pays and receives on their own node. The operator runs this daemon and one Twine Fiber node that the hold invoices are locked to.
+This repository is the coordinator daemon (`twine-daemon`) and a content-free push doorbell (`twine-push`). The daemon speaks Nostr to the [Flutter client](https://github.com/chukwuma619/twine_app) and JSON-RPC to one Fiber node (`fnn`). It never holds a user's Fiber key. Each trader pays and receives on their own node. The operator runs this daemon, one Twine Fiber node that the hold invoices are locked to, and `twine-push` so a phone can wake when the process is frozen.
 
 There is no HTTP API for trades. Twine charges no fee, keeps no ratings, takes no bond, and does not use UDTs. The two traders chat on the client. The daemon does not read that thread.
 
-To run this on your own machine, follow [Run locally](#run-locally) from the top. Do not skip ahead. A VPS install is [DEPLOY.md](DEPLOY.md).
+To run this on your own machine, follow [Run locally](#run-locally) from the top. Do not skip ahead. A VPS install is [DEPLOY.md](DEPLOY.md). A host that already runs Fiber and the daemon adds `twine-push` from [Already deployed](DEPLOY.md#already-deployed).
 
 ## How a trade works
 
@@ -188,6 +188,21 @@ Export the variables below before `cargo run`. The [run](#run-locally) section w
 | `RUST_LOG` | no | Tracing filter. Default `info`. |
 
 `FIBER_SECRET_KEY_PASSWORD` is the Fiber node's password. It encrypts `fiber-node/ckb/key`. The password typed into `ckb-cli` only unlocks that wallet inside `ckb-cli`.
+
+### `twine-push`
+
+A separate crate in `twine-push/`. It is not started by `cargo run` in the repo root. The VPS unit is in [DEPLOY.md](DEPLOY.md#push-doorbell). The app registers at `https://push.backr.site` unless built with `--dart-define=TWINE_PUSH_URL=...`.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `TWINE_RELAYS` | no | Same comma-separated websocket list as the daemon. Default `wss://relay.backr.site`. |
+| `TWINE_PUSH_LISTEN` | no | HTTP bind. Default `0.0.0.0:8787`. On a VPS this is `127.0.0.1:8787` behind Caddy. |
+| `TWINE_PUSH_TOKENS` | no | JSON file of device tokens. Default `./twine-push-tokens.json`. |
+| `FCM_SERVICE_ACCOUNT` | no | Firebase service-account JSON path, or the JSON itself. Without it, doorbells are logged only. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | no | Fallback path if `FCM_SERVICE_ACCOUNT` is unset. |
+| `RUST_LOG` | no | Tracing filter. Default `info`. |
+
+This JSON is the Firebase Admin SDK file (`type: service_account`, a `private_key`). It is not `google-services.json` and not `GoogleService-Info.plist`. Those stay on the phone. The service account stays on the VPS.
 
 ## Fiber channels
 
@@ -452,5 +467,6 @@ cargo test -- --ignored
 | `src/fiber/` | JSON-RPC for invoices, payments, the node pubkey, and the watchtower. |
 | `src/db.rs` | SQLite. |
 | `src/constant.rs` | Time limits and event kinds. |
+| `twine-push/` | Content-free FCM doorbell. Watches kinds `4242` and `4243`. |
 | `docker/` | Fiber node image. |
-| `DEPLOY.md` | VPS install for this daemon and a Fiber node. |
+| `DEPLOY.md` | VPS install for the daemon, a Fiber node, and `twine-push`. |

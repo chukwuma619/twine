@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
@@ -115,7 +115,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 ClientNotification::Shutdown => {
-                    bail!("nostr client shut down");
+                    warn!("nostr client shut down; opening another");
+                    break;
                 }
             }
         }
