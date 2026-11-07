@@ -1,5 +1,5 @@
-use super::{HttpFiber, InvoiceCreated, InvoiceInfo, ParsedInvoice};
-use crate::{HASH_ALGORITHM, hex_u64, hex_u128};
+use super::{HashAlgorithm, HttpFiber, InvoiceCreated, InvoiceInfo, ParsedInvoice};
+use crate::{hex_u64, hex_u128};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::json;
@@ -10,6 +10,7 @@ pub trait InvoiceRpc: Send + Sync {
         &self,
         amount: u128,
         payment_hash: &str,
+        hash_algorithm: HashAlgorithm,
         description: &str,
         final_expiry_delta_ms: u64,
         expiry_secs: u64,
@@ -32,6 +33,7 @@ impl InvoiceRpc for HttpFiber {
         &self,
         amount: u128,
         payment_hash: &str,
+        hash_algorithm: HashAlgorithm,
         description: &str,
         final_expiry_delta_ms: u64,
         expiry_secs: u64,
@@ -43,7 +45,7 @@ impl InvoiceRpc for HttpFiber {
                     "amount": hex_u128(amount),
                     "currency": self.currency,
                     "payment_hash": payment_hash,
-                    "hash_algorithm": HASH_ALGORITHM,
+                    "hash_algorithm": hash_algorithm.as_str(),
                     "final_expiry_delta": hex_u64(final_expiry_delta_ms),
                     "expiry": hex_u64(expiry_secs),
                     "description": description,
@@ -54,6 +56,14 @@ impl InvoiceRpc for HttpFiber {
         let got_hash = super::payment_hash_from_invoice(invoice)?;
         if !super::same_hash(&got_hash, payment_hash) {
             bail!("hold invoice hash {got_hash} does not match {payment_hash}");
+        }
+        let got_algorithm = super::hash_algorithm_from_invoice(invoice)?;
+        if got_algorithm != hash_algorithm {
+            bail!(
+                "hold invoice algorithm {} does not match {}",
+                got_algorithm.as_str(),
+                hash_algorithm.as_str()
+            );
         }
         match super::hex_amount(invoice.get("amount"))? {
             Some(got) if got == amount => {}
@@ -154,6 +164,7 @@ impl InvoiceRpc for HttpFiber {
                 .unwrap_or("")
                 .to_string(),
             amount: super::hex_amount(invoice.get("amount"))?,
+            hash_algorithm: super::hash_algorithm_from_invoice(invoice)?,
         })
     }
 }

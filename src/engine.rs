@@ -1,5 +1,5 @@
 use crate::db::Db;
-use crate::fiber::{FiberRpc, ParsedInvoice, payment_route_failed, route_not_ready};
+use crate::fiber::{FiberRpc, HashAlgorithm, ParsedInvoice, payment_route_failed, route_not_ready};
 use crate::nostr::publish_outbounds;
 use crate::types::{Order, Trade};
 use crate::{
@@ -334,6 +334,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             .new_hold_invoice(
                 trade.shannons,
                 &parsed.payment_hash,
+                parsed.hash_algorithm,
                 &format!("twine {}", trade.id),
                 order.hold_secs * 1_000,
                 INVOICE_EXPIRY_SECS,
@@ -381,10 +382,29 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 "this invoice uses a new payment hash. Retry with the same hash as the hold".into(),
             ));
         }
+        let hold_algorithm = match self.hold_algorithm(trade).await? {
+            Ok(algorithm) => algorithm,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if parsed.hash_algorithm != hold_algorithm {
+            return Ok(Err(
+                "this invoice uses a different hash algorithm than the hold".into(),
+            ));
+        }
         if let Err(reason) = payout_invoice_ok(&parsed, self.fiber.currency(), trade.shannons) {
             return Ok(Err(reason.into()));
         }
         Ok(Ok(()))
+    }
+
+    async fn hold_algorithm(&self, trade: &Trade) -> Result<Result<HashAlgorithm, String>> {
+        let Some(invoice) = trade.hold_invoice.as_deref() else {
+            return Ok(Err("hold is not open yet".into()));
+        };
+        match self.fiber.parse_invoice(invoice).await {
+            Ok(parsed) => Ok(Ok(parsed.hash_algorithm)),
+            Err(error) => Ok(Err(format!("hold invoice rejected: {error}"))),
+        }
     }
 
     pub(crate) async fn drop_preimage(&self, trade: &Trade) -> Result<()> {
@@ -433,6 +453,16 @@ impl<F: FiberRpc + 'static> Engine<F> {
             };
             if !same_hash(&parsed.payment_hash, &hold_hash) {
                 return self.fail_payout(&trade, "payout invoice hash does not match the hold");
+            }
+            let hold_algorithm = match self.hold_algorithm(&trade).await? {
+                Ok(algorithm) => algorithm,
+                Err(reason) => return self.fail_payout(&trade, &reason),
+            };
+            if parsed.hash_algorithm != hold_algorithm {
+                return self.fail_payout(
+                    &trade,
+                    "payout invoice hash algorithm does not match the hold",
+                );
             }
             if let Err(reason) = payout_invoice_ok(&parsed, self.fiber.currency(), trade.shannons) {
                 return self.fail_payout(&trade, reason);
@@ -864,6 +894,8 @@ mod tests {
         payment_preimage: StdMutex<Option<String>>,
         payment_failed_error: StdMutex<Option<String>>,
         parsed_amount: StdMutex<u128>,
+        invoice_algorithm: StdMutex<HashAlgorithm>,
+        hold_algorithm: StdMutex<HashAlgorithm>,
         get_payment_missing: StdMutex<bool>,
         send_count: StdMutex<u32>,
         send_status: StdMutex<String>,
@@ -881,6 +913,8 @@ mod tests {
                 payment_preimage: StdMutex::new(None),
                 payment_failed_error: StdMutex::new(None),
                 parsed_amount: StdMutex::new(parsed_amount),
+                invoice_algorithm: StdMutex::new(HashAlgorithm::CkbHash),
+                hold_algorithm: StdMutex::new(HashAlgorithm::CkbHash),
                 get_payment_missing: StdMutex::new(false),
                 send_count: StdMutex::new(0),
                 send_status: StdMutex::new("Success".into()),
@@ -896,10 +930,12 @@ mod tests {
             &self,
             _: u128,
             payment_hash: &str,
+            hash_algorithm: HashAlgorithm,
             _: &str,
             _: u64,
             _: u64,
         ) -> Result<InvoiceCreated> {
+            *self.hold_algorithm.lock().expect("hold algorithm") = hash_algorithm;
             Ok(InvoiceCreated {
                 invoice: format!("hold-{payment_hash}"),
                 payment_hash: payment_hash.to_string(),
@@ -921,11 +957,20 @@ mod tests {
         async fn settle_invoice(&self, _: &str, _: &str) -> Result<()> {
             Ok(())
         }
-        async fn parse_invoice(&self, _: &str) -> Result<ParsedInvoice> {
+        async fn parse_invoice(&self, invoice: &str) -> Result<ParsedInvoice> {
+            if invoice.starts_with("unsupported-") {
+                bail!("unsupported hash algorithm blake2b");
+            }
+            let hash_algorithm = if invoice.starts_with("hold-") {
+                *self.hold_algorithm.lock().expect("hold algorithm")
+            } else {
+                *self.invoice_algorithm.lock().expect("algorithm")
+            };
             Ok(ParsedInvoice {
                 payment_hash: "hash".into(),
                 currency: "Fibt".into(),
                 amount: Some(*self.parsed_amount.lock().expect("amount")),
+                hash_algorithm,
             })
         }
     }
@@ -1299,6 +1344,7 @@ mod tests {
             payment_hash: "h".into(),
             currency: "Fibt".into(),
             amount: Some(10),
+            hash_algorithm: HashAlgorithm::CkbHash,
         };
         assert!(payout_invoice_ok(&invoice, "Fibt", 10).is_ok());
         assert!(payout_invoice_ok(&invoice, "Fibb", 10).is_err());
@@ -1312,6 +1358,90 @@ mod tests {
             ..wrong
         };
         assert!(payout_invoice_ok(&open, "Fibt", 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_hold_uses_the_buyer_invoice_algorithm() {
+        let (engine, fiber) = fake_engine("Open");
+        engine
+            .db
+            .set_trade_state("trade", Phase::WaitingInvoice.as_str())
+            .unwrap();
+        *fiber.invoice_algorithm.lock().unwrap() = HashAlgorithm::Sha256;
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        engine
+            .bind_buyer_hold(&trade, "buyer-invoice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*fiber.hold_algorithm.lock().unwrap(), HashAlgorithm::Sha256);
+        assert_eq!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .hold_payment_hash
+                .as_deref(),
+            Some("hash")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_buyer_algorithm_is_rejected_before_the_hold() {
+        let (engine, fiber) = fake_engine("Open");
+        engine
+            .db
+            .set_trade_state("trade", Phase::WaitingInvoice.as_str())
+            .unwrap();
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        let before = trade.hold_payment_hash.clone();
+        let rejected = engine
+            .bind_buyer_hold(&trade, "unsupported-invoice")
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(rejected.contains("unsupported hash algorithm"));
+        assert_eq!(
+            *fiber.hold_algorithm.lock().unwrap(),
+            HashAlgorithm::CkbHash
+        );
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        assert_eq!(trade.hold_payment_hash, before);
+        assert_eq!(trade.state, Phase::WaitingInvoice.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_replacement_invoice_must_use_the_hold_algorithm() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_hold("trade", "hash", "hold-hash", unix_now())
+            .unwrap();
+        *fiber.hold_algorithm.lock().unwrap() = HashAlgorithm::CkbHash;
+        *fiber.invoice_algorithm.lock().unwrap() = HashAlgorithm::Sha256;
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        let rejected = engine
+            .require_same_hold_hash(&trade, "buyer-invoice")
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(rejected.contains("hash algorithm"));
+    }
+
+    #[tokio::test]
+    async fn payout_refuses_an_invoice_whose_algorithm_differs_from_the_hold() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_hold("trade", "hash", "hold-hash", unix_now())
+            .unwrap();
+        *fiber.hold_algorithm.lock().unwrap() = HashAlgorithm::CkbHash;
+        *fiber.invoice_algorithm.lock().unwrap() = HashAlgorithm::Sha256;
+        releasing_payout(&engine, &fiber).await;
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, NEW_INVOICE));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
     }
 
     #[tokio::test]

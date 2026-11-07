@@ -23,9 +23,6 @@ pub const TESTNET_INVOICE_CURRENCY: &str = "Fibt";
 
 pub const MAINNET_INVOICE_CURRENCY: &str = "Fibb";
 
-/// Hold invoices use the buyer's payment hash. The daemon does not mint it.
-pub const HASH_ALGORITHM: &str = "sha256";
-
 pub const FIBER_POLL_SECS: u64 = 2;
 
 /// SQLite path when `TWINE_DB` is unset.

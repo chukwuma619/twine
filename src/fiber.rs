@@ -33,11 +33,36 @@ pub struct PaymentInfo {
     pub failed_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashAlgorithm {
+    #[default]
+    CkbHash,
+    Sha256,
+}
+
+impl HashAlgorithm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CkbHash => "ckb_hash",
+            Self::Sha256 => "sha256",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "ckb_hash" => Ok(Self::CkbHash),
+            "sha256" => Ok(Self::Sha256),
+            other => bail!("unsupported hash algorithm {other}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedInvoice {
     pub payment_hash: String,
     pub currency: String,
     pub amount: Option<u128>,
+    pub hash_algorithm: HashAlgorithm,
 }
 
 pub trait FiberRpc: InvoiceRpc + WatchtowerRpc + PaymentRpc + NodeRpc {
@@ -139,6 +164,27 @@ fn payment_hash_from_invoice(invoice: &Value) -> Result<String> {
         .ok_or_else(|| anyhow!("invoice is missing payment_hash"))
 }
 
+pub(crate) fn hash_algorithm_from_invoice(invoice: &Value) -> Result<HashAlgorithm> {
+    let Some(attrs) = invoice.pointer("/data/attrs").and_then(Value::as_array) else {
+        return Ok(HashAlgorithm::CkbHash);
+    };
+    let mut found = None;
+    for attr in attrs {
+        let Some(value) = attr.get("hash_algorithm") else {
+            continue;
+        };
+        let name = value
+            .as_str()
+            .ok_or_else(|| anyhow!("invoice hash algorithm is not a string"))?;
+        let algorithm = HashAlgorithm::parse(name)?;
+        if found.is_some_and(|previous| previous != algorithm) {
+            bail!("invoice has conflicting hash algorithms");
+        }
+        found = Some(algorithm);
+    }
+    Ok(found.unwrap_or(HashAlgorithm::CkbHash))
+}
+
 fn same_hash(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
@@ -198,5 +244,45 @@ mod tests {
             Some(100_000_000)
         );
         assert!(same_hash("0xAbC", "0xabc"));
+    }
+
+    #[test]
+    fn a_missing_hash_algorithm_is_ckb_hash() {
+        let omitted = json!({
+            "currency": "Fibt",
+            "data": {
+                "payment_hash": "0xabc",
+                "attrs": [{ "description": "buyer" }]
+            }
+        });
+        assert_eq!(
+            hash_algorithm_from_invoice(&omitted).unwrap(),
+            HashAlgorithm::CkbHash
+        );
+        let explicit = json!({
+            "data": {
+                "payment_hash": "0xabc",
+                "attrs": [{ "hash_algorithm": "sha256" }]
+            }
+        });
+        assert_eq!(
+            hash_algorithm_from_invoice(&explicit).unwrap(),
+            HashAlgorithm::Sha256
+        );
+        let unknown = json!({
+            "data": {
+                "attrs": [{ "hash_algorithm": "blake2b" }]
+            }
+        });
+        assert!(hash_algorithm_from_invoice(&unknown).is_err());
+        let conflict = json!({
+            "data": {
+                "attrs": [
+                    { "hash_algorithm": "ckb_hash" },
+                    { "hash_algorithm": "sha256" }
+                ]
+            }
+        });
+        assert!(hash_algorithm_from_invoice(&conflict).is_err());
     }
 }
