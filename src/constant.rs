@@ -1,7 +1,7 @@
 /// 1 CKB = 100_000_000 shannons.
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
-/// Fiber accepts 16 to 48 hours. A received hold cannot be canceled.
+/// Hold invoice `final_expiry_delta`. Fiber accepts 160 minutes through 14 days.
 pub const HOLD_HOURS: u64 = 36;
 
 pub const fn hold_secs(hours: u64) -> u64 {
@@ -13,8 +13,29 @@ pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 /// How long an unpaid hold invoice stays open for the seller to lock.
 pub const INVOICE_EXPIRY_SECS: u64 = 60 * 60;
 
-/// Do not start a payout this close to the Fiber timelock.
-pub const SAFETY_SECS: u64 = 30 * 60;
+/// Release `MILLI_SECONDS_PER_EPOCH`. Debug builds use 2 seconds.
+pub const FIBER_MILLIS_PER_EPOCH: u64 = 4 * 60 * 60 * 1000;
+
+/// Two thirds of one commitment-delay epoch. Release `MIN_TLC_EXPIRY_DELTA`.
+pub const FIBER_TLC_EXPIRY_DELAY_MS: u64 = FIBER_MILLIS_PER_EPOCH * 2 / 3;
+
+/// Release `CHECK_CHANNELS_INTERVAL`. Added to the delay before Fiber drops a TLC.
+pub const FIBER_CHECK_CHANNELS_MS: u64 = 60 * 1000;
+
+/// Incoming TLC stays claimable until `expiry - this`.
+pub const CLAIM_MARGIN_MS: u64 = FIBER_TLC_EXPIRY_DELAY_MS + FIBER_CHECK_CHANNELS_MS;
+
+/// `DEFAULT_TLC_EXPIRY_DELTA`. Fiber adds at least this to every hop.
+pub const FIBER_RANDOM_EXPIRY_RESERVE_MS: u64 = 4 * 60 * 60 * 1000;
+
+/// `DEFAULT_FINAL_TLC_EXPIRY_DELTA` when the invoice omits the attribute.
+pub const DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// `MAX_PAYMENT_TLC_EXPIRY_LIMIT`.
+pub const MAX_TLC_EXPIRY_LIMIT_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+/// Shortest `tlc_expiry_limit` Fiber accepts.
+pub const MIN_TLC_EXPIRY_LIMIT_MS: u64 = FIBER_TLC_EXPIRY_DELAY_MS;
 
 /// Per-thousand routing-fee cap on `send_payment`. Fiber's default is 5.
 pub const MAX_FEE_RATE: u64 = 5;

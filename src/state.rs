@@ -1,4 +1,3 @@
-use crate::constant::SAFETY_SECS;
 use crate::types::{Actor, Decision, InvoiceStatus, Phase};
 
 /// The poster owns the order. Only they can cancel it before someone takes it.
@@ -25,20 +24,13 @@ pub fn trade_actor(seller: &str, buyer: &str, solver: Option<&str>, sender: &str
     }
 }
 
-/// Last moment a payout or a buyer-wins resolution may start.
-/// After that the Fiber hold is too close to expiry, so the seller is refunded.
-pub fn action_deadline(received_at: i64, hold_secs: u64) -> i64 {
-    received_at + hold_secs as i64 - SAFETY_SECS as i64
-}
-
-pub fn apply_clock(phase: Phase, now: i64, received_at: Option<i64>, hold_secs: u64) -> Decision {
-    let Some(received_at) = received_at else {
+pub fn apply_clock(phase: Phase, now: i64, deadline: Option<i64>) -> Decision {
+    let Some(deadline) = deadline else {
         return Decision::NoOp;
     };
-    let action_end = action_deadline(received_at, hold_secs);
     match phase {
         Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed
-            if now >= action_end =>
+            if now >= deadline =>
         {
             Decision::Ok(Phase::Refunding)
         }
@@ -351,35 +343,61 @@ mod tests {
 
     #[test]
     fn hold_deadline_refunds_without_settling() {
-        let received = 1_000;
-        let hold = 36 * 3_600;
-        let deadline = action_deadline(received, hold);
+        let expires_at_ms = 50_000_000_000;
+        let deadline = crate::payout_deadline_secs(expires_at_ms);
         assert_eq!(
-            apply_clock(Phase::WaitingFiat, deadline - 1, Some(received), hold),
+            apply_clock(Phase::WaitingFiat, deadline - 1, Some(deadline)),
             Decision::NoOp
         );
         assert_eq!(
-            apply_clock(Phase::WaitingFiat, deadline, Some(received), hold),
+            apply_clock(Phase::WaitingFiat, deadline, Some(deadline)),
             Decision::Ok(Phase::Refunding)
         );
         assert_eq!(
-            apply_clock(Phase::Disputed, deadline - 1, Some(received), hold),
+            apply_clock(Phase::Disputed, deadline, Some(deadline)),
+            Decision::Ok(Phase::Refunding)
+        );
+        assert_eq!(
+            apply_clock(Phase::AwaitingInvoice, deadline, Some(deadline)),
+            Decision::Ok(Phase::Refunding)
+        );
+        assert_eq!(
+            apply_clock(Phase::WaitingFiat, deadline, None),
             Decision::NoOp
         );
+        assert!(deadline < expires_at_ms / 1000);
+    }
+
+    #[test]
+    fn outgoing_budget_ends_before_fiber_drops_the_incoming_tlc() {
+        let now_ms = 1_000_000_000_000;
+        let expires_at_ms = now_ms + 36 * 3_600 * 1000;
+        let crate::PayoutBudget::Send {
+            tlc_expiry_limit_ms,
+        } = crate::payout_budget(expires_at_ms, now_ms, 24 * 3_600 * 1000)
+        else {
+            panic!("a 36 hour hold fits a 24 hour final hop");
+        };
+        assert!(
+            now_ms + tlc_expiry_limit_ms as i64 + crate::CLAIM_MARGIN_MS as i64 <= expires_at_ms
+        );
+        let late = expires_at_ms - crate::CLAIM_MARGIN_MS as i64 - 60_000;
         assert_eq!(
-            apply_clock(Phase::Disputed, deadline, Some(received), hold),
-            Decision::Ok(Phase::Refunding)
+            crate::payout_budget(expires_at_ms, late, crate::MIN_TLC_EXPIRY_LIMIT_MS),
+            crate::PayoutBudget::Refund
+        );
+        let mid = now_ms + 20 * 3_600 * 1000;
+        assert_eq!(
+            crate::payout_budget(expires_at_ms, mid, 24 * 3_600 * 1000),
+            crate::PayoutBudget::ShorterInvoice
         );
         assert_eq!(
-            apply_clock(Phase::AwaitingInvoice, deadline, Some(received), hold),
-            Decision::Ok(Phase::Refunding)
-        );
-        let short = 16 * 3_600;
-        let short_deadline = action_deadline(received, short);
-        assert!(short_deadline < deadline);
-        assert_eq!(
-            apply_clock(Phase::Disputed, short_deadline, Some(received), short),
-            Decision::Ok(Phase::Refunding)
+            crate::payout_budget(
+                expires_at_ms,
+                expires_at_ms + 1,
+                crate::MIN_TLC_EXPIRY_LIMIT_MS
+            ),
+            crate::PayoutBudget::Refund
         );
     }
 

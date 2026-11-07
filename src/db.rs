@@ -8,7 +8,8 @@ use std::sync::Mutex;
 
 const TRADE_COLUMNS: &str = "id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber, \
      fiat_amount, shannons, state, hold_payment_hash, hold_invoice, payout_invoice, \
-     payout_payment_hash, hold_received_at, hold_created_at, buyer_fiber_addr";
+     payout_payment_hash, hold_received_at, hold_created_at, buyer_fiber_addr, \
+     hold_expires_at_ms";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -80,6 +81,7 @@ impl Db {
                 hold_received_at INTEGER,
                 hold_created_at INTEGER,
                 buyer_fiber_addr TEXT,
+                hold_expires_at_ms INTEGER,
                 FOREIGN KEY(order_id) REFERENCES orders(id)
             );
             CREATE TABLE IF NOT EXISTS preimages (
@@ -98,6 +100,10 @@ impl Db {
         )?;
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN hold_created_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN buyer_fiber_addr TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE trades ADD COLUMN hold_expires_at_ms INTEGER",
+            [],
+        );
         let _ = conn.execute("DROP TABLE IF EXISTS payment_methods", []);
         let _ = conn.execute("DROP TABLE IF EXISTS supported_payment_methods", []);
         for column in [
@@ -218,8 +224,8 @@ impl Db {
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
                 payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
-                buyer_fiber_addr
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                buyer_fiber_addr, hold_expires_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 trade.id,
                 trade.order_id,
@@ -237,6 +243,7 @@ impl Db {
                 trade.hold_received_at,
                 trade.hold_created_at,
                 trade.buyer_fiber_addr,
+                trade.hold_expires_at_ms,
             ],
         )?;
         tx.commit()?;
@@ -322,8 +329,8 @@ impl Db {
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
                 payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
-                buyer_fiber_addr
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                buyer_fiber_addr, hold_expires_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 trade.id,
                 trade.order_id,
@@ -341,6 +348,7 @@ impl Db {
                 trade.hold_received_at,
                 trade.hold_created_at,
                 trade.buyer_fiber_addr,
+                trade.hold_expires_at_ms,
             ],
         )?;
         Ok(())
@@ -393,11 +401,26 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_hold_received(&self, id: &str, state: &str, at: i64) -> Result<()> {
+    pub fn set_hold_expires_at_ms(&self, id: &str, expires_at_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        conn.execute(
+            "UPDATE trades SET hold_expires_at_ms = ?1 WHERE id = ?2",
+            params![expires_at_ms, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_hold_received(
+        &self,
+        id: &str,
+        state: &str,
+        at: i64,
+        expires_at_ms: Option<i64>,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         let updated = conn.execute(
-            "UPDATE trades SET state = ?1, hold_received_at = ?2 WHERE id = ?3",
-            params![state, at, id],
+            "UPDATE trades SET state = ?1, hold_received_at = ?2, hold_expires_at_ms = ?3 WHERE id = ?4",
+            params![state, at, expires_at_ms, id],
         )?;
         if updated != 1 {
             bail!("trade {id} not found");
@@ -675,6 +698,7 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         hold_received_at: row.get(13)?,
         hold_created_at: row.get(14)?,
         buyer_fiber_addr: row.get(15)?,
+        hold_expires_at_ms: row.get(16)?,
     })
 }
 
@@ -717,6 +741,7 @@ mod tests {
             hold_received_at: None,
             hold_created_at: None,
             buyer_fiber_addr: None,
+            hold_expires_at_ms: None,
         }
     }
 

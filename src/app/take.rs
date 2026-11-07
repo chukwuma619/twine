@@ -71,6 +71,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         hold_received_at: None,
         hold_created_at: Some(created_at),
         buyer_fiber_addr: None,
+        hold_expires_at_ms: None,
     };
     if let Err(error) = engine.db.commit_take(&trade) {
         return Ok(vec![cant_do(sender, None, &error.to_string())]);

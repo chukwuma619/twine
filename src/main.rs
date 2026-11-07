@@ -108,8 +108,7 @@ async fn main() -> Result<()> {
                     }
                     warn!("action subscription closed; re-issuing");
                     let _ = client.unsubscribe(&action_subscription_id()).await;
-                    if let Err(error) =
-                        ensure_action_subscription(&client, keys.public_key()).await
+                    if let Err(error) = ensure_action_subscription(&client, keys.public_key()).await
                     {
                         warn!(%error, "action subscription failed; will retry");
                     }

@@ -5,7 +5,7 @@ mod watchtower;
 
 pub use invoice::InvoiceRpc;
 pub use node::{FiberNodeInfo, NodeRpc};
-pub use payment::{PaymentRpc, payment_route_failed, route_not_ready};
+pub use payment::{PaymentRpc, payment_expiry_limited, payment_route_failed, route_not_ready};
 pub use watchtower::WatchtowerRpc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -63,6 +63,7 @@ pub struct ParsedInvoice {
     pub currency: String,
     pub amount: Option<u128>,
     pub hash_algorithm: HashAlgorithm,
+    pub final_tlc_expiry_delta_ms: u64,
 }
 
 pub trait FiberRpc: InvoiceRpc + WatchtowerRpc + PaymentRpc + NodeRpc {
@@ -162,6 +163,35 @@ fn payment_hash_from_invoice(invoice: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("invoice is missing payment_hash"))
+}
+
+pub(crate) fn final_tlc_expiry_delta_ms(invoice: &Value) -> Result<u64> {
+    let Some(attrs) = invoice.pointer("/data/attrs").and_then(Value::as_array) else {
+        return Ok(crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS);
+    };
+    let mut found = None;
+    for attr in attrs {
+        let Some(value) = attr.get("final_htlc_minimum_expiry_delta") else {
+            continue;
+        };
+        let delta = hex_u64_value(value).context("invoice final tlc expiry delta")?;
+        if found.is_some_and(|previous| previous != delta) {
+            bail!("invoice has conflicting final tlc expiry deltas");
+        }
+        found = Some(delta);
+    }
+    Ok(found.unwrap_or(crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS))
+}
+
+fn hex_u64_value(value: &Value) -> Result<u64> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow!("integer is not a hex string"))?;
+    let digits = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    u64::from_str_radix(digits, 16).context("hex integer")
 }
 
 pub(crate) fn hash_algorithm_from_invoice(invoice: &Value) -> Result<HashAlgorithm> {
@@ -284,5 +314,22 @@ mod tests {
             }
         });
         assert!(hash_algorithm_from_invoice(&conflict).is_err());
+    }
+
+    #[test]
+    fn a_missing_final_delta_uses_fibers_one_day_default() {
+        let omitted = json!({
+            "data": { "attrs": [{ "description": "buyer" }] }
+        });
+        assert_eq!(
+            final_tlc_expiry_delta_ms(&omitted).unwrap(),
+            crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS
+        );
+        let set = json!({
+            "data": {
+                "attrs": [{ "final_htlc_minimum_expiry_delta": "0x36ee80" }]
+            }
+        });
+        assert_eq!(final_tlc_expiry_delta_ms(&set).unwrap(), 3_600_000);
     }
 }

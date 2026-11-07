@@ -1,8 +1,8 @@
 use crate::constant::{
-    CANCEL, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER, PAYOUT_INVOICE, RELEASE,
-    RESOLVE, SAFETY_SECS, TAKE,
+    CANCEL, CLAIM_MARGIN_MS, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER,
+    PAYOUT_INVOICE, RELEASE, RESOLVE, TAKE,
 };
-use crate::util::shannons_to_ckb_string;
+use crate::util::{payout_deadline_secs, shannons_to_ckb_string};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -378,19 +378,14 @@ pub struct WaitingFiatPayload {
 }
 
 impl WaitingFiatPayload {
-    pub fn from_trade(
-        trade: &Trade,
-        fiat_currency: &str,
-        hold_secs: u64,
-        received_at: i64,
-    ) -> Self {
+    pub fn from_trade(trade: &Trade, fiat_currency: &str, hold_secs: u64) -> Self {
         Self {
             fiat_amount: trade.fiat_amount.clone(),
             fiat_currency: fiat_currency.to_string(),
             reference: trade.id.clone(),
             seller_nostr: trade.seller_nostr.clone(),
             buyer_nostr: trade.buyer_nostr.clone(),
-            pay_by: Some(received_at + hold_secs as i64 - SAFETY_SECS as i64),
+            pay_by: trade.pay_by(),
             release_by: trade.release_by(hold_secs),
         }
     }
@@ -443,7 +438,7 @@ impl TradeSnapshot {
             payout_invoice: trade.payout_invoice.clone(),
             lock_by: trade.lock_by(),
             hold_ends_at: trade.hold_ends_at(hold_secs),
-            pay_by: trade.pay_by(hold_secs),
+            pay_by: trade.pay_by(),
             release_by: trade.release_by(hold_secs),
         }
     }
@@ -508,6 +503,8 @@ pub struct Trade {
     pub hold_received_at: Option<i64>,
     pub hold_created_at: Option<i64>,
     pub buyer_fiber_addr: Option<String>,
+    /// Inbound TLC expiry in milliseconds.
+    pub hold_expires_at_ms: Option<i64>,
 }
 
 impl Trade {
@@ -520,19 +517,23 @@ impl Trade {
             .map(|at| at + INVOICE_EXPIRY_SECS as i64)
     }
 
+    /// TLC expiry once locked. Before that, the invoice's requested hold.
     pub fn hold_ends_at(&self, hold_secs: u64) -> Option<i64> {
+        if let Some(expires_at_ms) = self.hold_expires_at_ms {
+            return Some(expires_at_ms / 1000);
+        }
         self.hold_created_at.map(|at| at + hold_secs as i64)
     }
 
-    /// Same instant as [crate::action_deadline]: the buyer marks fiat sent before this.
-    pub fn pay_by(&self, hold_secs: u64) -> Option<i64> {
-        self.hold_received_at
-            .map(|at| at + hold_secs as i64 - SAFETY_SECS as i64)
+    pub fn pay_by(&self) -> Option<i64> {
+        self.hold_expires_at_ms.map(payout_deadline_secs)
     }
 
     pub fn release_by(&self, hold_secs: u64) -> Option<i64> {
-        self.hold_ends_at(hold_secs)
-            .map(|at| at - SAFETY_SECS as i64)
+        self.pay_by().or_else(|| {
+            self.hold_ends_at(hold_secs)
+                .map(|at| at - (CLAIM_MARGIN_MS / 1000) as i64)
+        })
     }
 }
 

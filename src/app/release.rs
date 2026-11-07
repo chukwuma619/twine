@@ -15,8 +15,7 @@ pub(crate) async fn on_release<F: FiberRpc + 'static>(
     let Some(trade) = engine.db.get_trade(&trade_id)? else {
         return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
     };
-    let order = engine.require_order(&trade.order_id)?;
-    if let Some(outbound) = engine.refund_due_outbound(&order, &trade).await? {
+    if let Some(outbound) = engine.refund_due_outbound(&trade).await? {
         return Ok(outbound);
     }
     let actor = engine.trade_actor(&trade, sender);

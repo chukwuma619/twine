@@ -12,6 +12,46 @@ pub fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+pub fn unix_now_ms() -> i64 {
+    unix_now() * 1000
+}
+
+/// Last second a payout can still start before Fiber drops the incoming TLC.
+pub fn payout_deadline_secs(expires_at_ms: i64) -> i64 {
+    let shortest = (crate::MIN_TLC_EXPIRY_LIMIT_MS + crate::FIBER_RANDOM_EXPIRY_RESERVE_MS) as i64;
+    expires_at_ms
+        .saturating_sub(crate::CLAIM_MARGIN_MS as i64)
+        .saturating_sub(shortest)
+        / 1000
+}
+
+/// `tlc_expiry_limit` for this invoice, or a shorter invoice, or a refund.
+pub fn payout_budget(expires_at_ms: i64, now_ms: i64, final_delta_ms: u64) -> PayoutBudget {
+    let budget = expires_at_ms
+        .saturating_sub(crate::CLAIM_MARGIN_MS as i64)
+        .saturating_sub(now_ms);
+    let budget = u64::try_from(budget).unwrap_or(0);
+    let needed = final_delta_ms.saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS);
+    let shortest =
+        crate::MIN_TLC_EXPIRY_LIMIT_MS.saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS);
+    if budget >= needed {
+        PayoutBudget::Send {
+            tlc_expiry_limit_ms: budget.min(crate::MAX_TLC_EXPIRY_LIMIT_MS),
+        }
+    } else if budget >= shortest {
+        PayoutBudget::ShorterInvoice
+    } else {
+        PayoutBudget::Refund
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayoutBudget {
+    Send { tlc_expiry_limit_ms: u64 },
+    ShorterInvoice,
+    Refund,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AmountError {
     #[error("{0}")]

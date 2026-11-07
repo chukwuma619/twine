@@ -6,19 +6,20 @@ use serde_json::json;
 
 #[async_trait]
 pub trait PaymentRpc: Send + Sync {
-    async fn send_payment(&self, invoice: &str) -> Result<PaymentInfo>;
+    async fn send_payment(&self, invoice: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo>;
     async fn get_payment(&self, payment_hash: &str) -> Result<PaymentInfo>;
 }
 
 #[async_trait]
 impl PaymentRpc for HttpFiber {
-    async fn send_payment(&self, invoice: &str) -> Result<PaymentInfo> {
+    async fn send_payment(&self, invoice: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo> {
         let result = self
             .call(
                 "send_payment",
                 Some(json!({
                     "invoice": invoice,
                     "max_fee_rate": hex_u64(MAX_FEE_RATE),
+                    "tlc_expiry_limit": hex_u64(tlc_expiry_limit_ms),
                 })),
             )
             .await?;
@@ -67,7 +68,14 @@ pub fn payment_route_failed(failed_error: Option<&str>) -> bool {
     failed_error.is_some_and(route_failure_text)
 }
 
+pub fn payment_expiry_limited(failed_error: Option<&str>) -> bool {
+    failed_error.is_some_and(|error| error.to_ascii_lowercase().contains("tlc_expiry_limit"))
+}
+
 fn route_failure_text(error: &str) -> bool {
+    if payment_expiry_limited(Some(error)) {
+        return false;
+    }
     let text = error.to_ascii_lowercase();
     text.contains("failed to build route")
         || text.contains("no route")
@@ -121,5 +129,11 @@ mod tests {
         )));
         assert!(!payment_route_failed(Some("invoice expired")));
         assert!(!payment_route_failed(None));
+        assert!(!payment_route_failed(Some(
+            "Failed to build route, payment hop expiry 10 exceeds tlc_expiry_limit 9"
+        )));
+        assert!(payment_expiry_limited(Some(
+            "tlc_expiry_limit is too small, final_tlc_expiry_delta: 1, tlc_expiry_limit: 0"
+        )));
     }
 }

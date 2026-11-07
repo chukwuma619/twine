@@ -165,6 +165,7 @@ impl InvoiceRpc for HttpFiber {
                 .to_string(),
             amount: super::hex_amount(invoice.get("amount"))?,
             hash_algorithm: super::hash_algorithm_from_invoice(invoice)?,
+            final_tlc_expiry_delta_ms: super::final_tlc_expiry_delta_ms(invoice)?,
         })
     }
 }
