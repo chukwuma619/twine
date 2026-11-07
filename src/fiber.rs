@@ -5,7 +5,10 @@ mod watchtower;
 
 pub use invoice::InvoiceRpc;
 pub use node::{FiberNodeInfo, NodeRpc};
-pub use payment::{PaymentRpc, payment_expiry_limited, payment_route_failed, route_not_ready};
+pub use payment::{
+    PaymentRpc, payment_expiry_limited, payment_invoice_expired, payment_route_failed,
+    route_not_ready,
+};
 pub use watchtower::WatchtowerRpc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -64,6 +67,7 @@ pub struct ParsedInvoice {
     pub amount: Option<u128>,
     pub hash_algorithm: HashAlgorithm,
     pub final_tlc_expiry_delta_ms: u64,
+    pub expires_at_ms: Option<i64>,
 }
 
 pub trait FiberRpc: InvoiceRpc + WatchtowerRpc + PaymentRpc + NodeRpc {
@@ -181,6 +185,43 @@ pub(crate) fn final_tlc_expiry_delta_ms(invoice: &Value) -> Result<u64> {
         found = Some(delta);
     }
     Ok(found.unwrap_or(crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS))
+}
+
+pub(crate) fn invoice_expires_at_ms(invoice: &Value) -> Result<Option<i64>> {
+    let Some(secs) = expiry_time_secs(invoice)? else {
+        return Ok(None);
+    };
+    let timestamp_ms = invoice_timestamp_ms(invoice)?;
+    let extra_ms = i64::try_from(secs)
+        .ok()
+        .and_then(|secs| secs.checked_mul(1_000))
+        .ok_or_else(|| anyhow!("invoice expiry is too large"))?;
+    Ok(Some(timestamp_ms.saturating_add(extra_ms)))
+}
+
+fn expiry_time_secs(invoice: &Value) -> Result<Option<u64>> {
+    let Some(attrs) = invoice.pointer("/data/attrs").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for attr in attrs {
+        let Some(value) = attr.get("expiry_time") else {
+            continue;
+        };
+        let secs = hex_u64_value(value).context("invoice expiry")?;
+        if found.is_some_and(|previous| previous != secs) {
+            bail!("invoice has conflicting expiry times");
+        }
+        found = Some(secs);
+    }
+    Ok(found)
+}
+
+fn invoice_timestamp_ms(invoice: &Value) -> Result<i64> {
+    let value = invoice
+        .pointer("/data/timestamp")
+        .ok_or_else(|| anyhow!("invoice expiry is missing a timestamp"))?;
+    i64::try_from(hex_u64_value(value)?).context("invoice timestamp")
 }
 
 fn hex_u64_value(value: &Value) -> Result<u64> {
@@ -331,5 +372,37 @@ mod tests {
             }
         });
         assert_eq!(final_tlc_expiry_delta_ms(&set).unwrap(), 3_600_000);
+    }
+
+    #[test]
+    fn an_invoice_without_expiry_does_not_expire() {
+        let open = json!({
+            "data": {
+                "timestamp": "0x5",
+                "attrs": [{ "description": "buyer" }]
+            }
+        });
+        assert_eq!(invoice_expires_at_ms(&open).unwrap(), None);
+        let set = json!({
+            "data": {
+                "timestamp": "0x5",
+                "attrs": [{ "expiry_time": "0xe10" }]
+            }
+        });
+        assert_eq!(invoice_expires_at_ms(&set).unwrap(), Some(5 + 3_600_000));
+        let missing_timestamp = json!({
+            "data": { "attrs": [{ "expiry_time": "0xe10" }] }
+        });
+        assert!(invoice_expires_at_ms(&missing_timestamp).is_err());
+        let conflict = json!({
+            "data": {
+                "timestamp": "0x5",
+                "attrs": [
+                    { "expiry_time": "0xe10" },
+                    { "expiry_time": "0x1" }
+                ]
+            }
+        });
+        assert!(invoice_expires_at_ms(&conflict).is_err());
     }
 }

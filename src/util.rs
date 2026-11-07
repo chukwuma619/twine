@@ -25,6 +25,25 @@ pub fn payout_deadline_secs(expires_at_ms: i64) -> i64 {
         / 1000
 }
 
+/// Seconds a payout invoice must still be payable when the hold is created.
+pub fn payout_invoice_must_last_secs(hold_secs: u64) -> u64 {
+    let slack_secs = (crate::CLAIM_MARGIN_MS
+        + crate::MIN_TLC_EXPIRY_LIMIT_MS
+        + crate::FIBER_RANDOM_EXPIRY_RESERVE_MS)
+        / 1000;
+    crate::INVOICE_EXPIRY_SECS
+        .saturating_add(hold_secs)
+        .saturating_sub(slack_secs)
+}
+
+/// No expiry stays payable. Fiber still accepts an invoice at the exact expiry instant.
+pub fn invoice_payable_through(expires_at_ms: Option<i64>, until_ms: i64) -> bool {
+    match expires_at_ms {
+        None => true,
+        Some(expires_at_ms) => expires_at_ms >= until_ms,
+    }
+}
+
 /// `tlc_expiry_limit` for this invoice, or a shorter invoice, or a refund.
 pub fn payout_budget(expires_at_ms: i64, now_ms: i64, final_delta_ms: u64) -> PayoutBudget {
     let budget = expires_at_ms
@@ -226,6 +245,18 @@ pub fn i64_from_shannons(value: u128) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_payout_invoice_has_to_outlast_the_hold() {
+        let must_last = payout_invoice_must_last_secs(crate::HOLD_SECS);
+        assert!(must_last > 24 * 3_600);
+        assert!(must_last < crate::HOLD_SECS);
+        let now = 1_000_000_i64;
+        let until = now + i64::try_from(must_last).unwrap() * 1000;
+        assert!(invoice_payable_through(None, until));
+        assert!(invoice_payable_through(Some(until), until));
+        assert!(!invoice_payable_through(Some(until - 1), until));
+    }
 
     #[test]
     fn fiber_addr_is_a_multiaddr() {

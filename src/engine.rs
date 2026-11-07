@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::fiber::{
-    FiberRpc, HashAlgorithm, ParsedInvoice, payment_expiry_limited, payment_route_failed,
-    route_not_ready,
+    FiberRpc, HashAlgorithm, ParsedInvoice, payment_expiry_limited, payment_invoice_expired,
+    payment_route_failed, route_not_ready,
 };
 use crate::nostr::publish_outbounds;
 use crate::types::{Order, Trade};
@@ -10,7 +10,8 @@ use crate::{
     FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound,
     PAY_INVOICE, PayInvoicePayload, PayoutBudget, Phase, REFUNDING, SETTLED, WAITING_FIAT,
     WaitingFiatPayload, apply_clock, apply_expired, apply_hold_received, apply_release_failed,
-    apply_release_succeeded, payout_budget, trade_actor, unix_now, unix_now_ms,
+    apply_release_succeeded, invoice_payable_through, payout_budget, payout_invoice_must_last_secs,
+    trade_actor, unix_now, unix_now_ms,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
@@ -312,13 +313,28 @@ impl<F: FiberRpc + 'static> Engine<F> {
     }
 
     pub(crate) async fn begin_refund(&self, trade: &Trade) -> Result<Vec<Outbound>> {
+        self.refund_for(trade, None).await
+    }
+
+    async fn refund_for(&self, trade: &Trade, reason: Option<&str>) -> Result<Vec<Outbound>> {
         self.db
             .set_trade_state(&trade.id, Phase::Refunding.as_str())?;
         self.drop_preimage(trade).await?;
-        Ok(party_replies(
-            trade,
-            Envelope::new(REFUNDING).with_trade(&trade.id),
-        ))
+        let mut envelope = Envelope::new(REFUNDING).with_trade(&trade.id);
+        if let Some(reason) = reason {
+            envelope = envelope.with_payload(NewInvoicePayload {
+                reason: reason.to_string(),
+            })?;
+        }
+        Ok(party_replies(trade, envelope))
+    }
+
+    async fn refund_expired_invoice(&self, trade: &Trade) -> Result<Vec<Outbound>> {
+        warn!(
+            trade_id = %trade.id,
+            "payout invoice expired; refunding the seller"
+        );
+        self.refund_for(trade, Some(PAYOUT_INVOICE_EXPIRED)).await
     }
 
     pub(crate) async fn expire_waiting_invoice(&self, trade: &Trade) -> Result<Vec<Outbound>> {
@@ -352,6 +368,14 @@ impl<F: FiberRpc + 'static> Engine<F> {
             return Ok(Err("this payout hash was already used".into()));
         }
         let order = self.require_order(&trade.order_id)?;
+        let must_last = payout_invoice_must_last_secs(order.hold_secs);
+        let until_ms = unix_now_ms().saturating_add(must_last as i64 * 1_000);
+        if !invoice_payable_through(parsed.expires_at_ms, until_ms) {
+            let hours = must_last.div_ceil(3_600);
+            return Ok(Err(format!(
+                "payout invoice expires before the hold can be paid. It has to stay payable for {hours} hours, or have no expiry"
+            )));
+        }
         let created = match self
             .fiber
             .new_hold_invoice(
@@ -416,6 +440,13 @@ impl<F: FiberRpc + 'static> Engine<F> {
         }
         if let Err(reason) = payout_invoice_ok(&parsed, self.fiber.currency(), trade.shannons) {
             return Ok(Err(reason.into()));
+        }
+        let until_ms = trade
+            .pay_by()
+            .map(|secs| secs.saturating_mul(1000))
+            .unwrap_or_else(unix_now_ms);
+        if !invoice_payable_through(parsed.expires_at_ms, until_ms) {
+            return Ok(Err("this invoice expires before the payout window".into()));
         }
         Ok(Ok(()))
     }
@@ -494,6 +525,12 @@ impl<F: FiberRpc + 'static> Engine<F> {
             if let Err(reason) = payout_invoice_ok(&parsed, self.fiber.currency(), trade.shannons) {
                 return self.fail_payout(&trade, reason);
             }
+            if parsed
+                .expires_at_ms
+                .is_some_and(|expires| expires < unix_now_ms())
+            {
+                return self.refund_expired_invoice(&trade).await;
+            }
             // Record the hash before send_payment. A crash then resumes with get_payment
             // instead of paying the buyer twice.
             self.db.set_payout(&trade.id, &invoice, Some(&hold_hash))?;
@@ -520,6 +557,12 @@ impl<F: FiberRpc + 'static> Engine<F> {
             Err(error) => Err(error),
             Ok(payment) if payment.status == "Failed" && payout_window_closed(&trade) => {
                 self.refund_past_deadline(&trade).await
+            }
+            Ok(payment)
+                if payment.status == "Failed"
+                    && payment_invoice_expired(payment.failed_error.as_deref()) =>
+            {
+                self.refund_expired_invoice(&trade).await
             }
             // Hop expiry past tlc_expiry_limit. Retry while the hold can still fit a route.
             Ok(payment)
@@ -582,11 +625,14 @@ impl<F: FiberRpc + 'static> Engine<F> {
     }
 
     async fn send_recorded_payout(&self, trade: &Trade, invoice: &str) -> Result<Vec<Outbound>> {
-        let final_delta_ms = self
-            .fiber
-            .parse_invoice(invoice)
-            .await?
-            .final_tlc_expiry_delta_ms;
+        let parsed = self.fiber.parse_invoice(invoice).await?;
+        if parsed
+            .expires_at_ms
+            .is_some_and(|expires| expires < unix_now_ms())
+        {
+            return self.refund_expired_invoice(trade).await;
+        }
+        let final_delta_ms = parsed.final_tlc_expiry_delta_ms;
         let budget = self.outgoing_budget(trade, final_delta_ms).await?;
         let tlc_expiry_limit_ms = match budget {
             PayoutBudget::Refund => return self.refund_past_deadline(trade).await,
@@ -603,6 +649,12 @@ impl<F: FiberRpc + 'static> Engine<F> {
         // A transport error may mean the payment landed. Leave the hash in place
         // and let the next poll read it. Do not fail the payout and do not send again.
         match self.fiber.send_payment(invoice, tlc_expiry_limit_ms).await {
+            Ok(payment)
+                if payment.status == "Failed"
+                    && payment_invoice_expired(payment.failed_error.as_deref()) =>
+            {
+                self.refund_expired_invoice(trade).await
+            }
             Ok(payment)
                 if payment.status == "Failed"
                     && payment_expiry_limited(payment.failed_error.as_deref()) =>
@@ -623,6 +675,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
             Ok(payment) => {
                 self.finish_recorded_payout(trade, &payment.status, payment.preimage)
                     .await
+            }
+            Err(error) if payment_invoice_expired(Some(&error.to_string())) => {
+                self.refund_expired_invoice(trade).await
             }
             Err(error) if payment_expiry_limited(Some(&error.to_string())) => Ok(Vec::new()),
             Err(error) if route_not_ready(&error) => {
@@ -923,6 +978,8 @@ fn payout_window_closed(trade: &Trade) -> bool {
 
 const PAYOUT_NO_ROUTE: &str = "no route to the payout invoice. The wallet has to be able to receive, then send this invoice again";
 
+const PAYOUT_INVOICE_EXPIRED: &str = "the payout invoice expired. The wallet cannot replace that payment hash, so the hold is returning the CKB to the seller";
+
 fn payout_invoice_ok(
     parsed: &ParsedInvoice,
     currency: &str,
@@ -977,6 +1034,7 @@ mod tests {
         inbound_expiry: StdMutex<Option<i64>>,
         last_tlc_expiry_limit: StdMutex<Option<u64>>,
         final_delta_ms: StdMutex<u64>,
+        expires_at_ms: StdMutex<Option<i64>>,
     }
 
     impl FakeFiber {
@@ -1000,6 +1058,7 @@ mod tests {
                 inbound_expiry: StdMutex::new(None),
                 last_tlc_expiry_limit: StdMutex::new(None),
                 final_delta_ms: StdMutex::new(crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS),
+                expires_at_ms: StdMutex::new(None),
             }
         }
     }
@@ -1052,6 +1111,7 @@ mod tests {
                 amount: Some(*self.parsed_amount.lock().expect("amount")),
                 hash_algorithm,
                 final_tlc_expiry_delta_ms: *self.final_delta_ms.lock().expect("final delta"),
+                expires_at_ms: *self.expires_at_ms.lock().expect("expires"),
             })
         }
     }
@@ -1442,6 +1502,7 @@ mod tests {
             amount: Some(10),
             hash_algorithm: HashAlgorithm::CkbHash,
             final_tlc_expiry_delta_ms: crate::MIN_TLC_EXPIRY_LIMIT_MS,
+            expires_at_ms: None,
         };
         assert!(payout_invoice_ok(&invoice, "Fibt", 10).is_ok());
         assert!(payout_invoice_ok(&invoice, "Fibb", 10).is_err());
@@ -1505,6 +1566,28 @@ mod tests {
         );
         let trade = engine.db.get_trade("trade").unwrap().unwrap();
         assert_eq!(trade.hold_payment_hash, before);
+        assert_eq!(trade.state, Phase::WaitingInvoice.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_short_lived_invoice_is_refused_before_the_hold() {
+        let (engine, fiber) = fake_engine("Open");
+        engine
+            .db
+            .set_trade_state("trade", Phase::WaitingInvoice.as_str())
+            .unwrap();
+        *fiber.expires_at_ms.lock().unwrap() = Some(unix_now_ms());
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        let rejected = engine
+            .bind_buyer_hold(&trade, "buyer-invoice")
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(rejected.contains("expires before the hold"));
+        assert!(rejected.contains("no expiry"));
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        assert_eq!(trade.hold_payment_hash.as_deref(), Some("hash"));
+        assert_eq!(trade.hold_invoice.as_deref(), Some("inv"));
         assert_eq!(trade.state, Phase::WaitingInvoice.as_str());
     }
 
@@ -1894,9 +1977,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_payout_that_is_not_a_route_still_asks_for_a_new_invoice() {
+    async fn an_expired_invoice_refunds_instead_of_asking_for_a_replacement() {
         let (engine, fiber) = fake_engine("Received");
         recorded_payout(&engine, &fiber, "Failed", Some("invoice expired"));
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, REFUNDING));
+        assert!(outbound_replies(&outbound).iter().any(|envelope| {
+            envelope.action == REFUNDING
+                && envelope.payload.as_ref().is_some_and(|payload| {
+                    payload["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("expired"))
+                })
+        }));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Refunding.as_str()
+        );
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_invoice_that_expires_before_send_refunds() {
+        let (engine, fiber) = fake_engine("Received");
+        releasing_payout(&engine, &fiber).await;
+        *fiber.expires_at_ms.lock().unwrap() = Some(unix_now_ms() - 1);
+        let outbound = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&outbound, REFUNDING));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Refunding.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_payout_that_is_not_a_route_still_asks_for_a_new_invoice() {
+        let (engine, fiber) = fake_engine("Received");
+        recorded_payout(&engine, &fiber, "Failed", Some("payment hash mismatch"));
         let outbound = engine.on_payout_status("trade").await.unwrap();
         assert!(replies_contain(&outbound, NEW_INVOICE));
         assert_eq!(*fiber.send_count.lock().unwrap(), 0);

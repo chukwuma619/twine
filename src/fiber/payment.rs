@@ -63,9 +63,13 @@ pub fn route_not_ready(error: &anyhow::Error) -> bool {
 }
 
 /// A stored `Failed` payment can be sent again when Fiber had no path.
-/// An expired invoice or a hash mismatch stays a real failure.
+/// An expired invoice refunds the hold. A hash mismatch stays a real failure.
 pub fn payment_route_failed(failed_error: Option<&str>) -> bool {
     failed_error.is_some_and(route_failure_text)
+}
+
+pub fn payment_invoice_expired(failed_error: Option<&str>) -> bool {
+    failed_error.is_some_and(|error| error.to_ascii_lowercase().contains("invoice expired"))
 }
 
 pub fn payment_expiry_limited(failed_error: Option<&str>) -> bool {
@@ -128,6 +132,10 @@ mod tests {
             "Insufficient balance: max outbound liquidity"
         )));
         assert!(!payment_route_failed(Some("invoice expired")));
+        assert!(payment_invoice_expired(Some("invoice expired")));
+        assert!(!payment_invoice_expired(Some(
+            "Build payment route error: PathFind error: no path found"
+        )));
         assert!(!payment_route_failed(None));
         assert!(!payment_route_failed(Some(
             "Failed to build route, payment hop expiry 10 exceeds tlc_expiry_limit 9"

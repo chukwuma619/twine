@@ -16,7 +16,7 @@ Cancel is only possible before the hold is locked. Either party can open a dispu
 
 - Sell posts with a price, a fiat currency, and min and max. Partial takes are allowed, and several trades can be open on one post.
 - Fiber hold invoices last 36 hours. An unpaid hold expires after 1 hour. A payout must start at least 30 minutes before the hold ends.
-- If the buyer's invoice does not route, they send another invoice with the same payment hash.
+- If the buyer's invoice does not route, they paste that same invoice again after the wallet can receive. An invoice with an expiry has to stay payable through the hold. An expired one cannot be replaced, so the hold refunds.
 - Disputes. A party can share the chat key with the solver. The daemon still cannot read the thread.
 - A public order book and the operator's Fiber pubkey and listen addresses on Nostr.
 - SQLite for orders, trades, and processed events. The preimage is removed from the database after settle.
