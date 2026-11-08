@@ -113,10 +113,10 @@ impl Fcm {
         self.account.is_some()
     }
 
-    pub fn message_body(token: &str, wake: &str) -> serde_json::Value {
+    pub fn message_body(fid: &str, wake: &str) -> serde_json::Value {
         serde_json::json!({
             "message": {
-                "token": token,
+                "fid": fid,
                 "data": { "type": wake },
                 "android": { "priority": "HIGH" },
                 "apns": {
@@ -132,9 +132,9 @@ impl Fcm {
         })
     }
 
-    pub async fn send(&self, token: &str, wake: &str) -> FcmOutcome {
+    pub async fn send(&self, fid: &str, wake: &str) -> FcmOutcome {
         let Some(account) = &self.account else {
-            info!(%token, %wake, "skip fcm; FCM_SERVICE_ACCOUNT unset");
+            info!(%fid, %wake, "skip fcm; FCM_SERVICE_ACCOUNT unset");
             return FcmOutcome::Skipped;
         };
         let access = match self.access_token(account).await {
@@ -152,7 +152,7 @@ impl Fcm {
             .http
             .post(url)
             .bearer_auth(access)
-            .json(&Self::message_body(token, wake))
+            .json(&Self::message_body(fid, wake))
             .send()
             .await
         {
@@ -249,9 +249,10 @@ mod tests {
 
     #[test]
     fn doorbell_payload_has_no_notification_body() {
-        let body = Fcm::message_body("device-token", "chat_wake");
+        let body = Fcm::message_body("device-fid", "chat_wake");
         let message = &body["message"];
-        assert_eq!(message["token"], "device-token");
+        assert_eq!(message["fid"], "device-fid");
+        assert!(message.get("token").is_none());
         assert_eq!(message["data"]["type"], "chat_wake");
         assert!(message.get("notification").is_none());
         assert_eq!(message["android"]["priority"], "HIGH");
