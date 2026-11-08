@@ -64,12 +64,7 @@ async fn main() -> Result<()> {
     if let Err(error) = ensure_action_subscription(&client, keys.public_key()).await {
         warn!(%error, "action subscription failed; will retry");
     }
-    spawn_relay_maintenance(
-        client.clone(),
-        keys.clone(),
-        engine.db.clone(),
-        config.solver.clone(),
-    );
+    spawn_relay_maintenance(client.clone(), keys.clone(), engine.clone());
 
     loop {
         let mut notifications = client.notifications();
@@ -101,6 +96,8 @@ async fn main() -> Result<()> {
                         Ok(outbound) => {
                             if let Err(error) = publish_outbounds(&client, &keys, &outbound).await {
                                 warn!(%error, "publish failed");
+                            } else if let Err(error) = engine.note_evidence_delivered(&outbound) {
+                                warn!(%error, "solver evidence was published but not marked delivered");
                             }
                         }
                         Err(error) => warn!(%error, "handle failed"),
@@ -136,7 +133,9 @@ async fn main() -> Result<()> {
 
 const RELAY_MAINTENANCE: Duration = Duration::from_secs(5);
 
-fn spawn_relay_maintenance(client: Client, keys: Keys, db: Arc<Db>, solver: Option<String>) {
+fn spawn_relay_maintenance(client: Client, keys: Keys, engine: Engine<HttpFiber>) {
+    let solver = engine.solver_pubkey().map(str::to_string);
+    let db = engine.db.clone();
     tokio::spawn(async move {
         let mut published_to = BTreeSet::new();
         let mut reported_down = false;
@@ -162,11 +161,27 @@ fn spawn_relay_maintenance(client: Client, keys: Keys, db: Arc<Db>, solver: Opti
             }
             if !up.is_empty() && !up.is_subset(&published_to) {
                 match publish_presence(&client, &keys, &db, solver.as_deref()).await {
-                    Ok(None) => published_to.extend(up),
+                    Ok(None) => published_to.extend(up.clone()),
                     Ok(Some(urls)) => published_to.extend(urls),
                     Err(error) => {
                         warn!(%error, "republish after connect failed; will retry");
                         published_to.clear();
+                    }
+                }
+            }
+            if !up.is_empty() {
+                let outbound = match engine.pending_evidence_outbounds() {
+                    Ok(outbound) => outbound,
+                    Err(error) => {
+                        warn!(%error, "solver evidence lookup failed");
+                        Vec::new()
+                    }
+                };
+                if !outbound.is_empty() {
+                    if let Err(error) = publish_outbounds(&client, &keys, &outbound).await {
+                        warn!(%error, "solver evidence republish failed");
+                    } else if let Err(error) = engine.note_evidence_delivered(&outbound) {
+                        warn!(%error, "solver evidence was published but not marked delivered");
                     }
                 }
             }

@@ -11,6 +11,7 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
+    #[cfg(test)]
     pub fn memory() -> Self {
         Self::default()
     }

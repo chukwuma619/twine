@@ -18,10 +18,10 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         #[cfg(unix)]
         {
@@ -124,6 +124,11 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN outcome TEXT", []);
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN solver_evidence TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE trades ADD COLUMN evidence_pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let _ = conn.execute("DROP TABLE IF EXISTS payment_methods", []);
         let _ = conn.execute("DROP TABLE IF EXISTS supported_payment_methods", []);
         for column in [
@@ -329,7 +334,7 @@ impl Db {
         let open = OrderStatus::Open.as_str();
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&canceled, &id, &open];
         for state in &states {
-            values.push(&*state);
+            values.push(state);
         }
         let conn = self.conn.lock().expect("db");
         let updated = conn.execute(&sql, rusqlite::params_from_iter(values.iter().copied()))?;
@@ -439,15 +444,58 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_chat_key_shared(&self, id: &str) -> Result<()> {
+    pub fn save_solver_evidence(&self, id: &str, evidence: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         let updated = conn.execute(
-            "UPDATE trades SET chat_key_shared = 1 WHERE id = ?1",
-            params![id],
+            "UPDATE trades SET solver_evidence = ?1, chat_key_shared = 1, evidence_pending = 1 WHERE id = ?2",
+            params![evidence, id],
         )?;
         if updated != 1 {
             bail!("trade {id} not found");
         }
+        Ok(())
+    }
+
+    pub fn solver_evidence(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db");
+        let value = conn
+            .query_row(
+                "SELECT solver_evidence FROM trades WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
+    }
+
+    pub fn pending_solver_evidence(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db");
+        let mut stmt = conn.prepare(
+            "SELECT id, solver_evidence FROM trades
+             WHERE evidence_pending = 1 AND solver_evidence IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn evidence_is_pending(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db");
+        let pending: Option<i64> = conn
+            .query_row(
+                "SELECT evidence_pending FROM trades WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(pending == Some(1))
+    }
+
+    pub fn clear_evidence_pending(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        conn.execute(
+            "UPDATE trades SET evidence_pending = 0 WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -731,7 +779,7 @@ fn reserved_shannons_for(conn: &Connection, order_id: &str) -> Result<u128> {
     );
     let mut values: Vec<&dyn rusqlite::ToSql> = vec![&order_id];
     for state in &states {
-        values.push(&*state);
+        values.push(state);
     }
     let total: i64 = conn.query_row(
         &sql,
@@ -747,7 +795,7 @@ fn open_trades_for(conn: &Connection, order_id: &str) -> Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM trades WHERE order_id = ? AND state IN ({marks})");
     let mut values: Vec<&dyn rusqlite::ToSql> = vec![&order_id];
     for state in &states {
-        values.push(&*state);
+        values.push(state);
     }
     let count = conn.query_row(
         &sql,
@@ -878,7 +926,8 @@ mod tests {
         assert!(db.fiber_addresses().unwrap().is_empty());
 
         let multiaddr = "/ip4/203.0.113.10/tcp/8230/p2p/Qmabc".to_string();
-        db.set_fiber_node("02abc", &[multiaddr.clone()]).unwrap();
+        db.set_fiber_node("02abc", std::slice::from_ref(&multiaddr))
+            .unwrap();
         assert_eq!(db.fiber_pubkey().unwrap().as_deref(), Some("02abc"));
         assert_eq!(db.fiber_addresses().unwrap(), vec![multiaddr]);
 
@@ -893,7 +942,7 @@ mod tests {
     fn pinned_address_refresh_cannot_replace_the_pubkey() {
         let db = Db::open_in_memory().unwrap();
         let kept = "/ip4/203.0.113.10/tcp/8230/p2p/Qmabc".to_string();
-        db.set_fiber_node("02abc", &[kept.clone()]).unwrap();
+        db.set_fiber_node("02abc", std::slice::from_ref(&kept)).unwrap();
 
         db.update_pinned_addresses("02def", &["/ip4/198.51.100.2/tcp/8230".into()])
             .unwrap();
@@ -904,7 +953,7 @@ mod tests {
         assert_eq!(db.fiber_addresses().unwrap().len(), 1);
 
         let refreshed = "/ip4/198.51.100.8/tcp/8230/p2p/Qmdef".to_string();
-        db.update_pinned_addresses("02abc", &[refreshed.clone()])
+        db.update_pinned_addresses("02abc", std::slice::from_ref(&refreshed))
             .unwrap();
         assert_eq!(db.fiber_pubkey().unwrap().as_deref(), Some("02abc"));
         assert_eq!(db.fiber_addresses().unwrap(), vec![refreshed]);

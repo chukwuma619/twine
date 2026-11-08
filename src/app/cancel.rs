@@ -72,10 +72,10 @@ async fn cancel_trade<F: FiberRpc + 'static>(
     };
     match apply_cancel(trade.phase()?, actor, invoice_status) {
         crate::Decision::Ok(Phase::Canceled) => {
-            if invoice_status == Some(InvoiceStatus::Open) {
-                if let Some(hash) = trade.hold_payment_hash.as_deref() {
-                    engine.fiber.cancel_invoice(hash).await?;
-                }
+            if invoice_status == Some(InvoiceStatus::Open)
+                && let Some(hash) = trade.hold_payment_hash.as_deref()
+            {
+                engine.fiber.cancel_invoice(hash).await?;
             }
             engine.complete_cancel(&order, &trade).await
         }

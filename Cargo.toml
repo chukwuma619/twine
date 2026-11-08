@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-trait = "0.1"
 hex = "0.4"
 nostr = { version = "0.45.5", default-features = false, features = ["std", "nip44", "os-rng"] }

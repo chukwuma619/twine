@@ -35,7 +35,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     }
     match apply_take(Phase::Pending) {
         crate::Decision::Ok(Phase::WaitingHold) => {}
-        crate::Decision::Reject(reason) => return Ok(vec![cant_do(sender, None, &reason)]),
+        crate::Decision::Reject(reason) => return Ok(vec![cant_do(sender, None, reason)]),
         _ => return Ok(vec![cant_do(sender, None, "cannot take this order")]),
     }
     let shannons = match validate_take_amount(&payload, &order) {

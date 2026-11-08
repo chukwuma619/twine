@@ -1,6 +1,16 @@
 use crate::constant::{DEFAULT_DB_PATH, MAINNET_INVOICE_CURRENCY, TESTNET_INVOICE_CURRENCY};
 use anyhow::{Context, Result, bail};
+use nostr_sdk::prelude::PublicKey;
 use std::path::PathBuf;
+
+fn canonical_solver(value: &str) -> Result<Option<String>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let key = PublicKey::parse(trimmed).context("TWINE_SOLVER must be a hex pubkey or npub")?;
+    Ok(Some(key.to_hex()))
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -41,10 +51,10 @@ impl Config {
         let network = std::env::var("FIBER_NETWORK").unwrap_or_else(|_| "testnet".to_string());
         let currency = invoice_currency(network.trim())?.to_string();
         let network = network.trim().to_string();
-        let solver = std::env::var("TWINE_SOLVER")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let solver = match std::env::var("TWINE_SOLVER") {
+            Ok(value) => canonical_solver(&value)?,
+            Err(_) => None,
+        };
         Ok(Self {
             network,
             invoice_currency: currency,
@@ -68,12 +78,30 @@ pub fn invoice_currency(network: &str) -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::invoice_currency;
+    use super::{canonical_solver, invoice_currency};
+    use nostr_sdk::prelude::{Keys, ToBech32};
 
     #[test]
     fn invoice_currency_follows_fiber_network() {
         assert_eq!(invoice_currency("testnet").unwrap(), "Fibt");
         assert_eq!(invoice_currency("mainnet").unwrap(), "Fibb");
         assert!(invoice_currency("devnet").is_err());
+    }
+
+    #[test]
+    fn solver_pubkey_is_canonical_hex() {
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let npub = keys.public_key().to_bech32().unwrap();
+        assert_eq!(
+            canonical_solver(&hex.to_uppercase()).unwrap().as_deref(),
+            Some(hex.as_str())
+        );
+        assert_eq!(
+            canonical_solver(&npub).unwrap().as_deref(),
+            Some(hex.as_str())
+        );
+        assert!(canonical_solver("  ").unwrap().is_none());
+        assert!(canonical_solver("not-a-key").is_err());
     }
 }

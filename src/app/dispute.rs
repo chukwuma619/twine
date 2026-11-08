@@ -3,7 +3,16 @@ use crate::fiber::FiberRpc;
 use crate::types::Outbound;
 use crate::{Actor, DISPUTED, DisputePayload, DisputedPayload, Envelope, apply_dispute};
 use anyhow::Result;
-use serde::Serialize;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+
+const MAX_EVIDENCE: usize = 32;
+const MAX_BLOB_CHARS: usize = 100_000;
+const MIN_NIP44: usize = 1 + 32 + 34 + 32;
+const MAX_NIP44: usize = 80_000;
+
+const SEND_CHAT: &str = "send this trade's chat to the solver. The receipt cannot be read without it, so the solver cannot pay the buyer";
+const INVALID_EVIDENCE: &str = "solver evidence has to be NIP-44 messages addressed to the solver";
 
 pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
     engine: &Engine<F>,
@@ -24,11 +33,15 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
         return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
     };
     let payload: DisputePayload = envelope.decode_payload().unwrap_or_default();
+    let evidence = submitted_evidence(&payload.solver_evidence);
     if trade.phase()? == crate::Phase::Disputed {
-        return attach_chat_key(engine, sender, &trade, &payload).await;
+        return attach_evidence(engine, sender, &trade, evidence).await;
     }
     if let Some(outbound) = engine.refund_due_outbound(&trade).await? {
         return Ok(outbound);
+    }
+    if matches!(evidence, SubmittedEvidence::Invalid) {
+        return Ok(vec![cant_do(sender, Some(trade_id), INVALID_EVIDENCE)]);
     }
     let actor = engine.trade_actor(&trade, sender);
     match apply_dispute(trade.phase()?, actor) {
@@ -46,8 +59,8 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
                 engine.db.set_payout(&trade.id, invoice, None)?;
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
-            if conversation_key(payload.conversation_key.as_deref()).is_some() {
-                engine.db.set_chat_key_shared(&trade.id)?;
+            if let SubmittedEvidence::Ready(blobs) = evidence {
+                save_disclosure(engine, &trade.id, sender, blobs)?;
             }
             engine.watch(&trade.id)?;
             let mut outbound = party_replies(
@@ -58,18 +71,7 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
                         solver: engine.solver.clone(),
                     })?,
             );
-            if let Some(solver) = &engine.solver {
-                let mut envelope = Envelope::new(DISPUTED).with_trade(&trade.id);
-                if let Some(key) = conversation_key(payload.conversation_key.as_deref()) {
-                    envelope = envelope.with_payload(SolverDispute {
-                        conversation_key: key,
-                    })?;
-                }
-                outbound.push(Outbound::Reply {
-                    to: solver.clone(),
-                    envelope,
-                });
-            }
+            outbound.extend(solver_notice(engine, &trade.id)?);
             Ok(outbound)
         }
         crate::Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
@@ -77,12 +79,12 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
     }
 }
 
-/// A dispute is already open. A later message can still hand the solver the chat key.
-async fn attach_chat_key<F: FiberRpc + 'static>(
+/// A dispute is already open. A later message can still seal this trade's chat for the solver.
+async fn attach_evidence<F: FiberRpc + 'static>(
     engine: &Engine<F>,
     sender: &str,
     trade: &crate::Trade,
-    payload: &DisputePayload,
+    evidence: SubmittedEvidence,
 ) -> Result<Vec<Outbound>> {
     let actor = engine.trade_actor(trade, sender);
     if !matches!(actor, Actor::Buyer | Actor::Seller) {
@@ -92,42 +94,191 @@ async fn attach_chat_key<F: FiberRpc + 'static>(
             "only a party to the trade can dispute",
         )]);
     }
-    let Some(key) = conversation_key(payload.conversation_key.as_deref()) else {
-        return Ok(vec![cant_do(
-            sender,
-            Some(trade.id.clone()),
-            "the chat key has to be 32 bytes of hex",
-        )]);
+    let blobs = match evidence {
+        SubmittedEvidence::Ready(blobs) => blobs,
+        SubmittedEvidence::Invalid => {
+            return Ok(vec![cant_do(
+                sender,
+                Some(trade.id.clone()),
+                INVALID_EVIDENCE,
+            )]);
+        }
+        SubmittedEvidence::None => {
+            return Ok(vec![cant_do(sender, Some(trade.id.clone()), SEND_CHAT)]);
+        }
     };
-    engine.db.set_chat_key_shared(&trade.id)?;
-    let Some(solver) = engine.solver.clone() else {
-        return Ok(vec![cant_do(
-            sender,
-            Some(trade.id.clone()),
-            "solver is not configured",
-        )]);
+    save_disclosure(engine, &trade.id, sender, blobs)?;
+    solver_notice(engine, &trade.id)
+}
+
+fn save_disclosure<F>(
+    engine: &Engine<F>,
+    trade_id: &str,
+    sender: &str,
+    blobs: Vec<String>,
+) -> Result<()> {
+    let existing = engine.db.solver_evidence(trade_id)?;
+    let json = merge_disclosure(existing.as_deref(), sender, blobs)?;
+    engine.db.save_solver_evidence(trade_id, &json)
+}
+
+fn solver_notice<F>(engine: &Engine<F>, trade_id: &str) -> Result<Vec<Outbound>> {
+    let Some(solver) = engine.solver.as_deref() else {
+        return Ok(Vec::new());
     };
+    let stored = engine.db.solver_evidence(trade_id)?;
+    if let Some(json) = stored.as_deref()
+        && let Some(reply) = solver_reply(solver, trade_id, json)?
+    {
+        return Ok(vec![reply]);
+    }
     Ok(vec![Outbound::Reply {
-        to: solver,
-        envelope: Envelope::new(DISPUTED)
-            .with_trade(&trade.id)
-            .with_payload(SolverDispute {
-                conversation_key: key,
-            })?,
+        to: solver.to_string(),
+        envelope: Envelope::new(DISPUTED).with_trade(trade_id),
     }])
+}
+
+pub(crate) fn pending_evidence_outbounds(
+    db: &crate::db::Db,
+    solver: &str,
+) -> Result<Vec<Outbound>> {
+    let mut outbound = Vec::new();
+    for (trade_id, json) in db.pending_solver_evidence()? {
+        if let Some(reply) = solver_reply(solver, &trade_id, &json)? {
+            outbound.push(reply);
+        }
+    }
+    Ok(outbound)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Disclosure {
+    from: String,
+    evidence: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct SolverDispute {
-    conversation_key: String,
+    disclosures: Vec<Disclosure>,
 }
 
-/// 32-byte hex. Anything else is dropped so a bad key does not block the dispute.
-fn conversation_key(value: Option<&str>) -> Option<String> {
-    let key = value?.trim().to_ascii_lowercase();
-    if key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Some(key)
-    } else {
-        None
+pub(crate) fn solver_reply(solver: &str, trade_id: &str, json: &str) -> Result<Option<Outbound>> {
+    let disclosures: Vec<Disclosure> = serde_json::from_str(json).unwrap_or_default();
+    if disclosures.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Outbound::Reply {
+        to: solver.to_string(),
+        envelope: Envelope::new(DISPUTED)
+            .with_trade(trade_id)
+            .with_payload(SolverDispute { disclosures })?,
+    }))
+}
+
+pub(crate) fn merge_disclosure(
+    existing: Option<&str>,
+    from: &str,
+    evidence: Vec<String>,
+) -> Result<String> {
+    let mut rows: Vec<Disclosure> = existing
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
+    rows.retain(|row| row.from != from);
+    rows.push(Disclosure {
+        from: from.to_string(),
+        evidence,
+    });
+    Ok(serde_json::to_string(&rows)?)
+}
+
+enum SubmittedEvidence {
+    None,
+    Invalid,
+    Ready(Vec<String>),
+}
+
+fn submitted_evidence(values: &[String]) -> SubmittedEvidence {
+    if values.is_empty() {
+        return SubmittedEvidence::None;
+    }
+    if values.len() > MAX_EVIDENCE {
+        return SubmittedEvidence::Invalid;
+    }
+    let mut ready = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(blob) = nip44_blob(value) else {
+            return SubmittedEvidence::Invalid;
+        };
+        ready.push(blob);
+    }
+    SubmittedEvidence::Ready(ready)
+}
+
+fn nip44_blob(value: &str) -> Option<String> {
+    let blob = value.trim();
+    if blob.is_empty()
+        || blob.len() > MAX_BLOB_CHARS
+        || blob.as_bytes().iter().any(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .ok()?;
+    if bytes.len() < MIN_NIP44 || bytes.len() > MAX_NIP44 || bytes[0] != 2 {
+        return None;
+    }
+    Some(blob.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn sample_solver_evidence() -> String {
+    let mut bytes = vec![2_u8];
+    bytes.extend(std::iter::repeat_n(7, MIN_NIP44 - 1));
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_conversation_key_is_not_evidence() {
+        let payload: DisputePayload =
+            serde_json::from_str(&format!(r#"{{"conversation_key":"{}"}}"#, "ab".repeat(32)))
+                .unwrap();
+        assert!(payload.solver_evidence.is_empty());
+        assert!(matches!(
+            submitted_evidence(&["ab".repeat(32)]),
+            SubmittedEvidence::Invalid
+        ));
+        assert!(matches!(
+            submitted_evidence(&[sample_solver_evidence()]),
+            SubmittedEvidence::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn both_parties_keep_their_own_disclosure() {
+        let buyer = sample_solver_evidence();
+        let seller = {
+            let mut bytes = vec![2_u8];
+            bytes.extend(std::iter::repeat_n(9, MIN_NIP44 - 1));
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let first = merge_disclosure(None, "buyer", vec![buyer.clone()]).unwrap();
+        let second = merge_disclosure(Some(&first), "seller", vec![seller.clone()]).unwrap();
+        let replaced = {
+            let mut bytes = vec![2_u8];
+            bytes.extend(std::iter::repeat_n(4, MIN_NIP44 - 1));
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let third = merge_disclosure(Some(&second), "buyer", vec![replaced.clone()]).unwrap();
+        let rows: Vec<Disclosure> = serde_json::from_str(&third).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].from, "seller");
+        assert_eq!(rows[0].evidence, vec![seller]);
+        assert_eq!(rows[1].from, "buyer");
+        assert_eq!(rows[1].evidence, vec![replaced]);
     }
 }

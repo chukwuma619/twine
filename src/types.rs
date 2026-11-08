@@ -307,8 +307,9 @@ pub struct FiatSentPayload {
 pub struct DisputePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoice: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_key: Option<String>,
+    /// NIP-44 v2 ciphertexts from this party to the solver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub solver_evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,7 +575,7 @@ pub struct Trade {
     pub fiat_acknowledged: bool,
     /// Unix seconds when the buyer marked fiat sent. Starts the release grace.
     pub fiat_sent_at: Option<i64>,
-    /// A party sent the solver a 32-byte chat key. The key itself is not stored.
+    /// A party sealed this trade's chat to the solver. The ciphertext lives in `solver_evidence`.
     pub chat_key_shared: bool,
     /// The release-grace notice has already been sent.
     pub release_prompted: bool,

@@ -133,10 +133,10 @@ impl HttpFiber {
             .error_for_status()?
             .json()
             .await?;
-        if let Some(error) = response.get("error") {
-            if !error.is_null() {
-                bail!("{method} failed: {error}");
-            }
+        if let Some(error) = response.get("error")
+            && !error.is_null()
+        {
+            bail!("{method} failed: {error}");
         }
         response
             .get("result")

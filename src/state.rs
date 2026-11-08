@@ -160,10 +160,10 @@ pub fn apply_resolve(
         Winner::Seller => Decision::Ok(Phase::Refunding),
         Winner::FiatOwed if chat_shared => Decision::Ok(Phase::Refunding),
         Winner::FiatOwed => Decision::Reject(
-            "share the chat key with the solver. The receipt cannot be read without it",
+            "send this trade's chat to the solver. The receipt cannot be read without it, so the solver cannot pay the buyer",
         ),
         Winner::Buyer if !chat_shared => Decision::Reject(
-            "share the chat key with the solver. The receipt cannot be read without it, so the solver cannot pay the buyer",
+            "send this trade's chat to the solver. The receipt cannot be read without it, so the solver cannot pay the buyer",
         ),
         Winner::Buyer if has_invoice => Decision::Ok(Phase::Releasing),
         Winner::Buyer => Decision::Reject("payout invoice is required"),

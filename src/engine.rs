@@ -54,6 +54,10 @@ impl<F> Clone for Engine<F> {
 }
 
 impl<F: FiberRpc + 'static> Engine<F> {
+    pub fn solver_pubkey(&self) -> Option<&str> {
+        self.solver.as_deref()
+    }
+
     pub fn new(db: Arc<Db>, fiber: Arc<F>, solver: Option<String>) -> Self {
         Self {
             db,
@@ -61,6 +65,41 @@ impl<F: FiberRpc + 'static> Engine<F> {
             solver,
             polls: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Solver notices still waiting on a relay.
+    pub fn pending_evidence_outbounds(&self) -> Result<Vec<Outbound>> {
+        let Some(solver) = self.solver.as_deref() else {
+            return Ok(Vec::new());
+        };
+        crate::app::dispute::pending_evidence_outbounds(&self.db, solver)
+    }
+
+    /// The solver notice in `outbound` reached a relay. Later passes leave it alone.
+    pub fn note_evidence_delivered(&self, outbound: &[Outbound]) -> Result<()> {
+        let Some(solver) = self.solver.as_deref() else {
+            return Ok(());
+        };
+        for item in outbound {
+            let Outbound::Reply { to, envelope } = item else {
+                continue;
+            };
+            if to != solver {
+                continue;
+            }
+            let shared = envelope
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.get("disclosures").is_some());
+            if !shared {
+                continue;
+            }
+            let Some(trade_id) = envelope.trade_id.as_deref() else {
+                continue;
+            };
+            self.db.clear_evidence_pending(trade_id)?;
+        }
+        Ok(())
     }
 
     /// Nostr client used to publish what the hold and payout polls learn.
@@ -1331,7 +1370,7 @@ const FIAT_OWED_REASON: &str = "The buyer had already paid. The CKB is returning
 const BUYER_UNPAID_REASON: &str =
     "The solver found the buyer did not pay. The CKB is returning to the seller.";
 
-const CHAT_KEY_REQUIRED: &str = "share the chat key with the solver. The receipt cannot be read without it, so the solver cannot pay the buyer";
+const CHAT_KEY_REQUIRED: &str = "send this trade's chat to the solver. The receipt cannot be read without it, so the solver cannot pay the buyer";
 
 const FIAT_WINDOW_CLOSED: &str = "the fiat window has closed. It has to leave 2 hours for the seller to release and 4 hours for the solver before Fiber can no longer start the payout";
 
@@ -1407,6 +1446,7 @@ fn payout_invoice_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::dispute::sample_solver_evidence;
     use crate::fiber::{
         FiberNodeInfo, FiberRpc, InvoiceCreated, InvoiceInfo, InvoiceRpc, NodeRpc, ParsedInvoice,
         PaymentInfo, PaymentRpc, WatchtowerRpc,
@@ -1836,7 +1876,7 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: None,
-                        conversation_key: Some("ab".repeat(32)),
+                        solver_evidence: vec![sample_solver_evidence()],
                     })
                     .unwrap(),
             )
@@ -1926,7 +1966,7 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: None,
-                        conversation_key: None,
+                        solver_evidence: Vec::new(),
                     })
                     .unwrap(),
             )
@@ -1968,7 +2008,7 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: None,
-                        conversation_key: Some("ab".repeat(32)),
+                        solver_evidence: vec![sample_solver_evidence()],
                     })
                     .unwrap(),
             )
@@ -2057,25 +2097,46 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: None,
-                        conversation_key: Some("ab".repeat(32)),
+                        solver_evidence: vec![sample_solver_evidence()],
                     })
                     .unwrap(),
             )
             .await
             .unwrap();
         assert!(replies_contain(&disputed, DISPUTED));
-        let solver_key = disputed.iter().find_map(|item| match item {
+        let evidence = sample_solver_evidence();
+        let solver_payload = disputed.iter().find_map(|item| match item {
             Outbound::Reply { to, envelope } if to == "solver" && envelope.action == DISPUTED => {
-                envelope
-                    .payload
-                    .as_ref()
-                    .and_then(|payload| payload.get("conversation_key"))
-                    .and_then(|key| key.as_str())
-                    .map(str::to_string)
+                envelope.payload.clone()
             }
             _ => None,
         });
-        assert_eq!(solver_key.as_deref(), Some("ab".repeat(32).as_str()));
+        let disclosure = solver_payload
+            .as_ref()
+            .and_then(|payload| payload.get("disclosures"))
+            .and_then(|value| value.as_array())
+            .and_then(|rows| rows.first());
+        assert_eq!(
+            disclosure
+                .and_then(|row| row.get("from"))
+                .and_then(|value| value.as_str()),
+            Some("buyer")
+        );
+        assert_eq!(
+            disclosure
+                .and_then(|row| row.get("evidence"))
+                .and_then(|value| value.as_array())
+                .and_then(|blobs| blobs.first())
+                .and_then(|blob| blob.as_str()),
+            Some(evidence.as_str())
+        );
+        assert!(solver_payload.unwrap().get("conversation_key").is_none());
+        assert!(engine.db.evidence_is_pending("trade").unwrap());
+        let pending = engine.pending_evidence_outbounds().unwrap();
+        assert_eq!(pending.len(), 1);
+        engine.note_evidence_delivered(&disputed).unwrap();
+        assert!(!engine.db.evidence_is_pending("trade").unwrap());
+        assert!(engine.pending_evidence_outbounds().unwrap().is_empty());
         let buyer_payload = disputed.iter().find_map(|item| match item {
             Outbound::Reply { to, envelope } if to == "buyer" && envelope.action == DISPUTED => {
                 envelope.payload.clone()
@@ -2089,6 +2150,7 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("solver")
         );
+        assert!(buyer_payload.unwrap().get("disclosures").is_none());
         engine.db.set_payout("trade", "", None).unwrap();
         let missing = engine
             .handle(
@@ -2397,7 +2459,7 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: None,
-                        conversation_key: None,
+                        solver_evidence: Vec::new(),
                     })
                     .unwrap(),
             )
@@ -2416,21 +2478,59 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(cant_do_reason(&refused).contains("chat key"));
+        assert!(cant_do_reason(&refused).contains("trade's chat"));
         assert!(!*fiber.removed.lock().unwrap());
-        engine
+        let mut legacy = Envelope::new(DISPUTE).with_trade("trade");
+        legacy.payload = Some(serde_json::json!({
+            "conversation_key": "ab".repeat(32),
+        }));
+        let legacy = engine.handle("buyer", legacy).await.unwrap();
+        assert!(cant_do_reason(&legacy).contains("trade's chat"));
+        let garbage = engine
             .handle(
                 "buyer",
                 Envelope::new(DISPUTE)
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: None,
-                        conversation_key: Some("cd".repeat(32)),
+                        solver_evidence: vec!["not-a-nip44-message".into()],
                     })
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert!(cant_do_reason(&garbage).contains("NIP-44"));
+        assert!(
+            !engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .chat_key_shared
+        );
+        let sealed = engine
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        solver_evidence: vec![sample_solver_evidence()],
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(sealed.iter().any(|item| match item {
+            Outbound::Reply { to, envelope } => {
+                to == "solver"
+                    && envelope
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload.get("disclosures").is_some())
+            }
+            _ => false,
+        }));
         assert!(
             engine
                 .db
@@ -2464,7 +2564,7 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: None,
-                        conversation_key: Some("ab".repeat(32)),
+                        solver_evidence: vec![sample_solver_evidence()],
                     })
                     .unwrap(),
             )
@@ -3391,7 +3491,7 @@ mod tests {
                     .with_trade("trade")
                     .with_payload(DisputePayload {
                         invoice: Some("buyer-invoice".into()),
-                        conversation_key: None,
+                        solver_evidence: Vec::new(),
                     })
                     .unwrap(),
             )
