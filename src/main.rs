@@ -12,7 +12,7 @@ use twine_daemon::nostr::{
     ensure_action_subscription, fiber_node_event, public_order_event, publish_outbounds,
     relays_with_everything, sender_hex, wake_disconnected,
 };
-use twine_daemon::{Config, KIND_ACTION, Phase};
+use twine_daemon::{Config, KIND_ACTION, Phase, SOLVER_WINDOW_SECS};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,6 +24,16 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    if config.solver.is_none() {
+        warn!(
+            "TWINE_SOLVER is unset. Disputes are refused, and the node announcement has no solver decision time"
+        );
+    } else {
+        info!(
+            solver_window_secs = SOLVER_WINDOW_SECS,
+            "solver decision time"
+        );
+    }
     let keys = Keys::parse(&config.nostr_secret)?;
     let npub = keys.public_key().to_bech32()?;
     info!(

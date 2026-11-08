@@ -1,7 +1,7 @@
-use crate::engine::{Engine, cant_do};
+use crate::engine::{Engine, RECORD_ALREADY, WINDOW_ENDED, cant_do, release_refusal};
 use crate::fiber::FiberRpc;
 use crate::types::Outbound;
-use crate::{Envelope, Phase, ResolvePayload, apply_resolve, parse_winner};
+use crate::{Actor, Envelope, Phase, ResolvePayload, Winner, apply_resolve, parse_winner, unix_now};
 use anyhow::Result;
 
 pub(crate) async fn on_resolve<F: FiberRpc + 'static>(
@@ -26,14 +26,40 @@ pub(crate) async fn on_resolve<F: FiberRpc + 'static>(
         return Ok(vec![cant_do(
             sender,
             Some(trade_id),
-            "winner must be buyer or seller",
+            "winner must be buyer, seller, or fiat-owed",
         )]);
     };
     let Some(trade) = engine.db.get_trade(&trade_id)? else {
         return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
     };
-    if let Some(outbound) = engine.refund_due_outbound(&trade).await? {
-        return Ok(outbound);
+    let actor = engine.trade_actor(&trade, sender);
+    let phase = trade.phase()?;
+    let window_closed = trade
+        .route_by()
+        .is_some_and(|deadline| unix_now() >= deadline);
+    if actor == Actor::Solver && trade.outcome.is_some() {
+        return Ok(vec![cant_do(sender, Some(trade_id), RECORD_ALREADY)]);
+    }
+    // The missed window is already `unresolved`. A payout must not start in the gap
+    // before Fiber's routing deadline. A decision after that deadline still records
+    // an outcome when none has been published.
+    if actor == Actor::Solver && !window_closed && release_refusal(&trade, unix_now()).is_some() {
+        return Ok(vec![cant_do(sender, Some(trade_id), WINDOW_ENDED)]);
+    }
+    if matches!(phase, Phase::Refunding | Phase::Expired)
+        || (phase == Phase::Disputed && window_closed)
+    {
+        if actor != Actor::Solver {
+            return Ok(vec![cant_do(
+                sender,
+                Some(trade_id),
+                "only the solver can resolve a dispute",
+            )]);
+        }
+        return match winner {
+            Winner::Seller => engine.record_buyer_unpaid(&trade).await,
+            Winner::Buyer | Winner::FiatOwed => engine.record_fiat_owed(&trade, sender).await,
+        };
     }
     let supplied = payload
         .invoice
@@ -46,9 +72,11 @@ pub(crate) async fn on_resolve<F: FiberRpc + 'static>(
             .payout_invoice
             .as_deref()
             .is_some_and(|invoice| !invoice.trim().is_empty());
-    let actor = engine.trade_actor(&trade, sender);
-    match apply_resolve(trade.phase()?, actor, winner, has_invoice) {
-        crate::Decision::Ok(Phase::Refunding) => engine.begin_refund(&trade).await,
+    match apply_resolve(phase, actor, winner, has_invoice, trade.chat_key_shared) {
+        crate::Decision::Ok(Phase::Refunding) => match winner {
+            Winner::Seller => engine.record_buyer_unpaid(&trade).await,
+            Winner::Buyer | Winner::FiatOwed => engine.record_fiat_owed(&trade, sender).await,
+        },
         crate::Decision::Ok(Phase::Releasing) => {
             if let Some(invoice) = &supplied {
                 if let Err(reason) = engine.require_same_hold_hash(&trade, invoice).await? {
@@ -56,9 +84,7 @@ pub(crate) async fn on_resolve<F: FiberRpc + 'static>(
                 }
                 engine.db.set_payout(&trade.id, invoice, None)?;
             }
-            engine
-                .db
-                .set_trade_state(&trade.id, Phase::Releasing.as_str())?;
+            engine.db.begin_release(&trade.id)?;
             engine.watch(&trade.id)?;
             Ok(Vec::new())
         }

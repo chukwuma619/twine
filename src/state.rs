@@ -29,7 +29,11 @@ pub fn apply_clock(phase: Phase, now: i64, deadline: Option<i64>) -> Decision {
         return Decision::NoOp;
     };
     match phase {
-        Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed
+        Phase::AwaitingRoute
+        | Phase::WaitingFiat
+        | Phase::FiatSent
+        | Phase::AwaitingInvoice
+        | Phase::Disputed
             if now >= deadline =>
         {
             Decision::Ok(Phase::Refunding)
@@ -45,15 +49,30 @@ pub fn apply_take(phase: Phase) -> Decision {
     }
 }
 
-pub fn apply_hold_received(phase: Phase) -> Decision {
+/// The locked hold can ask for fiat once the payout invoice has a route.
+pub fn apply_route_ready(phase: Phase) -> Decision {
     match phase {
-        Phase::WaitingHold => Decision::Ok(Phase::WaitingFiat),
-        _ => Decision::Reject("hold is not waiting"),
+        Phase::WaitingHold | Phase::AwaitingRoute => Decision::Ok(Phase::WaitingFiat),
+        _ => Decision::Reject("hold is not waiting on a route"),
+    }
+}
+
+/// Coins are locked and the payout invoice cannot be paid yet.
+/// Waiting-fiat can return here when the fiat-sent dry run finds no route.
+pub fn apply_route_blocked(phase: Phase) -> Decision {
+    match phase {
+        Phase::WaitingHold | Phase::AwaitingRoute | Phase::WaitingFiat => {
+            Decision::Ok(Phase::AwaitingRoute)
+        }
+        _ => Decision::Reject("hold is not waiting on a route"),
     }
 }
 
 pub fn apply_fiat_sent(phase: Phase, actor: Actor) -> Decision {
     match (phase, actor) {
+        (Phase::AwaitingRoute, Actor::Buyer) => Decision::Reject(
+            "the wallet cannot receive yet. Send the same invoice again before paying",
+        ),
         (Phase::WaitingFiat, Actor::Buyer) => Decision::Ok(Phase::FiatSent),
         (Phase::AwaitingInvoice, Actor::Buyer) => Decision::Ok(Phase::Releasing),
         (Phase::Disputed, Actor::Buyer) => Decision::Ok(Phase::Disputed),
@@ -96,12 +115,13 @@ pub fn apply_release_failed(phase: Phase) -> Decision {
 pub fn apply_dispute(phase: Phase, actor: Actor) -> Decision {
     match (phase, actor) {
         (
-            Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice,
+            Phase::AwaitingRoute | Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice,
             Actor::Seller | Actor::Buyer,
         ) => Decision::Ok(Phase::Disputed),
-        (Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice, _) => {
-            Decision::Reject("only a party to the trade can dispute")
-        }
+        (
+            Phase::AwaitingRoute | Phase::WaitingFiat | Phase::FiatSent | Phase::AwaitingInvoice,
+            _,
+        ) => Decision::Reject("only a party to the trade can dispute"),
         _ => Decision::Reject("dispute is only valid while the hold is locked"),
     }
 }
@@ -110,17 +130,26 @@ pub fn apply_dispute(phase: Phase, actor: Actor) -> Decision {
 pub enum Winner {
     Buyer,
     Seller,
+    /// Fiat arrived and the CKB cannot be delivered. The protocol action is still a seller refund.
+    FiatOwed,
 }
 
 pub fn parse_winner(value: &str) -> Option<Winner> {
     match value.trim() {
         "buyer" => Some(Winner::Buyer),
         "seller" => Some(Winner::Seller),
+        "fiat-owed" => Some(Winner::FiatOwed),
         _ => None,
     }
 }
 
-pub fn apply_resolve(phase: Phase, actor: Actor, winner: Winner, has_invoice: bool) -> Decision {
+pub fn apply_resolve(
+    phase: Phase,
+    actor: Actor,
+    winner: Winner,
+    has_invoice: bool,
+    chat_shared: bool,
+) -> Decision {
     if phase != Phase::Disputed {
         return Decision::Reject("resolve is only valid during a dispute");
     }
@@ -129,6 +158,13 @@ pub fn apply_resolve(phase: Phase, actor: Actor, winner: Winner, has_invoice: bo
     }
     match winner {
         Winner::Seller => Decision::Ok(Phase::Refunding),
+        Winner::FiatOwed if chat_shared => Decision::Ok(Phase::Refunding),
+        Winner::FiatOwed => Decision::Reject(
+            "share the chat key with the solver. The receipt cannot be read without it",
+        ),
+        Winner::Buyer if !chat_shared => Decision::Reject(
+            "share the chat key with the solver. The receipt cannot be read without it, so the solver cannot pay the buyer",
+        ),
         Winner::Buyer if has_invoice => Decision::Ok(Phase::Releasing),
         Winner::Buyer => Decision::Reject("payout invoice is required"),
     }
@@ -162,7 +198,8 @@ pub fn apply_cancel(phase: Phase, actor: Actor, invoice: Option<InvoiceStatus>) 
                 None => Decision::Reject("unknown hold invoice status"),
             }
         }
-        Phase::WaitingFiat
+        Phase::AwaitingRoute
+        | Phase::WaitingFiat
         | Phase::FiatSent
         | Phase::Releasing
         | Phase::AwaitingInvoice
@@ -416,19 +453,59 @@ mod tests {
             Decision::Reject(_)
         ));
         assert_eq!(
-            apply_resolve(Phase::Disputed, Actor::Solver, Winner::Seller, true),
+            apply_resolve(Phase::Disputed, Actor::Solver, Winner::Seller, true, false),
             Decision::Ok(Phase::Refunding)
         );
         assert_eq!(
-            apply_resolve(Phase::Disputed, Actor::Solver, Winner::Buyer, true),
+            apply_resolve(
+                Phase::Disputed,
+                Actor::Solver,
+                Winner::FiatOwed,
+                false,
+                true
+            ),
+            Decision::Ok(Phase::Refunding)
+        );
+        assert!(matches!(
+            apply_resolve(
+                Phase::Disputed,
+                Actor::Solver,
+                Winner::FiatOwed,
+                true,
+                false
+            ),
+            Decision::Reject(_)
+        ));
+        assert!(matches!(
+            apply_resolve(Phase::Disputed, Actor::Solver, Winner::Buyer, true, false),
+            Decision::Reject(_)
+        ));
+        assert_eq!(
+            apply_dispute(Phase::AwaitingRoute, buyer()),
+            Decision::Ok(Phase::Disputed)
+        );
+        assert!(matches!(
+            apply_fiat_sent(Phase::AwaitingRoute, buyer()),
+            Decision::Reject(_)
+        ));
+        assert_eq!(
+            apply_route_blocked(Phase::WaitingFiat),
+            Decision::Ok(Phase::AwaitingRoute)
+        );
+        assert_eq!(
+            apply_route_blocked(Phase::WaitingHold),
+            Decision::Ok(Phase::AwaitingRoute)
+        );
+        assert_eq!(
+            apply_resolve(Phase::Disputed, Actor::Solver, Winner::Buyer, true, true),
             Decision::Ok(Phase::Releasing)
         );
         assert_eq!(
-            apply_resolve(Phase::Disputed, Actor::Solver, Winner::Buyer, false),
+            apply_resolve(Phase::Disputed, Actor::Solver, Winner::Buyer, false, true),
             Decision::Reject("payout invoice is required")
         );
         assert!(matches!(
-            apply_resolve(Phase::Disputed, seller(), Winner::Seller, true),
+            apply_resolve(Phase::Disputed, seller(), Winner::Seller, true, true),
             Decision::Reject(_)
         ));
     }

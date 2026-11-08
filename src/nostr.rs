@@ -1,5 +1,7 @@
-use crate::types::{Outbound, PublicOrder};
-use crate::{Envelope, FIBER_NODE_TAG, KIND_ACTION, KIND_FIBER_NODE, KIND_ORDER};
+use crate::types::{Outbound, PublicOrder, TradeRecord};
+use crate::{
+    Envelope, FIBER_NODE_TAG, KIND_ACTION, KIND_FIBER_NODE, KIND_ORDER, KIND_TRADE_RECORD,
+};
 use anyhow::{Context, Result, bail};
 use nostr::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
@@ -178,9 +180,22 @@ pub async fn publish_outbounds(client: &Client, keys: &Keys, outbound: &[Outboun
                 let event = public_order_event(keys, order)?;
                 publish_event(client, &event).await?;
             }
+            Outbound::TradeRecord(record) => {
+                let event = trade_record_event(keys, record)?;
+                publish_event(client, &event).await?;
+            }
         }
     }
     Ok(())
+}
+
+pub fn trade_record_event(keys: &Keys, record: &TradeRecord) -> Result<Event> {
+    Ok(EventBuilder::new(
+        Kind::from(KIND_TRADE_RECORD),
+        serde_json::to_string(record)?,
+    )
+    .tag(Tag::identifier(&record.trade_id))
+    .finalize(keys)?)
 }
 
 pub fn public_order_event(keys: &Keys, order: &PublicOrder) -> Result<Event> {
@@ -264,6 +279,7 @@ pub fn fiber_node_event(
     let content = serde_json::json!({
         "pubkey": pubkey,
         "solver": solver,
+        "solver_window_secs": solver.map(|_| crate::SOLVER_WINDOW_SECS),
         "addresses": addresses,
     })
     .to_string();
@@ -336,6 +352,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(event.content.as_str()).unwrap();
         assert_eq!(body["pubkey"], "02abc");
         assert!(body["solver"].is_null());
+        assert!(body["solver_window_secs"].is_null());
         let with_solver = fiber_node_event(
             &keys,
             "02abc",
@@ -345,6 +362,7 @@ mod tests {
         .unwrap();
         let solved: serde_json::Value = serde_json::from_str(with_solver.content.as_str()).unwrap();
         assert_eq!(solved["solver"], "solverpk");
+        assert_eq!(solved["solver_window_secs"], crate::SOLVER_WINDOW_SECS);
         assert_eq!(solved["addresses"][0], "/ip4/1.2.3.4/tcp/8228");
         assert!(fiber_node_event(&keys, " ", None, &[]).is_err());
     }

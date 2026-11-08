@@ -13,6 +13,15 @@ pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 /// How long an unpaid hold invoice stays open for the seller to lock.
 pub const INVOICE_EXPIRY_SECS: u64 = 60 * 60;
 
+/// After fiat is marked sent, the seller has this long to check the bank and release.
+pub const RELEASE_GRACE_SECS: i64 = 2 * 3_600;
+
+/// Published solver decision time after the release grace.
+pub const SOLVER_WINDOW_SECS: i64 = 4 * 3_600;
+
+/// Shortest routing buffer kept after the solver window. Fiber's TLC budget can require more.
+pub const ROUTE_BUFFER_SECS: i64 = 30 * 60;
+
 /// Release `MILLI_SECONDS_PER_EPOCH`. Debug builds use 2 seconds.
 pub const FIBER_MILLIS_PER_EPOCH: u64 = 4 * 60 * 60 * 1000;
 
@@ -58,6 +67,9 @@ pub const KIND_ORDER: u16 = 31420;
 /// Public addressable Fiber node. The `d` tag is [FIBER_NODE_TAG]. Not a NIP.
 pub const KIND_FIBER_NODE: u16 = 31421;
 
+/// Public addressable trade outcome. The `d` tag is the trade id. Not a NIP.
+pub const KIND_TRADE_RECORD: u16 = 31422;
+
 pub const FIBER_NODE_TAG: &str = "fiber-node";
 
 pub const NEW_ORDER: &str = "new-order";
@@ -72,8 +84,15 @@ pub const MY_TRADES: &str = "my-trades";
 
 pub const PAY_INVOICE: &str = "pay-invoice";
 pub const NEED_INVOICE: &str = "need-invoice";
+pub const NEED_ROUTE: &str = "need-route";
 pub const WAITING_FIAT: &str = "waiting-fiat";
+pub const TRADE_RECORD: &str = "trade-record";
+
+pub const OUTCOME_FIAT_OWED: &str = "fiat-owed";
+pub const OUTCOME_BUYER_UNPAID: &str = "buyer-unpaid";
+pub const OUTCOME_UNRESOLVED: &str = "unresolved";
 pub const FIAT_SENT_OK: &str = "fiat-sent-ok";
+pub const RELEASE_DUE: &str = "release-due";
 pub const NEW_INVOICE: &str = "new-invoice";
 pub const DISPUTED: &str = "disputed";
 pub const REFUNDING: &str = "refunding";

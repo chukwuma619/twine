@@ -7,11 +7,13 @@ use crate::nostr::publish_outbounds;
 use crate::types::{Order, Trade};
 use crate::{
     Actor, CANCELED, CANT_DO, CantDoPayload, ClientAction, Decision, EXPIRED, Envelope,
-    FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEW_INVOICE, NewInvoicePayload, Outbound,
-    PAY_INVOICE, PayInvoicePayload, PayoutBudget, Phase, REFUNDING, SETTLED, WAITING_FIAT,
-    WaitingFiatPayload, apply_clock, apply_expired, apply_hold_received, apply_release_failed,
-    apply_release_succeeded, invoice_payable_through, payout_budget, payout_invoice_must_last_secs,
-    trade_actor, unix_now, unix_now_ms,
+    FIBER_POLL_SECS, INVOICE_EXPIRY_SECS, InvoiceStatus, NEED_ROUTE, NEW_INVOICE,
+    NewInvoicePayload, OUTCOME_BUYER_UNPAID, OUTCOME_FIAT_OWED, OUTCOME_UNRESOLVED, Outbound,
+    PAY_INVOICE, PayInvoicePayload, PayoutBudget, Phase, REFUNDING, RELEASE_DUE, ReleaseDuePayload,
+    SETTLED, SOLVER_WINDOW_SECS, TRADE_RECORD, TradeRecord, TradeRecordNotice, WAITING_FIAT,
+    WaitingFiatPayload, apply_clock, apply_expired, apply_release_failed, apply_release_succeeded,
+    apply_route_blocked, apply_route_ready, invoice_payable_through, payout_budget,
+    payout_invoice_must_last_secs, trade_actor, unix_now, unix_now_ms,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
@@ -228,30 +230,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
             } else {
                 None
             };
-            return match apply_hold_received(Phase::WaitingHold) {
-                Decision::Ok(next) => {
-                    let received_at = unix_now();
-                    trade.hold_received_at = Some(received_at);
-                    trade.hold_expires_at_ms = expires_at_ms;
-                    self.db.set_hold_received(
-                        &trade.id,
-                        next.as_str(),
-                        received_at,
-                        expires_at_ms,
-                    )?;
-                    Ok(party_replies(
-                        &trade,
-                        Envelope::new(WAITING_FIAT)
-                            .with_trade(&trade.id)
-                            .with_payload(WaitingFiatPayload::from_trade(
-                                &trade,
-                                &order.fiat_currency,
-                                order.hold_secs,
-                            ))?,
-                    ))
-                }
-                other => bail!("invalid hold received: {other:?}"),
-            };
+            return self
+                .after_hold_locked(&mut trade, &order, expires_at_ms)
+                .await;
         }
         if status == InvoiceStatus::Received && trade.hold_expires_at_ms.is_none() {
             self.remember_hold_expiry(&mut trade, &payment_hash).await?;
@@ -263,7 +244,17 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 Envelope::new(REFUNDING).with_trade(&trade.id),
             ));
         }
-        self.refund_if_due(&trade).await
+        let mut refund = self.refund_if_due(&trade).await?;
+        if !refund.is_empty() {
+            let mut published = self.publish_unresolved_if_due(&trade)?;
+            published.append(&mut refund);
+            return Ok(published);
+        }
+        let unresolved = self.publish_unresolved_if_due(&trade)?;
+        if !unresolved.is_empty() {
+            return Ok(unresolved);
+        }
+        self.release_due_notice(&trade)
     }
 
     pub(crate) async fn expire_trade(&self, order: &Order, trade: &Trade) -> Result<Vec<Outbound>> {
@@ -282,6 +273,15 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 let order = self.require_order(&order.id)?;
                 let mut outbound =
                     party_replies(trade, Envelope::new(EXPIRED).with_trade(&trade.id));
+                if trade.fiat_acknowledged {
+                    let mut published = self.publish_outcome(trade, OUTCOME_FIAT_OWED)?;
+                    published.append(&mut outbound);
+                    outbound = published;
+                } else {
+                    let mut published = self.publish_unresolved_if_due(trade)?;
+                    published.append(&mut outbound);
+                    outbound = published;
+                }
                 outbound.insert(0, Outbound::PublicOrder(order.public()));
                 Ok(outbound)
             }
@@ -305,11 +305,106 @@ impl<F: FiberRpc + 'static> Engine<F> {
     }
 
     async fn refund_if_due(&self, trade: &Trade) -> Result<Vec<Outbound>> {
-        match apply_clock(trade.phase()?, unix_now(), trade.pay_by()) {
-            Decision::Ok(Phase::Refunding) => self.begin_refund(trade).await,
+        let phase = trade.phase()?;
+        let (deadline, reason) = match phase {
+            Phase::AwaitingRoute | Phase::WaitingFiat => (trade.pay_by(), Some(FIAT_WINDOW_CLOSED)),
+            // A dispute opened before fiat is marked sent keeps the fiat deadline.
+            Phase::Disputed if trade.fiat_sent_at.is_none() => {
+                (trade.pay_by(), Some(FIAT_WINDOW_CLOSED))
+            }
+            Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed | Phase::Releasing => {
+                (trade.route_by(), None)
+            }
+            _ => (None, None),
+        };
+        match apply_clock(phase, unix_now(), deadline) {
+            Decision::Ok(Phase::Refunding) => self.refund_for(trade, reason).await,
             Decision::NoOp => Ok(Vec::new()),
             other => bail!("invalid clock: {other:?}"),
         }
+    }
+
+    /// One notice after the seller's 2-hour grace, while the hold can still be paid.
+    fn release_due_notice(&self, trade: &Trade) -> Result<Vec<Outbound>> {
+        if trade.phase()? != Phase::FiatSent || trade.release_prompted {
+            return Ok(Vec::new());
+        }
+        let Some(release_by) = trade.release_by() else {
+            return Ok(Vec::new());
+        };
+        if unix_now() < release_by {
+            return Ok(Vec::new());
+        }
+        self.db.set_release_prompted(&trade.id)?;
+        Ok(party_replies(
+            trade,
+            Envelope::new(RELEASE_DUE)
+                .with_trade(&trade.id)
+                .with_payload(ReleaseDuePayload {
+                    release_by,
+                    solver_window_secs: SOLVER_WINDOW_SECS,
+                })?,
+        ))
+    }
+
+    /// Solver found the buyer did not pay. Counts on the public trade record.
+    pub(crate) async fn record_buyer_unpaid(&self, trade: &Trade) -> Result<Vec<Outbound>> {
+        if trade.outcome.is_some() {
+            bail!("trade {} already has a public record", trade.id);
+        }
+        self.db.set_fiat_acknowledged(&trade.id, false)?;
+        let mut outbound = if trade.phase()? == Phase::Disputed {
+            self.refund_for(trade, Some(BUYER_UNPAID_REASON)).await?
+        } else {
+            party_replies(
+                trade,
+                Envelope::new(REFUNDING)
+                    .with_trade(&trade.id)
+                    .with_payload(NewInvoicePayload {
+                        reason: BUYER_UNPAID_REASON.to_string(),
+                    })?,
+            )
+        };
+        let mut published = self.publish_outcome(trade, OUTCOME_BUYER_UNPAID)?;
+        published.append(&mut outbound);
+        Ok(published)
+    }
+
+    /// Fiat arrived and the payout can no longer start. The CKB returns to the seller.
+    pub(crate) async fn record_fiat_owed(
+        &self,
+        trade: &Trade,
+        sender: &str,
+    ) -> Result<Vec<Outbound>> {
+        if trade.outcome.is_some() {
+            return Ok(vec![cant_do(
+                sender,
+                Some(trade.id.clone()),
+                RECORD_ALREADY,
+            )]);
+        }
+        if !trade.chat_key_shared {
+            return Ok(vec![cant_do(
+                sender,
+                Some(trade.id.clone()),
+                CHAT_KEY_REQUIRED,
+            )]);
+        }
+        self.db.set_fiat_acknowledged(&trade.id, true)?;
+        if trade.phase()? == Phase::Disputed {
+            return self.begin_refund(trade).await;
+        }
+        let mut outbound = party_replies(
+            trade,
+            Envelope::new(REFUNDING)
+                .with_trade(&trade.id)
+                .with_payload(NewInvoicePayload {
+                    reason: FIAT_OWED_REASON.to_string(),
+                })?,
+        );
+        let mut published = self.publish_outcome(trade, OUTCOME_FIAT_OWED)?;
+        published.append(&mut outbound);
+        Ok(published)
     }
 
     pub(crate) async fn begin_refund(&self, trade: &Trade) -> Result<Vec<Outbound>> {
@@ -320,13 +415,266 @@ impl<F: FiberRpc + 'static> Engine<F> {
         self.db
             .set_trade_state(&trade.id, Phase::Refunding.as_str())?;
         self.drop_preimage(trade).await?;
+        let acknowledged = self
+            .db
+            .get_trade(&trade.id)?
+            .is_some_and(|current| current.fiat_acknowledged);
+        let text = refund_reason(reason, acknowledged);
         let mut envelope = Envelope::new(REFUNDING).with_trade(&trade.id);
-        if let Some(reason) = reason {
+        if let Some(text) = &text {
             envelope = envelope.with_payload(NewInvoicePayload {
-                reason: reason.to_string(),
+                reason: text.clone(),
             })?;
         }
-        Ok(party_replies(trade, envelope))
+        let mut outbound = party_replies(trade, envelope);
+        if acknowledged {
+            let mut published = self.publish_outcome(trade, OUTCOME_FIAT_OWED)?;
+            published.append(&mut outbound);
+            outbound = published;
+        }
+        Ok(outbound)
+    }
+
+    /// Public record plus the same outcome for the two apps. The first write sticks.
+    fn publish_outcome(&self, trade: &Trade, outcome: &str) -> Result<Vec<Outbound>> {
+        if !self.db.set_outcome_once(&trade.id, outcome)? {
+            return Ok(Vec::new());
+        }
+        let order = self.require_order(&trade.order_id)?;
+        let record = match outcome {
+            OUTCOME_FIAT_OWED => TradeRecord::fiat_owed(trade, &order.fiat_currency),
+            OUTCOME_BUYER_UNPAID => TradeRecord::buyer_unpaid(trade, &order.fiat_currency),
+            OUTCOME_UNRESOLVED => TradeRecord::unresolved(trade, &order.fiat_currency),
+            _ => bail!("unknown trade outcome {outcome}"),
+        };
+        let mut outbound = party_replies(
+            trade,
+            Envelope::new(TRADE_RECORD)
+                .with_trade(&trade.id)
+                .with_payload(TradeRecordNotice {
+                    outcome: outcome.to_string(),
+                })?,
+        );
+        outbound.insert(0, Outbound::TradeRecord(record));
+        Ok(outbound)
+    }
+
+    /// Fiat was marked sent, and neither the seller nor the solver decided before the window ended.
+    fn publish_unresolved_if_due(&self, trade: &Trade) -> Result<Vec<Outbound>> {
+        if !unresolved_due(trade, unix_now()) {
+            return Ok(Vec::new());
+        }
+        self.publish_outcome(trade, OUTCOME_UNRESOLVED)
+    }
+
+    /// Same Fiber v0.9.1 dry run used when the hold locked. A missing path refuses the click
+    /// and returns the trade to awaiting-route. Waiting-fiat is not probed until this click.
+    pub(crate) async fn refuse_fiat_if_route_blocked(
+        &self,
+        trade: &Trade,
+        sender: &str,
+    ) -> Result<Option<Vec<Outbound>>> {
+        match self.probe_payout(trade).await? {
+            PayoutProbe::Ready => Ok(None),
+            PayoutProbe::NoRoute(reason) => {
+                let mut outbound = self.mark_awaiting_route(trade, &reason)?;
+                outbound.insert(0, cant_do(sender, Some(trade.id.clone()), &reason));
+                Ok(Some(outbound))
+            }
+            PayoutProbe::InvoiceExpired => Ok(Some(self.refund_expired_invoice(trade).await?)),
+            PayoutProbe::WindowClosed => Ok(Some(self.refund_past_deadline(trade).await?)),
+            PayoutProbe::Later => Ok(Some(vec![cant_do(
+                sender,
+                Some(trade.id.clone()),
+                "could not check the payout route. Try again before sending fiat",
+            )])),
+        }
+    }
+
+    async fn after_hold_locked(
+        &self,
+        trade: &mut Trade,
+        order: &Order,
+        expires_at_ms: Option<i64>,
+    ) -> Result<Vec<Outbound>> {
+        let received_at = unix_now();
+        trade.hold_received_at = Some(received_at);
+        trade.hold_expires_at_ms = expires_at_ms;
+        self.db.set_hold_received(
+            &trade.id,
+            Phase::WaitingHold.as_str(),
+            received_at,
+            expires_at_ms,
+        )?;
+        self.finish_route_probe(trade, order).await
+    }
+
+    async fn finish_route_probe(&self, trade: &Trade, order: &Order) -> Result<Vec<Outbound>> {
+        match self.probe_payout(trade).await? {
+            PayoutProbe::Ready => self.mark_waiting_fiat(trade, order),
+            PayoutProbe::NoRoute(reason) => self.mark_awaiting_route(trade, &reason),
+            PayoutProbe::InvoiceExpired => self.refund_expired_invoice(trade).await,
+            PayoutProbe::WindowClosed => self.refund_past_deadline(trade).await,
+            PayoutProbe::Later => Ok(Vec::new()),
+        }
+    }
+
+    fn mark_waiting_fiat(&self, trade: &Trade, order: &Order) -> Result<Vec<Outbound>> {
+        match apply_route_ready(trade.phase()?) {
+            Decision::Ok(phase) => {
+                self.db.set_trade_state(&trade.id, phase.as_str())?;
+                Ok(party_replies(
+                    trade,
+                    Envelope::new(WAITING_FIAT)
+                        .with_trade(&trade.id)
+                        .with_payload(WaitingFiatPayload::from_trade(
+                            trade,
+                            &order.fiat_currency,
+                        ))?,
+                ))
+            }
+            other => bail!("invalid route ready: {other:?}"),
+        }
+    }
+
+    fn mark_awaiting_route(&self, trade: &Trade, reason: &str) -> Result<Vec<Outbound>> {
+        match apply_route_blocked(trade.phase()?) {
+            Decision::Ok(phase) => {
+                self.db.set_trade_state(&trade.id, phase.as_str())?;
+                warn!(trade_id = %trade.id, reason, "payout invoice has no route yet");
+                Ok(party_replies(
+                    trade,
+                    Envelope::new(NEED_ROUTE)
+                        .with_trade(&trade.id)
+                        .with_payload(NewInvoicePayload {
+                            reason: reason.to_string(),
+                        })?,
+                ))
+            }
+            other => bail!("invalid route blocked: {other:?}"),
+        }
+    }
+
+    /// Buyer sends the same payment hash again after the wallet can receive.
+    pub(crate) async fn retry_payout_route(
+        &self,
+        trade: &Trade,
+        invoice: &str,
+    ) -> Result<Vec<Outbound>> {
+        if let Err(reason) = self.require_same_hold_hash(trade, invoice).await? {
+            return Ok(vec![cant_do(
+                &trade.buyer_nostr,
+                Some(trade.id.clone()),
+                &reason,
+            )]);
+        }
+        if let Some(outbound) = self.refund_due_outbound(trade).await? {
+            return Ok(outbound);
+        }
+        self.db.set_payout(&trade.id, invoice, None)?;
+        let Some(trade) = self.db.get_trade(&trade.id)? else {
+            bail!("trade {} disappeared", trade.id);
+        };
+        let order = self.require_order(&trade.order_id)?;
+        match self.probe_payout(&trade).await? {
+            PayoutProbe::Ready => self.mark_waiting_fiat(&trade, &order),
+            PayoutProbe::NoRoute(reason) => {
+                Ok(vec![cant_do(&trade.buyer_nostr, Some(trade.id), &reason)])
+            }
+            PayoutProbe::InvoiceExpired => self.refund_expired_invoice(&trade).await,
+            PayoutProbe::WindowClosed => self.refund_past_deadline(&trade).await,
+            PayoutProbe::Later => Ok(vec![cant_do(
+                &trade.buyer_nostr,
+                Some(trade.id),
+                "could not check the payout route. Send the same invoice again",
+            )]),
+        }
+    }
+
+    /// Fiber v0.9.1 dry run. A returned preimage is ignored and does not open fiat.
+    async fn probe_payout(&self, trade: &Trade) -> Result<PayoutProbe> {
+        let Some(invoice) = trade
+            .payout_invoice
+            .clone()
+            .filter(|invoice| !invoice.trim().is_empty())
+        else {
+            warn!(trade_id = %trade.id, "payout invoice missing; holding fiat");
+            return Ok(PayoutProbe::Later);
+        };
+        let parsed = match self.fiber.parse_invoice(&invoice).await {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn!(trade_id = %trade.id, %error, "payout invoice could not be parsed");
+                return Ok(PayoutProbe::Later);
+            }
+        };
+        if parsed
+            .expires_at_ms
+            .is_some_and(|expires| expires < unix_now_ms())
+        {
+            return Ok(PayoutProbe::InvoiceExpired);
+        }
+        let budget = self
+            .outgoing_budget(trade, parsed.final_tlc_expiry_delta_ms)
+            .await?;
+        let tlc_expiry_limit_ms = match budget {
+            PayoutBudget::Refund => return Ok(PayoutProbe::WindowClosed),
+            PayoutBudget::ShorterInvoice => {
+                return Ok(PayoutProbe::NoRoute(
+                    "payout invoice lock is longer than the hold has left".into(),
+                ));
+            }
+            PayoutBudget::Send {
+                tlc_expiry_limit_ms,
+            } => tlc_expiry_limit_ms,
+        };
+        match self
+            .fiber
+            .probe_payment(&invoice, tlc_expiry_limit_ms)
+            .await
+        {
+            Ok(payment) if payment.preimage.is_some() => {
+                warn!(
+                    trade_id = %trade.id,
+                    "dry run returned a preimage; fiat stays closed"
+                );
+                Ok(PayoutProbe::Later)
+            }
+            Ok(payment)
+                if payment.status == "Failed"
+                    && payment_invoice_expired(payment.failed_error.as_deref()) =>
+            {
+                Ok(PayoutProbe::InvoiceExpired)
+            }
+            Ok(payment)
+                if payment.status == "Failed"
+                    && (payment_route_failed(payment.failed_error.as_deref())
+                        || payment_expiry_limited(payment.failed_error.as_deref())) =>
+            {
+                Ok(PayoutProbe::NoRoute(PAYOUT_NO_ROUTE.into()))
+            }
+            Ok(payment) if payment.status == "Failed" => {
+                warn!(
+                    trade_id = %trade.id,
+                    error = payment.failed_error.as_deref().unwrap_or("failed"),
+                    "dry run failed"
+                );
+                Ok(PayoutProbe::Later)
+            }
+            Ok(_) => Ok(PayoutProbe::Ready),
+            Err(error) if payment_invoice_expired(Some(&error.to_string())) => {
+                Ok(PayoutProbe::InvoiceExpired)
+            }
+            Err(error)
+                if route_not_ready(&error) || payment_expiry_limited(Some(&error.to_string())) =>
+            {
+                Ok(PayoutProbe::NoRoute(PAYOUT_NO_ROUTE.into()))
+            }
+            Err(error) => {
+                warn!(trade_id = %trade.id, %error, "dry run could not be checked");
+                Ok(PayoutProbe::Later)
+            }
+        }
     }
 
     async fn refund_expired_invoice(&self, trade: &Trade) -> Result<Vec<Outbound>> {
@@ -442,7 +790,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             return Ok(Err(reason.into()));
         }
         let until_ms = trade
-            .pay_by()
+            .route_by()
             .map(|secs| secs.saturating_mul(1000))
             .unwrap_or_else(unix_now_ms);
         if !invoice_payable_through(parsed.expires_at_ms, until_ms) {
@@ -972,11 +1320,72 @@ fn payment_missing(error: &anyhow::Error) -> bool {
 
 fn payout_window_closed(trade: &Trade) -> bool {
     trade
-        .pay_by()
+        .route_by()
         .is_some_and(|deadline| unix_now() >= deadline)
 }
 
-const PAYOUT_NO_ROUTE: &str = "no route to the payout invoice. The wallet has to be able to receive, then send this invoice again";
+const PAYOUT_NO_ROUTE: &str = "no route to the payout invoice. The wallet has to be able to receive, then send this invoice again. Do not send fiat until the trade asks for it";
+
+const FIAT_OWED_REASON: &str = "The buyer had already paid. The CKB is returning to the seller, who owes that fiat back. This desk cannot move the fiat.";
+
+const BUYER_UNPAID_REASON: &str =
+    "The solver found the buyer did not pay. The CKB is returning to the seller.";
+
+const CHAT_KEY_REQUIRED: &str = "share the chat key with the solver. The receipt cannot be read without it, so the solver cannot pay the buyer";
+
+const FIAT_WINDOW_CLOSED: &str = "the fiat window has closed. It has to leave 2 hours for the seller to release and 4 hours for the solver before Fiber can no longer start the payout";
+
+pub(crate) const WINDOW_ENDED: &str = "the solver window has ended. The CKB returns to the seller";
+
+pub(crate) const RECORD_ALREADY: &str = "this trade already has a public record";
+
+/// Release stops once the 6-hour window has ended, or once a public record is stored.
+pub(crate) fn release_refusal(trade: &Trade, now: i64) -> Option<&'static str> {
+    if trade
+        .solver_deadline()
+        .is_some_and(|deadline| now >= deadline)
+    {
+        return Some(WINDOW_ENDED);
+    }
+    if trade.outcome.is_some() {
+        return Some(RECORD_ALREADY);
+    }
+    None
+}
+
+enum PayoutProbe {
+    Ready,
+    NoRoute(String),
+    InvoiceExpired,
+    WindowClosed,
+    Later,
+}
+
+/// The solver window ended after fiat was marked sent, and nobody decided.
+fn unresolved_due(trade: &Trade, now: i64) -> bool {
+    if trade.fiat_sent_at.is_none() || trade.fiat_acknowledged || trade.outcome.is_some() {
+        return false;
+    }
+    let Some(deadline) = trade.solver_deadline() else {
+        return false;
+    };
+    if now < deadline {
+        return false;
+    }
+    matches!(
+        trade.phase().ok(),
+        Some(Phase::FiatSent | Phase::Disputed | Phase::Refunding | Phase::Expired)
+    )
+}
+
+fn refund_reason(reason: Option<&str>, fiat_acknowledged: bool) -> Option<String> {
+    match (reason, fiat_acknowledged) {
+        (Some(existing), true) => Some(format!("{existing} {FIAT_OWED_REASON}")),
+        (None, true) => Some(FIAT_OWED_REASON.to_string()),
+        (Some(existing), false) => Some(existing.to_string()),
+        (None, false) => None,
+    }
+}
 
 const PAYOUT_INVOICE_EXPIRED: &str = "the payout invoice expired. The wallet cannot replace that payment hash, so the hold is returning the CKB to the seller";
 
@@ -1035,6 +1444,8 @@ mod tests {
         last_tlc_expiry_limit: StdMutex<Option<u64>>,
         final_delta_ms: StdMutex<u64>,
         expires_at_ms: StdMutex<Option<i64>>,
+        probe_error: StdMutex<Option<String>>,
+        probe_preimage: StdMutex<bool>,
     }
 
     impl FakeFiber {
@@ -1059,6 +1470,8 @@ mod tests {
                 last_tlc_expiry_limit: StdMutex::new(None),
                 final_delta_ms: StdMutex::new(crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS),
                 expires_at_ms: StdMutex::new(None),
+                probe_error: StdMutex::new(None),
+                probe_preimage: StdMutex::new(false),
             }
         }
     }
@@ -1137,6 +1550,21 @@ mod tests {
 
     #[async_trait]
     impl PaymentRpc for FakeFiber {
+        async fn probe_payment(&self, _: &str, _: u64) -> Result<PaymentInfo> {
+            if let Some(error) = self.probe_error.lock().expect("probe").clone() {
+                bail!("{error}");
+            }
+            Ok(PaymentInfo {
+                payment_hash: "hash".into(),
+                status: "Created".into(),
+                preimage: self
+                    .probe_preimage
+                    .lock()
+                    .expect("probe preimage")
+                    .then(|| "preimage".to_string()),
+                failed_error: None,
+            })
+        }
         async fn send_payment(&self, _: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo> {
             *self.send_count.lock().expect("send") += 1;
             *self.last_tlc_expiry_limit.lock().expect("limit") = Some(tlc_expiry_limit_ms);
@@ -1227,12 +1655,17 @@ mod tests {
             state: Phase::WaitingHold.as_str().into(),
             hold_payment_hash: Some("hash".into()),
             hold_invoice: Some("inv".into()),
-            payout_invoice: None,
+            payout_invoice: Some("buyer-invoice".into()),
             payout_payment_hash: None,
             hold_received_at: None,
             hold_created_at: Some(unix_now()),
             buyer_fiber_addr: None,
             hold_expires_at_ms: None,
+            fiat_acknowledged: false,
+            fiat_sent_at: None,
+            chat_key_shared: false,
+            release_prompted: false,
+            outcome: None,
         })
         .unwrap();
         db.insert_preimage("hash", "preimage").unwrap();
@@ -1259,19 +1692,25 @@ mod tests {
         assert_eq!(details.seller_nostr, "seller");
         assert_eq!(details.buyer_nostr, "buyer");
         assert!(details.pay_by.is_some());
-        assert!(details.release_by.is_some());
+        assert!(details.release_by.is_none());
         let trade = engine.db.get_trade("trade").unwrap().unwrap();
         assert!(trade.hold_received_at.is_some());
         assert_eq!(
             details.pay_by,
-            trade.hold_expires_at_ms.map(crate::payout_deadline_secs)
+            trade.hold_expires_at_ms.map(crate::fiat_deadline_secs)
         );
+        assert!(details.release_by.is_none());
         engine
             .db
             .set_hold_expires_at_ms("trade", unix_now_ms())
             .unwrap();
         let refunding = engine.on_hold_status("trade").await.unwrap();
         assert!(replies_contain(&refunding, REFUNDING));
+        assert!(
+            !refunding
+                .iter()
+                .any(|item| matches!(item, Outbound::TradeRecord(_)))
+        );
         assert!(*fiber.removed.lock().unwrap());
         assert!(engine.db.get_preimage("hash").unwrap().is_none());
         assert_eq!(
@@ -1304,6 +1743,307 @@ mod tests {
                 .hold_received_at
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_route_holds_fiat_until_the_same_invoice_routes() {
+        let (engine, fiber) = fake_engine("Received");
+        *fiber.probe_error.lock().unwrap() =
+            Some("send_payment failed: Failed to build route, no path found".into());
+        let blocked = engine.on_hold_status("trade").await.unwrap();
+        assert!(replies_contain(&blocked, crate::NEED_ROUTE));
+        assert!(!replies_contain(&blocked, WAITING_FIAT));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::AwaitingRoute.as_str()
+        );
+        let paid = engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: "buyer-invoice".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&paid).contains("cannot receive"));
+        *fiber.probe_error.lock().unwrap() = None;
+        let opened = engine
+            .handle(
+                "buyer",
+                Envelope::new(crate::PAYOUT_INVOICE)
+                    .with_trade("trade")
+                    .with_payload(crate::PayoutInvoicePayload {
+                        invoice: "buyer-invoice".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(replies_contain(&opened, WAITING_FIAT));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::WaitingFiat.as_str()
+        );
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_preimage_does_not_open_fiat() {
+        let (engine, fiber) = fake_engine("Received");
+        *fiber.probe_preimage.lock().unwrap() = true;
+        let waiting = engine.on_hold_status("trade").await.unwrap();
+        assert!(waiting.is_empty());
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::WaitingHold.as_str()
+        );
+        assert!(engine.db.get_preimage("hash").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn solver_fiat_owed_refunds_and_records_the_fiat() {
+        let (engine, fiber) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .fiat_acknowledged
+        );
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        conversation_key: Some("ab".repeat(32)),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resolved = engine
+            .handle(
+                "solver",
+                Envelope::new(RESOLVE)
+                    .with_trade("trade")
+                    .with_payload(ResolvePayload {
+                        winner: "fiat-owed".into(),
+                        invoice: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(replies_contain(&resolved, REFUNDING));
+        let record = resolved.iter().find_map(|item| match item {
+            Outbound::TradeRecord(record) => Some(record),
+            _ => None,
+        });
+        let record = record.expect("fiat-owed record");
+        assert_eq!(record.outcome, "fiat-owed");
+        assert_eq!(record.seller_nostr, "seller");
+        assert_eq!(record.fiat_currency, "NGN");
+        let reason = resolved.iter().find_map(|item| match item {
+            Outbound::Reply { envelope, .. } if envelope.action == REFUNDING => {
+                let payload: NewInvoicePayload = envelope.decode_payload().unwrap();
+                Some(payload.reason)
+            }
+            _ => None,
+        });
+        assert!(reason.unwrap().contains("owes that fiat"));
+        assert!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .fiat_acknowledged
+        );
+        assert!(*fiber.removed.lock().unwrap());
+        let corrected = engine
+            .handle(
+                "solver",
+                Envelope::new(RESOLVE)
+                    .with_trade("trade")
+                    .with_payload(ResolvePayload {
+                        winner: "seller".into(),
+                        invoice: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&corrected).contains("public record"));
+        assert!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .fiat_acknowledged
+        );
+        assert_eq!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some(crate::OUTCOME_FIAT_OWED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispute_before_fiat_still_ends_at_the_fiat_deadline() {
+        let (engine, fiber) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        conversation_key: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        let route_by = trade.route_by().expect("route deadline");
+        let pay_by = trade.pay_by().expect("fiat deadline");
+        assert!(pay_by < route_by);
+        let expires_at_ms = unix_now_ms()
+            + 3_600_000
+            + crate::CLAIM_MARGIN_MS as i64
+            + crate::MIN_TLC_EXPIRY_LIMIT_MS as i64
+            + crate::FIBER_RANDOM_EXPIRY_RESERVE_MS as i64;
+        engine
+            .db
+            .set_hold_expires_at_ms("trade", expires_at_ms)
+            .unwrap();
+        let fresh = engine.db.get_trade("trade").unwrap().unwrap();
+        assert!(fresh.pay_by().expect("pay") < unix_now());
+        assert!(fresh.route_by().expect("route") > unix_now());
+        let refunding = engine.on_hold_status("trade").await.unwrap();
+        assert!(replies_contain(&refunding, REFUNDING));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Refunding.as_str()
+        );
+        assert!(*fiber.removed.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn fiat_sent_during_a_dispute_starts_the_release_clock() {
+        let (engine, _) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        conversation_key: Some("ab".repeat(32)),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sent = engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(replies_contain(&sent, FIAT_SENT_OK));
+        let payload = sent.iter().find_map(|item| match item {
+            Outbound::Reply { envelope, .. } if envelope.action == FIAT_SENT_OK => {
+                let body: crate::FiatSentOkPayload = envelope.decode_payload().unwrap();
+                Some(body)
+            }
+            _ => None,
+        });
+        let payload = payload.expect("fiat-sent payload");
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        assert_eq!(trade.state, Phase::Disputed.as_str());
+        let sent_at = trade.fiat_sent_at.expect("fiat sent at");
+        assert_eq!(payload.release_by, sent_at + crate::RELEASE_GRACE_SECS);
+        assert_eq!(payload.solver_window_secs, crate::SOLVER_WINDOW_SECS);
+        assert!(!trade.fiat_acknowledged);
+    }
+
+    #[tokio::test]
+    async fn release_then_expiry_records_fiat_owed() {
+        let (engine, fiber) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine
+            .handle("seller", Envelope::new(RELEASE).with_trade("trade"))
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .fiat_acknowledged
+        );
+        engine
+            .db
+            .set_hold_expires_at_ms("trade", unix_now_ms())
+            .unwrap();
+        *fiber.get_payment_missing.lock().unwrap() = true;
+        let refunding = engine.on_payout_status("trade").await.unwrap();
+        assert!(replies_contain(&refunding, REFUNDING));
+        assert!(
+            refunding
+                .iter()
+                .any(|item| matches!(item, Outbound::TradeRecord(_)))
+        );
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1349,6 +2089,7 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("solver")
         );
+        engine.db.set_payout("trade", "", None).unwrap();
         let missing = engine
             .handle(
                 "solver",
@@ -1361,6 +2102,10 @@ mod tests {
                     .unwrap(),
             )
             .await
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", None)
             .unwrap();
         assert!(cant_do_reason(&missing).contains("payout invoice"));
         let sneaky = engine
@@ -1377,14 +2122,15 @@ mod tests {
             .await
             .unwrap();
         assert!(cant_do_reason(&sneaky).contains("solver"));
-        assert!(
+        assert_eq!(
             engine
                 .db
                 .get_trade("trade")
                 .unwrap()
                 .unwrap()
                 .payout_invoice
-                .is_none()
+                .as_deref(),
+            Some("buyer-invoice")
         );
         let seller = engine
             .handle(
@@ -1400,12 +2146,359 @@ mod tests {
             .await
             .unwrap();
         assert!(replies_contain(&seller, REFUNDING));
+        let record = seller.iter().find_map(|item| match item {
+            Outbound::TradeRecord(record) => Some(record),
+            _ => None,
+        });
+        assert_eq!(record.expect("buyer-unpaid record").outcome, "buyer-unpaid");
         assert!(*fiber.removed.lock().unwrap());
         assert_eq!(
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::Refunding.as_str()
         );
         assert!(!fiber.preimages.lock().unwrap().contains("hash"));
+    }
+
+    #[tokio::test]
+    async fn fiat_sent_after_the_deadline_refunds_without_a_fiat_record() {
+        let (engine, _) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .db
+            .set_hold_expires_at_ms("trade", unix_now_ms())
+            .unwrap();
+        let refunding = engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(replies_contain(&refunding, REFUNDING));
+        let reason = refunding.iter().find_map(|item| match item {
+            Outbound::Reply { envelope, .. } if envelope.action == REFUNDING => {
+                let payload: NewInvoicePayload = envelope.decode_payload().unwrap();
+                Some(payload.reason)
+            }
+            _ => None,
+        });
+        assert!(reason.unwrap().contains("2 hours"));
+        assert!(
+            !refunding
+                .iter()
+                .any(|item| matches!(item, Outbound::TradeRecord(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn release_grace_asks_the_buyer_to_dispute_once() {
+        let (engine, _) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        let sent = engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let payload: crate::FiatSentOkPayload = sent
+            .iter()
+            .find_map(|item| match item {
+                Outbound::Reply { envelope, .. } if envelope.action == FIAT_SENT_OK => {
+                    Some(envelope.decode_payload().unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        let sent_at = trade.fiat_sent_at.expect("fiat sent");
+        assert_eq!(payload.release_by, sent_at + crate::RELEASE_GRACE_SECS);
+        assert_eq!(payload.solver_window_secs, crate::SOLVER_WINDOW_SECS);
+        assert!(engine.on_hold_status("trade").await.unwrap().is_empty());
+        engine
+            .db
+            .set_fiat_sent_at("trade", unix_now() - crate::RELEASE_GRACE_SECS - 1)
+            .unwrap();
+        let due = engine.on_hold_status("trade").await.unwrap();
+        assert!(replies_contain(&due, crate::RELEASE_DUE));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::FiatSent.as_str()
+        );
+        assert!(engine.on_hold_status("trade").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn waiting_fiat_is_not_probed_until_the_buyer_marks_sent() {
+        let (engine, fiber) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        *fiber.probe_error.lock().unwrap() =
+            Some("send_payment failed: Failed to build route, no path found".into());
+        assert!(engine.on_hold_status("trade").await.unwrap().is_empty());
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::WaitingFiat.as_str()
+        );
+        let refused = engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&refused).contains("no route"));
+        assert!(replies_contain(&refused, crate::NEED_ROUTE));
+        assert!(!replies_contain(&refused, FIAT_SENT_OK));
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::AwaitingRoute.as_str()
+        );
+        assert!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .fiat_sent_at
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missed_solver_window_publishes_unresolved_and_still_refunds() {
+        let (engine, fiber) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine
+            .db
+            .set_fiat_sent_at(
+                "trade",
+                unix_now() - crate::RELEASE_GRACE_SECS - crate::SOLVER_WINDOW_SECS - 1,
+            )
+            .unwrap();
+        engine.db.set_release_prompted("trade").unwrap();
+        let noted = engine.on_hold_status("trade").await.unwrap();
+        let record = noted.iter().find_map(|item| match item {
+            Outbound::TradeRecord(record) => Some(record.outcome.as_str()),
+            _ => None,
+        });
+        assert_eq!(record, Some(crate::OUTCOME_UNRESOLVED));
+        assert!(replies_contain(&noted, crate::TRADE_RECORD));
+        assert!(!replies_contain(&noted, REFUNDING));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::FiatSent.as_str()
+        );
+        assert_eq!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some(crate::OUTCOME_UNRESOLVED)
+        );
+        let late_release = engine
+            .handle("seller", Envelope::new(RELEASE).with_trade("trade"))
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&late_release).contains("solver window"));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::FiatSent.as_str()
+        );
+        assert!(
+            !engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .fiat_acknowledged
+        );
+        let late_decision = engine
+            .handle(
+                "solver",
+                Envelope::new(RESOLVE)
+                    .with_trade("trade")
+                    .with_payload(ResolvePayload {
+                        winner: "buyer".into(),
+                        invoice: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&late_decision).contains("public record"));
+        assert!(engine.on_hold_status("trade").await.unwrap().is_empty());
+
+        engine
+            .db
+            .set_hold_expires_at_ms("trade", unix_now_ms())
+            .unwrap();
+        let refunding = engine.on_hold_status("trade").await.unwrap();
+        assert!(replies_contain(&refunding, REFUNDING));
+        assert!(
+            !refunding
+                .iter()
+                .any(|item| matches!(item, Outbound::TradeRecord(_)))
+        );
+        assert_eq!(*fiber.send_count.lock().unwrap(), 0);
+        assert!(*fiber.removed.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn buyer_award_without_the_chat_key_is_refused() {
+        let (engine, fiber) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        conversation_key: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let refused = engine
+            .handle(
+                "solver",
+                Envelope::new(RESOLVE)
+                    .with_trade("trade")
+                    .with_payload(ResolvePayload {
+                        winner: "buyer".into(),
+                        invoice: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&refused).contains("chat key"));
+        assert!(!*fiber.removed.lock().unwrap());
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        conversation_key: Some("cd".repeat(32)),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .chat_key_shared
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_solver_decision_records_fiat_owed_after_the_refund() {
+        let (engine, _) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(FIAT_SENT)
+                    .with_trade("trade")
+                    .with_payload(FiatSentPayload {
+                        invoice: String::new(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine
+            .handle(
+                "buyer",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        conversation_key: Some("ab".repeat(32)),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine
+            .db
+            .set_hold_expires_at_ms("trade", unix_now_ms())
+            .unwrap();
+        let refunding = engine.on_hold_status("trade").await.unwrap();
+        assert!(replies_contain(&refunding, REFUNDING));
+        assert!(
+            !refunding
+                .iter()
+                .any(|item| matches!(item, Outbound::TradeRecord(_)))
+        );
+        let noted = engine
+            .handle(
+                "solver",
+                Envelope::new(RESOLVE)
+                    .with_trade("trade")
+                    .with_payload(ResolvePayload {
+                        winner: "fiat-owed".into(),
+                        invoice: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let record = noted.iter().find_map(|item| match item {
+            Outbound::TradeRecord(record) => Some(record.outcome.as_str()),
+            _ => None,
+        });
+        assert_eq!(record, Some("fiat-owed"));
     }
 
     #[tokio::test]
@@ -1725,7 +2818,7 @@ mod tests {
         assert_eq!(details.seller_nostr, "seller");
         assert_eq!(details.buyer_nostr, "buyer");
         assert!(details.pay_by.is_some());
-        assert!(details.release_by.is_some());
+        assert!(details.release_by.is_none());
 
         let seller_fiat = engine
             .handle(
@@ -1807,12 +2900,13 @@ mod tests {
         let expires_at_ms = unix_now_ms() + 5 * 3_600 * 1000;
         *fiber.inbound_expiry.lock().unwrap() = Some(expires_at_ms);
         let waiting = engine.on_hold_status("trade").await.unwrap();
-        assert!(replies_contain(&waiting, WAITING_FIAT));
+        // Five hours cannot fit Fiber's route reserve, so fiat stays closed.
+        assert!(replies_contain(&waiting, REFUNDING));
         let trade = engine.db.get_trade("trade").unwrap().unwrap();
         assert_eq!(trade.hold_expires_at_ms, Some(expires_at_ms));
         assert_eq!(
             trade.pay_by(),
-            Some(crate::payout_deadline_secs(expires_at_ms))
+            Some(crate::fiat_deadline_secs(expires_at_ms))
         );
     }
 
@@ -2178,7 +3272,7 @@ mod tests {
         assert!(replies_contain(&canceled, CANCELED));
         let published = canceled.iter().find_map(|item| match item {
             Outbound::PublicOrder(order) => Some(order),
-            Outbound::Reply { .. } => None,
+            Outbound::Reply { .. } | Outbound::TradeRecord(_) => None,
         });
         assert_eq!(published.unwrap().status, "canceled");
         let reply = canceled.iter().find_map(|item| match item {
@@ -2192,7 +3286,7 @@ mod tests {
     fn reply_to(out: &[Outbound], to: &str, action: &str) -> bool {
         out.iter().any(|item| match item {
             Outbound::Reply { to: dest, envelope } => dest == to && envelope.action == action,
-            Outbound::PublicOrder(_) => false,
+            Outbound::PublicOrder(_) | Outbound::TradeRecord(_) => false,
         })
     }
 

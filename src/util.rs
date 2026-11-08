@@ -25,6 +25,17 @@ pub fn payout_deadline_secs(expires_at_ms: i64) -> i64 {
         / 1000
 }
 
+/// Last second the buyer may mark fiat sent.
+///
+/// Leaves the 2-hour release grace and the 4-hour solver window in front of
+/// [payout_deadline_secs]. That routing deadline is at least [crate::ROUTE_BUFFER_SECS]
+/// before the hold ends, and longer when Fiber needs more TLC time.
+pub fn fiat_deadline_secs(expires_at_ms: i64) -> i64 {
+    payout_deadline_secs(expires_at_ms)
+        .saturating_sub(crate::RELEASE_GRACE_SECS)
+        .saturating_sub(crate::SOLVER_WINDOW_SECS)
+}
+
 /// Seconds a payout invoice must still be payable when the hold is created.
 pub fn payout_invoice_must_last_secs(hold_secs: u64) -> u64 {
     let slack_secs = (crate::CLAIM_MARGIN_MS
@@ -245,6 +256,25 @@ pub fn i64_from_shannons(value: u128) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fiat_deadline_leaves_the_release_grace_and_solver_window() {
+        let expires_at_ms = 50_000_000_000_i64;
+        let route = payout_deadline_secs(expires_at_ms);
+        let fiat = fiat_deadline_secs(expires_at_ms);
+        let hold_end = expires_at_ms / 1000;
+        assert_eq!(
+            fiat,
+            route - crate::RELEASE_GRACE_SECS - crate::SOLVER_WINDOW_SECS
+        );
+        assert!(route <= hold_end - crate::ROUTE_BUFFER_SECS);
+        assert!(
+            fiat <= hold_end
+                - crate::RELEASE_GRACE_SECS
+                - crate::SOLVER_WINDOW_SECS
+                - crate::ROUTE_BUFFER_SECS
+        );
+    }
 
     #[test]
     fn a_payout_invoice_has_to_outlast_the_hold() {

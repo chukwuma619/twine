@@ -1,7 +1,7 @@
 use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::Outbound;
-use crate::{Envelope, PayoutInvoicePayload};
+use crate::{Envelope, PayoutInvoicePayload, Phase};
 use anyhow::Result;
 
 pub(crate) async fn on_payout_invoice<F: FiberRpc + 'static>(
@@ -39,6 +39,9 @@ pub(crate) async fn on_payout_invoice<F: FiberRpc + 'static>(
             Some(trade_id),
             "only the buyer can send the payout invoice",
         )]);
+    }
+    if trade.phase()? == Phase::AwaitingRoute {
+        return engine.retry_payout_route(&trade, invoice).await;
     }
     match engine.bind_buyer_hold(&trade, invoice).await? {
         Ok(outbound) => Ok(outbound),

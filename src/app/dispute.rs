@@ -23,13 +23,16 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
     let Some(trade) = engine.db.get_trade(&trade_id)? else {
         return Ok(vec![cant_do(sender, Some(trade_id), "trade not found")]);
     };
+    let payload: DisputePayload = envelope.decode_payload().unwrap_or_default();
+    if trade.phase()? == crate::Phase::Disputed {
+        return attach_chat_key(engine, sender, &trade, &payload).await;
+    }
     if let Some(outbound) = engine.refund_due_outbound(&trade).await? {
         return Ok(outbound);
     }
     let actor = engine.trade_actor(&trade, sender);
     match apply_dispute(trade.phase()?, actor) {
         crate::Decision::Ok(phase) => {
-            let payload: DisputePayload = envelope.decode_payload().unwrap_or_default();
             if actor == Actor::Buyer
                 && let Some(invoice) = payload
                     .invoice
@@ -43,6 +46,9 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
                 engine.db.set_payout(&trade.id, invoice, None)?;
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
+            if conversation_key(payload.conversation_key.as_deref()).is_some() {
+                engine.db.set_chat_key_shared(&trade.id)?;
+            }
             engine.watch(&trade.id)?;
             let mut outbound = party_replies(
                 &trade,
@@ -69,6 +75,46 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
         crate::Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
         crate::Decision::NoOp => Ok(Vec::new()),
     }
+}
+
+/// A dispute is already open. A later message can still hand the solver the chat key.
+async fn attach_chat_key<F: FiberRpc + 'static>(
+    engine: &Engine<F>,
+    sender: &str,
+    trade: &crate::Trade,
+    payload: &DisputePayload,
+) -> Result<Vec<Outbound>> {
+    let actor = engine.trade_actor(trade, sender);
+    if !matches!(actor, Actor::Buyer | Actor::Seller) {
+        return Ok(vec![cant_do(
+            sender,
+            Some(trade.id.clone()),
+            "only a party to the trade can dispute",
+        )]);
+    }
+    let Some(key) = conversation_key(payload.conversation_key.as_deref()) else {
+        return Ok(vec![cant_do(
+            sender,
+            Some(trade.id.clone()),
+            "the chat key has to be 32 bytes of hex",
+        )]);
+    };
+    engine.db.set_chat_key_shared(&trade.id)?;
+    let Some(solver) = engine.solver.clone() else {
+        return Ok(vec![cant_do(
+            sender,
+            Some(trade.id.clone()),
+            "solver is not configured",
+        )]);
+    };
+    Ok(vec![Outbound::Reply {
+        to: solver,
+        envelope: Envelope::new(DISPUTED)
+            .with_trade(&trade.id)
+            .with_payload(SolverDispute {
+                conversation_key: key,
+            })?,
+    }])
 }
 
 #[derive(Serialize)]

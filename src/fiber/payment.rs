@@ -7,6 +7,10 @@ use serde_json::json;
 #[async_trait]
 pub trait PaymentRpc: Send + Sync {
     async fn send_payment(&self, invoice: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo>;
+    /// Route check only. Fiber v0.9.1 `send_payment` with `dry_run: true` builds a path,
+    /// returns `Created`, and does not store a session or send an onion, so it cannot
+    /// reveal the preimage. `build_router` is the wrong call: it requires `hops_info`.
+    async fn probe_payment(&self, invoice: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo>;
     async fn get_payment(&self, payment_hash: &str) -> Result<PaymentInfo>;
 }
 
@@ -23,15 +27,17 @@ impl PaymentRpc for HttpFiber {
                 })),
             )
             .await?;
-        Ok(PaymentInfo {
-            payment_hash: result["payment_hash"]
-                .as_str()
-                .ok_or_else(|| anyhow!("send_payment missing payment_hash"))?
-                .to_string(),
-            status: result["status"].as_str().unwrap_or("Created").to_string(),
-            preimage: preimage_field(&result),
-            failed_error: failed_error_field(&result),
-        })
+        payment_from_send(result)
+    }
+
+    async fn probe_payment(&self, invoice: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo> {
+        let result = self
+            .call(
+                "send_payment",
+                Some(probe_payment_params(invoice, tlc_expiry_limit_ms)),
+            )
+            .await?;
+        payment_from_send(result)
     }
 
     async fn get_payment(&self, payment_hash: &str) -> Result<PaymentInfo> {
@@ -48,6 +54,29 @@ impl PaymentRpc for HttpFiber {
             failed_error: failed_error_field(&result),
         })
     }
+}
+
+/// Params for Fiber v0.9.1 `send_payment` `dry_run`. A missing path comes back as an
+/// RPC error whose message contains `Failed to build route`, not as a stored payment.
+pub fn probe_payment_params(invoice: &str, tlc_expiry_limit_ms: u64) -> serde_json::Value {
+    json!({
+        "invoice": invoice,
+        "max_fee_rate": hex_u64(MAX_FEE_RATE),
+        "tlc_expiry_limit": hex_u64(tlc_expiry_limit_ms),
+        "dry_run": true,
+    })
+}
+
+fn payment_from_send(result: serde_json::Value) -> Result<PaymentInfo> {
+    Ok(PaymentInfo {
+        payment_hash: result["payment_hash"]
+            .as_str()
+            .ok_or_else(|| anyhow!("send_payment missing payment_hash"))?
+            .to_string(),
+        status: result["status"].as_str().unwrap_or("Created").to_string(),
+        preimage: preimage_field(&result),
+        failed_error: failed_error_field(&result),
+    })
 }
 
 fn preimage_field(result: &serde_json::Value) -> Option<String> {
@@ -100,6 +129,14 @@ fn text_field(result: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_asks_fiber_not_to_send() {
+        let params = probe_payment_params("invoice", 60_000);
+        assert_eq!(params["dry_run"], true);
+        assert_eq!(params["invoice"], "invoice");
+        assert!(params.get("keysend").is_none());
+    }
 
     #[test]
     fn payment_preimage_is_the_field_fiber_returns() {

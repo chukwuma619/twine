@@ -1,8 +1,8 @@
 use crate::constant::{
-    CANCEL, CLAIM_MARGIN_MS, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER,
-    PAYOUT_INVOICE, RELEASE, RESOLVE, TAKE,
+    CANCEL, DISPUTE, FIAT_SENT, INVOICE_EXPIRY_SECS, MY_TRADES, NEW_ORDER, PAYOUT_INVOICE, RELEASE,
+    RELEASE_GRACE_SECS, RESOLVE, TAKE,
 };
-use crate::util::{payout_deadline_secs, shannons_to_ckb_string};
+use crate::util::{fiat_deadline_secs, payout_deadline_secs, shannons_to_ckb_string};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,7 @@ pub enum Phase {
     Pending,
     WaitingInvoice,
     WaitingHold,
+    AwaitingRoute,
     WaitingFiat,
     FiatSent,
     Releasing,
@@ -28,6 +29,7 @@ impl Phase {
             Self::Pending => "pending",
             Self::WaitingInvoice => "waiting-invoice",
             Self::WaitingHold => "waiting-hold",
+            Self::AwaitingRoute => "awaiting-route",
             Self::WaitingFiat => "waiting-fiat",
             Self::FiatSent => "fiat-sent",
             Self::Releasing => "releasing",
@@ -45,6 +47,7 @@ impl Phase {
             "pending" => Some(Self::Pending),
             "waiting-invoice" => Some(Self::WaitingInvoice),
             "waiting-hold" => Some(Self::WaitingHold),
+            "awaiting-route" => Some(Self::AwaitingRoute),
             "waiting-fiat" => Some(Self::WaitingFiat),
             "fiat-sent" => Some(Self::FiatSent),
             "releasing" => Some(Self::Releasing),
@@ -63,6 +66,7 @@ impl Phase {
         matches!(
             self,
             Self::WaitingHold
+                | Self::AwaitingRoute
                 | Self::WaitingFiat
                 | Self::FiatSent
                 | Self::Releasing
@@ -75,6 +79,7 @@ impl Phase {
     pub fn watched_phases() -> &'static [Phase] {
         &[
             Self::WaitingHold,
+            Self::AwaitingRoute,
             Self::WaitingFiat,
             Self::FiatSent,
             Self::Releasing,
@@ -90,6 +95,7 @@ impl Phase {
         &[
             Self::WaitingInvoice,
             Self::WaitingHold,
+            Self::AwaitingRoute,
             Self::WaitingFiat,
             Self::FiatSent,
             Self::Releasing,
@@ -345,6 +351,7 @@ pub struct CantDoPayload {
 pub enum Outbound {
     Reply { to: String, envelope: Envelope },
     PublicOrder(PublicOrder),
+    TradeRecord(TradeRecord),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +371,60 @@ pub struct PublicOrder {
     pub reserved_ckb: Option<String>,
 }
 
+/// One published outcome for a trade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeRecord {
+    pub trade_id: String,
+    pub seller_nostr: String,
+    pub buyer_nostr: String,
+    pub fiat_amount: String,
+    pub fiat_currency: String,
+    /// `fiat-owed`, `buyer-unpaid`, or `unresolved`. The CKB refund is a separate protocol action.
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeRecordNotice {
+    pub outcome: String,
+}
+
+impl TradeRecord {
+    pub fn fiat_owed(trade: &Trade, fiat_currency: &str) -> Self {
+        Self::outcome(trade, fiat_currency, crate::OUTCOME_FIAT_OWED)
+    }
+
+    pub fn buyer_unpaid(trade: &Trade, fiat_currency: &str) -> Self {
+        Self::outcome(trade, fiat_currency, crate::OUTCOME_BUYER_UNPAID)
+    }
+
+    pub fn unresolved(trade: &Trade, fiat_currency: &str) -> Self {
+        Self::outcome(trade, fiat_currency, crate::OUTCOME_UNRESOLVED)
+    }
+
+    fn outcome(trade: &Trade, fiat_currency: &str, outcome: &str) -> Self {
+        Self {
+            trade_id: trade.id.clone(),
+            seller_nostr: trade.seller_nostr.clone(),
+            buyer_nostr: trade.buyer_nostr.clone(),
+            fiat_amount: trade.fiat_amount.clone(),
+            fiat_currency: fiat_currency.to_string(),
+            outcome: outcome.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiatSentOkPayload {
+    pub release_by: i64,
+    pub solver_window_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseDuePayload {
+    pub release_by: i64,
+    pub solver_window_secs: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingFiatPayload {
     pub fiat_amount: String,
@@ -378,7 +439,7 @@ pub struct WaitingFiatPayload {
 }
 
 impl WaitingFiatPayload {
-    pub fn from_trade(trade: &Trade, fiat_currency: &str, hold_secs: u64) -> Self {
+    pub fn from_trade(trade: &Trade, fiat_currency: &str) -> Self {
         Self {
             fiat_amount: trade.fiat_amount.clone(),
             fiat_currency: fiat_currency.to_string(),
@@ -386,7 +447,7 @@ impl WaitingFiatPayload {
             seller_nostr: trade.seller_nostr.clone(),
             buyer_nostr: trade.buyer_nostr.clone(),
             pay_by: trade.pay_by(),
-            release_by: trade.release_by(hold_secs),
+            release_by: trade.release_by(),
         }
     }
 }
@@ -420,6 +481,8 @@ pub struct TradeSnapshot {
     pub pay_by: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_by: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 impl TradeSnapshot {
@@ -439,7 +502,8 @@ impl TradeSnapshot {
             lock_by: trade.lock_by(),
             hold_ends_at: trade.hold_ends_at(hold_secs),
             pay_by: trade.pay_by(),
-            release_by: trade.release_by(hold_secs),
+            release_by: trade.release_by(),
+            outcome: trade.outcome.clone(),
         }
     }
 }
@@ -505,6 +569,17 @@ pub struct Trade {
     pub buyer_fiber_addr: Option<String>,
     /// Inbound TLC expiry in milliseconds.
     pub hold_expires_at_ms: Option<i64>,
+    /// Seller released, or the solver decided the fiat arrived.
+    /// A `fiat-sent` click does not set this.
+    pub fiat_acknowledged: bool,
+    /// Unix seconds when the buyer marked fiat sent. Starts the release grace.
+    pub fiat_sent_at: Option<i64>,
+    /// A party sent the solver a 32-byte chat key. The key itself is not stored.
+    pub chat_key_shared: bool,
+    /// The release-grace notice has already been sent.
+    pub release_prompted: bool,
+    /// `fiat-owed`, `buyer-unpaid`, or `unresolved`, once that record is published.
+    pub outcome: Option<String>,
 }
 
 impl Trade {
@@ -525,14 +600,27 @@ impl Trade {
         self.hold_created_at.map(|at| at + hold_secs as i64)
     }
 
+    /// Last second the buyer may mark fiat sent.
     pub fn pay_by(&self) -> Option<i64> {
+        self.hold_expires_at_ms.map(fiat_deadline_secs)
+    }
+
+    /// Last second a payout can start.
+    pub fn route_by(&self) -> Option<i64> {
         self.hold_expires_at_ms.map(payout_deadline_secs)
     }
 
-    pub fn release_by(&self, hold_secs: u64) -> Option<i64> {
-        self.pay_by().or_else(|| {
-            self.hold_ends_at(hold_secs)
-                .map(|at| at - (CLAIM_MARGIN_MS / 1000) as i64)
+    /// Seller's deadline to release, measured from fiat-sent.
+    pub fn release_by(&self) -> Option<i64> {
+        self.fiat_sent_at
+            .map(|at| at.saturating_add(RELEASE_GRACE_SECS))
+    }
+
+    /// End of the published solver window, measured from fiat-sent.
+    pub fn solver_deadline(&self) -> Option<i64> {
+        self.fiat_sent_at.map(|at| {
+            at.saturating_add(RELEASE_GRACE_SECS)
+                .saturating_add(crate::SOLVER_WINDOW_SECS)
         })
     }
 }

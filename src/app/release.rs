@@ -1,7 +1,7 @@
-use crate::engine::{Engine, cant_do};
+use crate::engine::{Engine, cant_do, release_refusal};
 use crate::fiber::FiberRpc;
 use crate::types::Outbound;
-use crate::{Envelope, apply_release};
+use crate::{Envelope, apply_release, unix_now};
 use anyhow::Result;
 
 pub(crate) async fn on_release<F: FiberRpc + 'static>(
@@ -18,14 +18,17 @@ pub(crate) async fn on_release<F: FiberRpc + 'static>(
     if let Some(outbound) = engine.refund_due_outbound(&trade).await? {
         return Ok(outbound);
     }
+    if let Some(reason) = release_refusal(&trade, unix_now()) {
+        return Ok(vec![cant_do(sender, Some(trade_id), reason)]);
+    }
     let actor = engine.trade_actor(&trade, sender);
     let has_invoice = trade
         .payout_invoice
         .as_deref()
         .is_some_and(|invoice| !invoice.trim().is_empty());
     match apply_release(trade.phase()?, actor, has_invoice) {
-        crate::Decision::Ok(phase) => {
-            engine.db.set_trade_state(&trade.id, phase.as_str())?;
+        crate::Decision::Ok(_) => {
+            engine.db.begin_release(&trade.id)?;
             engine.watch(&trade.id)?;
             Ok(Vec::new())
         }

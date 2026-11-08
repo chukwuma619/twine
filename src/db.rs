@@ -9,7 +9,8 @@ use std::sync::Mutex;
 const TRADE_COLUMNS: &str = "id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber, \
      fiat_amount, shannons, state, hold_payment_hash, hold_invoice, payout_invoice, \
      payout_payment_hash, hold_received_at, hold_created_at, buyer_fiber_addr, \
-     hold_expires_at_ms";
+     hold_expires_at_ms, fiat_acknowledged, fiat_sent_at, chat_key_shared, release_prompted, \
+     outcome";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -82,6 +83,11 @@ impl Db {
                 hold_created_at INTEGER,
                 buyer_fiber_addr TEXT,
                 hold_expires_at_ms INTEGER,
+                fiat_acknowledged INTEGER NOT NULL DEFAULT 0,
+                fiat_sent_at INTEGER,
+                chat_key_shared INTEGER NOT NULL DEFAULT 0,
+                release_prompted INTEGER NOT NULL DEFAULT 0,
+                outcome TEXT,
                 FOREIGN KEY(order_id) REFERENCES orders(id)
             );
             CREATE TABLE IF NOT EXISTS preimages (
@@ -104,6 +110,20 @@ impl Db {
             "ALTER TABLE trades ADD COLUMN hold_expires_at_ms INTEGER",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE trades ADD COLUMN fiat_acknowledged INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN fiat_sent_at INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE trades ADD COLUMN chat_key_shared INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE trades ADD COLUMN release_prompted INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN outcome TEXT", []);
         let _ = conn.execute("DROP TABLE IF EXISTS payment_methods", []);
         let _ = conn.execute("DROP TABLE IF EXISTS supported_payment_methods", []);
         for column in [
@@ -381,6 +401,102 @@ impl Db {
             trades.push(row?);
         }
         Ok(trades)
+    }
+
+    pub fn set_fiat_acknowledged(&self, id: &str, acknowledged: bool) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET fiat_acknowledged = ?1 WHERE id = ?2",
+            params![i64::from(acknowledged), id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
+    pub fn mark_fiat_sent(&self, id: &str, at: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET state = ?1, fiat_sent_at = ?2, release_prompted = 0 WHERE id = ?3",
+            params![Phase::FiatSent.as_str(), at, id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
+    pub fn set_fiat_sent_at(&self, id: &str, at: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET fiat_sent_at = ?1 WHERE id = ?2",
+            params![at, id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
+    pub fn set_chat_key_shared(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET chat_key_shared = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
+    /// Stores the public outcome the first time. A later write does not replace it.
+    pub fn set_outcome_once(&self, id: &str, outcome: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET outcome = ?1 WHERE id = ?2 AND outcome IS NULL",
+            params![outcome, id],
+        )?;
+        if updated == 1 {
+            return Ok(true);
+        }
+        let found: Option<Option<String>> = conn
+            .query_row(
+                "SELECT outcome FROM trades WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if found.is_none() {
+            bail!("trade {id} not found");
+        }
+        Ok(false)
+    }
+
+    pub fn set_release_prompted(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET release_prompted = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
+    /// Seller release, or a solver decision that the fiat arrived and the invoice can be paid.
+    pub fn begin_release(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET state = ?1, fiat_acknowledged = 1 WHERE id = ?2",
+            params![Phase::Releasing.as_str(), id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
     }
 
     pub fn set_trade_state(&self, id: &str, state: &str) -> Result<()> {
@@ -699,6 +815,11 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         hold_created_at: row.get(14)?,
         buyer_fiber_addr: row.get(15)?,
         hold_expires_at_ms: row.get(16)?,
+        fiat_acknowledged: row.get::<_, i64>(17)? != 0,
+        fiat_sent_at: row.get(18)?,
+        chat_key_shared: row.get::<_, i64>(19)? != 0,
+        release_prompted: row.get::<_, i64>(20)? != 0,
+        outcome: row.get(21)?,
     })
 }
 
@@ -742,6 +863,11 @@ mod tests {
             hold_created_at: None,
             buyer_fiber_addr: None,
             hold_expires_at_ms: None,
+            fiat_acknowledged: false,
+            fiat_sent_at: None,
+            chat_key_shared: false,
+            release_prompted: false,
+            outcome: None,
         }
     }
 

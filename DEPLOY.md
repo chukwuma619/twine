@@ -203,7 +203,7 @@ sudo docker exec fiber-node fnn-cli --auth-token "$(tr -d '\n' < /opt/twine/secr
 
 ## Daemon
 
-Still on the VPS, in `/opt/twine`. This writes a new Nostr secret. To keep an existing daemon identity, put that `nsec` or 64-character hex secret in `TWINE_NOSTR_SECRET` after the file is written. `FIBER_NETWORK` matches the node started above. Add `TWINE_SOLVER=<hex pubkey>` when a solver exists. Until then the daemon refuses disputes.
+Still on the VPS, in `/opt/twine`. This writes a new Nostr secret. To keep an existing daemon identity, put that `nsec` or 64-character hex secret in `TWINE_NOSTR_SECRET` after the file is written. `FIBER_NETWORK` matches the node started above. Add `TWINE_SOLVER=<hex pubkey>`. The public hub runs with a solver set. The node announcement then includes `solver_window_secs` of 14400, the 4-hour decision time. Until a solver is set, the daemon refuses disputes.
 
 ```bash
 cd /opt/twine
