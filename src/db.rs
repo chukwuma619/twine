@@ -943,7 +943,8 @@ mod tests {
     fn pinned_address_refresh_cannot_replace_the_pubkey() {
         let db = Db::open_in_memory().unwrap();
         let kept = "/ip4/203.0.113.10/tcp/8230/p2p/Qmabc".to_string();
-        db.set_fiber_node("02abc", std::slice::from_ref(&kept)).unwrap();
+        db.set_fiber_node("02abc", std::slice::from_ref(&kept))
+            .unwrap();
 
         db.update_pinned_addresses("02def", &["/ip4/198.51.100.2/tcp/8230".into()])
             .unwrap();

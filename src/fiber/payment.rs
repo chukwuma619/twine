@@ -105,6 +105,48 @@ pub fn payment_expiry_limited(failed_error: Option<&str>) -> bool {
     failed_error.is_some_and(|error| error.to_ascii_lowercase().contains("tlc_expiry_limit"))
 }
 
+pub fn payment_session_exists(failed_error: Option<&str>) -> bool {
+    failed_error.is_some_and(|error| {
+        error
+            .to_ascii_lowercase()
+            .contains("payment session already exists")
+    })
+}
+
+pub fn payment_attempts_inflight(failed_error: Option<&str>) -> bool {
+    failed_error.is_some_and(|error| {
+        error
+            .to_ascii_lowercase()
+            .contains("attempts that are in flight state")
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailureKind {
+    InvoiceExpired,
+    SessionExists,
+    AttemptsInflight,
+    ExpiryLimited,
+    NoRoute,
+    Other,
+}
+
+pub fn classify_send_failure(failed_error: Option<&str>) -> SendFailureKind {
+    if payment_invoice_expired(failed_error) {
+        SendFailureKind::InvoiceExpired
+    } else if payment_session_exists(failed_error) {
+        SendFailureKind::SessionExists
+    } else if payment_attempts_inflight(failed_error) {
+        SendFailureKind::AttemptsInflight
+    } else if payment_expiry_limited(failed_error) {
+        SendFailureKind::ExpiryLimited
+    } else if payment_route_failed(failed_error) {
+        SendFailureKind::NoRoute
+    } else {
+        SendFailureKind::Other
+    }
+}
+
 fn route_failure_text(error: &str) -> bool {
     if payment_expiry_limited(Some(error)) {
         return false;
@@ -180,5 +222,35 @@ mod tests {
         assert!(payment_expiry_limited(Some(
             "tlc_expiry_limit is too small, final_tlc_expiry_delta: 1, tlc_expiry_limit: 0"
         )));
+        assert!(payment_session_exists(Some(
+            "Payment session already exists: 0xabc with payment session status: Inflight"
+        )));
+        assert!(!payment_session_exists(Some(
+            "Build payment route error: PathFind error: no path found"
+        )));
+        assert!(payment_attempts_inflight(Some(
+            "Payment session 0xabc has attempts that are in flight state, can not retry"
+        )));
+        assert!(!payment_attempts_inflight(Some(
+            "Payment session already exists: 0xabc with payment session status: Inflight"
+        )));
+        assert_eq!(
+            classify_send_failure(Some(
+                "Payment session already exists: 0xabc with payment session status: Inflight"
+            )),
+            SendFailureKind::SessionExists
+        );
+        assert_eq!(
+            classify_send_failure(Some(
+                "Payment session 0xabc has attempts that are in flight state, can not retry"
+            )),
+            SendFailureKind::AttemptsInflight
+        );
+        assert_eq!(
+            classify_send_failure(Some(
+                "Build payment route error: PathFind error: no path found"
+            )),
+            SendFailureKind::NoRoute
+        );
     }
 }

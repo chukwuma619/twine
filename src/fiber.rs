@@ -6,8 +6,9 @@ mod watchtower;
 pub use invoice::InvoiceRpc;
 pub use node::{FiberNodeInfo, NodeRpc};
 pub use payment::{
-    PaymentRpc, payment_expiry_limited, payment_invoice_expired, payment_route_failed,
-    route_not_ready,
+    PaymentRpc, SendFailureKind, classify_send_failure, payment_attempts_inflight,
+    payment_expiry_limited, payment_invoice_expired, payment_route_failed,
+    payment_session_exists, route_not_ready,
 };
 pub use watchtower::WatchtowerRpc;
 
