@@ -43,6 +43,9 @@ pub(crate) async fn on_payout_invoice<F: FiberRpc + 'static>(
     if trade.phase()? == Phase::AwaitingRoute {
         return engine.retry_payout_route(&trade, invoice).await;
     }
+    if trade.phase()? == Phase::AwaitingInvoice {
+        return engine.retry_awaiting_invoice(&trade, invoice).await;
+    }
     match engine.bind_buyer_hold(&trade, invoice).await? {
         Ok(outbound) => Ok(outbound),
         Err(reason) => Ok(vec![cant_do(sender, Some(trade_id), &reason)]),

@@ -73,7 +73,7 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
             if let SubmittedEvidence::Ready(blobs) = evidence {
-                save_disclosure(engine, &trade.id, sender, blobs)?;
+                save_disclosure(engine, &trade.id, sender, &trade.buyer_nostr, blobs)?;
             }
             engine.watch(&trade.id)?;
             let mut outbound = party_replies(
@@ -120,7 +120,7 @@ async fn attach_evidence<F: FiberRpc + 'static>(
             return Ok(vec![cant_do(sender, Some(trade.id.clone()), SEND_CHAT)]);
         }
     };
-    save_disclosure(engine, &trade.id, sender, blobs)?;
+    save_disclosure(engine, &trade.id, sender, &trade.buyer_nostr, blobs)?;
     solver_notice(engine, &trade.id)
 }
 
@@ -128,11 +128,21 @@ fn save_disclosure<F>(
     engine: &Engine<F>,
     trade_id: &str,
     sender: &str,
+    buyer_nostr: &str,
     blobs: Vec<String>,
 ) -> Result<()> {
     let existing = engine.db.solver_evidence(trade_id)?;
     let json = merge_disclosure(existing.as_deref(), sender, blobs)?;
-    engine.db.save_solver_evidence(trade_id, &json)
+    let buyer_shared = disclosure_includes(&json, buyer_nostr);
+    engine
+        .db
+        .save_solver_evidence(trade_id, &json, buyer_shared)
+}
+
+fn disclosure_includes(json: &str, nostr: &str) -> bool {
+    let rows: Vec<Disclosure> = serde_json::from_str(json).unwrap_or_default();
+    rows.iter()
+        .any(|row| row.from.eq_ignore_ascii_case(nostr))
 }
 
 fn solver_notice<F>(engine: &Engine<F>, trade_id: &str) -> Result<Vec<Outbound>> {

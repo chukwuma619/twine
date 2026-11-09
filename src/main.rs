@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
     }
 }
 
-const RELAY_MAINTENANCE: Duration = Duration::from_secs(5);
+const RELAY_MAINTENANCE: Duration = Duration::from_secs(60);
 
 fn spawn_relay_maintenance(client: Client, keys: Keys, engine: Engine<HttpFiber>) {
     let solver = engine.solver_pubkey().map(str::to_string);
@@ -227,13 +227,20 @@ async fn publish_presence(
         }
         None => warn!("fiber node is not pinned"),
     }
+    // Catch new relays up on open book rows. Cancel/fill already publishes on the action path.
     for order in db.orders()? {
+        if !order.is_open() {
+            continue;
+        }
         let order_id = order.id.clone();
         // Read again immediately before signing. A trade can commit while an
         // earlier order in this batch is still waiting on a relay.
         let Some(order) = db.get_order(&order_id)? else {
             continue;
         };
+        if !order.is_open() {
+            continue;
+        }
         let event = match public_order_event(keys, &order.public()) {
             Ok(event) => event,
             Err(error) => {

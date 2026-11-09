@@ -150,7 +150,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         for trade in self.db.trades_in_states(Phase::watched_phases())? {
             if trade.phase()? == Phase::Refunding {
                 if self.preimage_pending(&trade)? {
-                    self.drop_preimage(&trade).await?;
+                    self.settle_hold(&trade, None).await?;
                 }
                 continue;
             }
@@ -325,11 +325,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             self.remember_hold_expiry(&mut trade, &payment_hash).await?;
         }
         if phase == Phase::Refunding && self.preimage_pending(&trade)? {
-            self.drop_preimage(&trade).await?;
-            return Ok(party_replies(
-                &trade,
-                Envelope::new(REFUNDING).with_trade(&trade.id),
-            ));
+            return self.settle_hold(&trade, None).await;
         }
         let mut refund = self.refund_if_due(&trade).await?;
         if !refund.is_empty() {
@@ -580,6 +576,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
     }
 
     async fn refund_for(&self, trade: &Trade, reason: Option<&str>) -> Result<Vec<Outbound>> {
+        if let Some(outbound) = self.settle_if_buyer_paid(trade).await? {
+            return Ok(outbound);
+        }
         self.db
             .set_trade_state(&trade.id, Phase::Refunding.as_str())?;
         self.drop_preimage(trade).await?;
@@ -601,6 +600,31 @@ impl<F: FiberRpc + 'static> Engine<F> {
             outbound = published;
         }
         Ok(outbound)
+    }
+
+    /// Settle instead of refund when the buyer payout already revealed Sb.
+    async fn settle_if_buyer_paid(&self, trade: &Trade) -> Result<Option<Vec<Outbound>>> {
+        let Some(hash) = trade.hold_payment_hash.as_deref() else {
+            return Ok(None);
+        };
+        let phase = trade.phase()?;
+        if self.preimage_pending(trade)?
+            && matches!(
+                phase,
+                Phase::Releasing | Phase::Refunding | Phase::AwaitingInvoice
+            )
+        {
+            return Ok(Some(self.settle_hold(trade, None).await?));
+        }
+        match self.fiber.get_payment(hash).await {
+            Ok(payment) if payment.status == "Success" => Ok(Some(
+                self.settle_hold(trade, payment.preimage.as_deref())
+                    .await?,
+            )),
+            Ok(_) => Ok(None),
+            Err(error) if payment_missing(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Public record plus the same outcome for the two apps. The first write sticks.
@@ -791,6 +815,49 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 "could not check the payout route. Send the same invoice again",
             )]),
         }
+    }
+
+    /// Replacement invoice while the trade is `awaiting-invoice`.
+    pub(crate) async fn retry_awaiting_invoice(
+        &self,
+        trade: &Trade,
+        invoice: &str,
+    ) -> Result<Vec<Outbound>> {
+        let parsed = match self.require_same_hold_hash(trade, invoice).await? {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                return Ok(vec![cant_do(
+                    &trade.buyer_nostr,
+                    Some(trade.id.clone()),
+                    &reason,
+                )]);
+            }
+        };
+        if let Some(outbound) = self.refund_due_outbound(trade).await? {
+            return Ok(outbound);
+        }
+        self.db.set_payout_with_final_delta(
+            &trade.id,
+            invoice,
+            None,
+            parsed.final_tlc_expiry_delta_ms,
+        )?;
+        if trade.fiat_acknowledged {
+            self.db
+                .set_trade_state(&trade.id, Phase::Releasing.as_str())?;
+            self.watch(&trade.id)?;
+            return Ok(Vec::new());
+        }
+        let Some(trade) = self.db.get_trade(&trade.id)? else {
+            bail!("trade {} disappeared", trade.id);
+        };
+        self.db
+            .set_trade_state(&trade.id, Phase::FiatSent.as_str())?;
+        self.watch(&trade.id)?;
+        if let Some(route) = self.route_after_fiat_sent(&trade).await? {
+            return Ok(route);
+        }
+        Ok(Vec::new())
     }
 
     /// Fiber v0.9.1 dry run. A returned preimage is ignored and does not open fiat.
@@ -1359,8 +1426,17 @@ impl<F: FiberRpc + 'static> Engine<F> {
         let Some(current) = self.db.get_trade(&trade.id)? else {
             return Ok(Vec::new());
         };
-        if current.phase()? != Phase::Releasing {
+        let phase = current.phase()?;
+        // Settle even if a concurrent refund flipped the phase after payout success.
+        if !matches!(
+            phase,
+            Phase::Releasing | Phase::Refunding | Phase::AwaitingInvoice
+        ) {
             return Ok(Vec::new());
+        }
+        if phase != Phase::Releasing {
+            self.db
+                .set_trade_state(&trade.id, Phase::Releasing.as_str())?;
         }
         let payment_hash = trade
             .hold_payment_hash
@@ -1750,8 +1826,8 @@ mod tests {
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
         FiatSentPayload, NEW_INVOICE, NEW_ORDER, NewInvoicePayload, NewOrderPayload, OrderStatus,
-        PAY_INVOICE, REFUNDING, RELEASE, RESOLVE, ResolvePayload, SETTLED, TAKE, TakePayload,
-        WAITING_FIAT, WaitingFiatPayload,
+        PAY_INVOICE, PAYOUT_INVOICE, PayoutInvoicePayload, REFUNDING, RELEASE, RESOLVE,
+        ResolvePayload, SETTLED, TAKE, TakePayload, WAITING_FIAT, WaitingFiatPayload,
     };
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
@@ -1804,7 +1880,7 @@ mod tests {
                 inbound_expiry: StdMutex::new(None),
                 inbound_claim_margin_ms: StdMutex::new(None),
                 last_tlc_expiry_limit: StdMutex::new(None),
-                // Short lock so a 36h hold still fits the published 2h + 4h windows in tests.
+                // Short lock so a 48h hold still fits the published 2h + 4h windows in tests.
                 final_delta_ms: StdMutex::new(crate::MIN_TLC_EXPIRY_LIMIT_MS),
                 expires_at_ms: StdMutex::new(None),
                 probe_error: StdMutex::new(None),
@@ -1981,11 +2057,6 @@ mod tests {
 
     fn fake_engine(status: &str) -> (Engine<FakeFiber>, Arc<FakeFiber>) {
         let fiber = Arc::new(FakeFiber::new(status, 100_000_000));
-        fiber
-            .preimages
-            .lock()
-            .expect("preimages")
-            .insert("hash".into());
         let db = Arc::new(Db::open_in_memory().unwrap());
         db.insert_order(&Order {
             id: "order".into(),
@@ -2030,7 +2101,6 @@ mod tests {
             outcome: None,
         })
         .unwrap();
-        db.insert_preimage("hash", "preimage").unwrap();
         let engine = Engine::new(db, fiber.clone(), Some("solver".into()));
         (engine, fiber)
     }
@@ -2070,7 +2140,6 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, Outbound::TradeRecord(_)))
         );
-        assert!(*fiber.removed.lock().unwrap());
         assert!(engine.db.get_preimage("hash").unwrap().is_none());
         assert_eq!(
             engine.db.get_trade("trade").unwrap().unwrap().state,
@@ -2261,12 +2330,12 @@ mod tests {
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::WaitingHold.as_str()
         );
-        assert!(engine.db.get_preimage("hash").unwrap().is_some());
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
     }
 
     #[tokio::test]
     async fn solver_fiat_owed_refunds_and_records_the_fiat() {
-        let (engine, fiber) = fake_engine("Received");
+        let (engine, _fiber) = fake_engine("Received");
         engine.on_hold_status("trade").await.unwrap();
         engine
             .handle(
@@ -2339,7 +2408,7 @@ mod tests {
                 .unwrap()
                 .fiat_acknowledged
         );
-        assert!(*fiber.removed.lock().unwrap());
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
         let corrected = engine
             .handle(
                 "solver",
@@ -2376,7 +2445,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dispute_before_fiat_still_ends_at_the_fiat_deadline() {
-        let (engine, fiber) = fake_engine("Received");
+        let (engine, _fiber) = fake_engine("Received");
         engine.on_hold_status("trade").await.unwrap();
         engine
             .handle(
@@ -2413,7 +2482,7 @@ mod tests {
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::Refunding.as_str()
         );
-        assert!(*fiber.removed.lock().unwrap());
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2681,7 +2750,7 @@ mod tests {
             _ => None,
         });
         assert_eq!(record.expect("buyer-unpaid record").outcome, "buyer-unpaid");
-        assert!(*fiber.removed.lock().unwrap());
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
         assert_eq!(
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::Refunding.as_str()
@@ -2950,7 +3019,7 @@ mod tests {
                 .any(|item| matches!(item, Outbound::TradeRecord(_)))
         );
         assert_eq!(*fiber.send_count.lock().unwrap(), 0);
-        assert!(*fiber.removed.lock().unwrap());
+        assert!(engine.db.get_preimage("hash").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3059,6 +3128,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seller_disclosure_alone_does_not_mark_chat_shared() {
+        let (engine, _) = fake_engine("Received");
+        engine.on_hold_status("trade").await.unwrap();
+        engine
+            .handle(
+                "seller",
+                Envelope::new(DISPUTE)
+                    .with_trade("trade")
+                    .with_payload(DisputePayload {
+                        invoice: None,
+                        solver_evidence: vec![sample_solver_evidence()],
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !engine
+                .db
+                .get_trade("trade")
+                .unwrap()
+                .unwrap()
+                .chat_key_shared
+        );
+        let refused = engine
+            .handle(
+                "solver",
+                Envelope::new(RESOLVE)
+                    .with_trade("trade")
+                    .with_payload(ResolvePayload {
+                        winner: "buyer".into(),
+                        invoice: None,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(cant_do_reason(&refused).contains("trade's chat"));
+    }
+
+    #[tokio::test]
     async fn a_late_solver_decision_records_fiat_owed_after_the_refund() {
         let (engine, _) = fake_engine("Received");
         engine.on_hold_status("trade").await.unwrap();
@@ -3119,8 +3229,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_rearms_a_claimable_hold_and_drops_a_refund() {
+    async fn restart_rearms_a_claimable_hold_and_settles_a_refund_with_preimage() {
         let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .insert_preimage("hash", "preimage")
+            .unwrap();
         engine
             .db
             .set_trade_state("trade", Phase::WaitingFiat.as_str())
@@ -3134,8 +3248,34 @@ mod tests {
             .set_trade_state("trade", Phase::Refunding.as_str())
             .unwrap();
         engine.arm_watchtower().await.unwrap();
-        assert!(!fiber.preimages.lock().unwrap().contains("hash"));
-        assert!(engine.db.get_preimage("hash").unwrap().is_none());
+        assert!(fiber.preimages.lock().unwrap().contains("hash"));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Settled.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn refund_after_buyer_payout_success_settles_the_hold() {
+        let (engine, fiber) = fake_engine("Received");
+        engine
+            .db
+            .set_trade_state("trade", Phase::Releasing.as_str())
+            .unwrap();
+        engine
+            .db
+            .set_payout("trade", "buyer-invoice", Some("hash"))
+            .unwrap();
+        *fiber.payment_status.lock().unwrap() = "Success".into();
+        *fiber.payment_preimage.lock().unwrap() = Some("preimage".into());
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        let outbound = engine.refund_for(&trade, None).await.unwrap();
+        assert!(replies_contain(&outbound, SETTLED));
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Settled.as_str()
+        );
+        assert_eq!(fiber.status.lock().unwrap().as_str(), "Paid");
     }
 
     #[tokio::test]
@@ -3150,6 +3290,7 @@ mod tests {
             .set_payout("trade", "buyer-invoice", Some("hash"))
             .unwrap();
         *fiber.payment_status.lock().unwrap() = "Success".into();
+        *fiber.payment_preimage.lock().unwrap() = Some("preimage".into());
         let settled = engine.on_payout_status("trade").await.unwrap();
         assert!(replies_contain(&settled, SETTLED));
         assert!(fiber.preimages.lock().unwrap().contains("hash"));
@@ -3447,7 +3588,7 @@ mod tests {
             .db
             .set_trade_state("trade", Phase::WaitingInvoice.as_str())
             .unwrap();
-        *fiber.final_delta_ms.lock().unwrap() = crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS;
+        *fiber.final_delta_ms.lock().unwrap() = 40 * 60 * 60 * 1000;
         let trade = engine.db.get_trade("trade").unwrap().unwrap();
         let rejected = engine
             .bind_buyer_hold(&trade, "buyer-invoice")
@@ -3458,6 +3599,27 @@ mod tests {
         assert_eq!(
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::WaitingInvoice.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn fiber_default_final_delta_fits_the_hold() {
+        let (engine, fiber) = fake_engine("Open");
+        engine
+            .db
+            .set_trade_state("trade", Phase::WaitingInvoice.as_str())
+            .unwrap();
+        *fiber.final_delta_ms.lock().unwrap() = crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS;
+        *fiber.expires_at_ms.lock().unwrap() = None;
+        let trade = engine.db.get_trade("trade").unwrap().unwrap();
+        engine
+            .bind_buyer_hold(&trade, "buyer-invoice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::WaitingHold.as_str()
         );
     }
 
@@ -3530,7 +3692,7 @@ mod tests {
         let Outbound::PublicOrder(public) = &posted[0] else {
             panic!("expected a public order");
         };
-        assert_eq!(public.hold_hours, 36);
+        assert_eq!(public.hold_hours, 48);
         assert_eq!(public.side, "sell");
         assert_eq!(public.maker_nostr_pubkey, "seller");
         let published = serde_json::to_string(public).unwrap();
@@ -3705,7 +3867,7 @@ mod tests {
     #[tokio::test]
     async fn a_long_payout_invoice_is_rejected_before_send() {
         let (engine, fiber) = fake_engine("Received");
-        *fiber.final_delta_ms.lock().unwrap() = 30 * 3_600 * 1000;
+        *fiber.final_delta_ms.lock().unwrap() = 40 * 3_600 * 1000;
         releasing_payout(&engine, &fiber).await;
         let outbound = engine.on_payout_status("trade").await.unwrap();
         assert!(replies_contain(&outbound, NEW_INVOICE));
@@ -3897,6 +4059,34 @@ mod tests {
         assert_eq!(
             engine.db.get_trade("trade").unwrap().unwrap().state,
             Phase::AwaitingInvoice.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn payout_invoice_retries_awaiting_invoice_after_release() {
+        let (engine, fiber) = fake_engine("Received");
+        recorded_payout(&engine, &fiber, "Failed", Some("payment hash mismatch"));
+        engine.on_payout_status("trade").await.unwrap();
+        engine
+            .db
+            .set_fiat_acknowledged("trade", true)
+            .unwrap();
+        let outbound = engine
+            .handle(
+                "buyer",
+                Envelope::new(PAYOUT_INVOICE)
+                    .with_trade("trade")
+                    .with_payload(PayoutInvoicePayload {
+                        invoice: "buyer-invoice".into(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(outbound.is_empty());
+        assert_eq!(
+            engine.db.get_trade("trade").unwrap().unwrap().state,
+            Phase::Releasing.as_str()
         );
     }
 

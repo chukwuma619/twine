@@ -22,7 +22,7 @@ Buying CKB for local currency usually means depositing into a custodial P2P desk
 3. The seller pays that hold from their own node (Fiber Studio or any Fiber wallet).
 4. Fiat moves bank-to-bank / Zelle-to-Zelle outside Twine.
 5. On release the hub pays the buyer's invoice, learns `S_b`, arms the watchtower, and settles the hold.
-6. If nobody settles, Fiber's 36-hour timelock returns the CKB to the seller.
+6. If nobody settles, Fiber's 48-hour timelock returns the CKB to the seller.
 
 The operator can coordinate the book and a published solver, but cannot settle locked coins before paying the buyer.
 
@@ -47,7 +47,7 @@ Also: `canceled` (hold still Open), `refunding` / `expired` on timelock.
 ## What it does today
 
 - Sell posts with a price, a local currency, and min and max. Partial takes are allowed, and several trades can be open on one post while CKB remains.
-- Fiber hold invoices last 36 hours. An unpaid hold expires after 1 hour. The buyer can mark fiat sent only while a 2-hour release grace, a 4-hour solver window, and Fiber's routing time are still left. That routing time follows the inbound channel claim margin and the buyer invoice's lock, and is at least 30 minutes. After fiat is marked sent, the seller has 2 hours to release. If that grace passes, the buyer is told to open a dispute and seal this trade's chat to the solver.
+- Fiber hold invoices last 48 hours. An unpaid hold expires after 1 hour. The buyer can mark fiat sent only while a 2-hour release grace, a 4-hour solver window, and Fiber's routing time are still left. That routing time follows the inbound channel claim margin and the buyer invoice's lock, and is at least 30 minutes. After fiat is marked sent, the seller has 2 hours to release. If that grace passes, the buyer is told to open a dispute and seal this trade's chat to the solver.
 - If the buyer's invoice has no route when the hold locks, fiat stays closed (`awaiting-route`) until they paste that same invoice again. A dispute cannot open the release clock until fiat instructions were offered. A later routing failure after fiat was marked sent keeps the fiat report and waits in `awaiting-invoice`. An invoice with an expiry has to stay payable through the hold. An expired one cannot be replaced, so the hold refunds. If the seller had released, or the solver recorded that the fiat arrived, that refund also publishes a public `fiat-owed` record.
 - Disputes with sealed solver evidence. The daemon still cannot read the thread.
 - Public order book (kind `31420`), Fiber node announcement with pubkey, listen addresses, optional solver, and solver window (kind `31421`), and public trade outcomes (kind `31422`).

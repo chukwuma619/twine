@@ -163,6 +163,9 @@ pub fn validate_new_order(
     if min.is_zero() || max < min {
         return Err(AmountError::Invalid("min"));
     }
+    if min > available * price {
+        return Err(AmountError::Invalid("min"));
+    }
     let shannons = ckb_to_shannons(available)?;
     if shannons == 0 {
         return Err(AmountError::Invalid("available_ckb"));
@@ -387,6 +390,7 @@ mod tests {
         assert!(validate_new_order("10", "1500", "1000", "9000", "NGN").is_ok());
         assert!(validate_new_order("0", "1500", "1000", "9000", "NGN").is_err());
         assert!(validate_new_order("10", "1500", "9000", "1000", "NGN").is_err());
+        assert!(validate_new_order("1", "1500", "2000", "9000", "NGN").is_err());
     }
 }
 

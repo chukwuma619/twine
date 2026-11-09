@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn doorbell_payload_has_no_notification_body() {
+    fn doorbell_targets_firebase_installation_id() {
         let body = Fcm::message_body("device-fid", "chat_wake");
         let message = &body["message"];
         assert_eq!(message["fid"], "device-fid");

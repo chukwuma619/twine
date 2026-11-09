@@ -2,7 +2,8 @@
 pub const SHANNONS_PER_CKB: u128 = 100_000_000;
 
 /// Hold invoice `final_expiry_delta`. Fiber accepts 160 minutes through 14 days.
-pub const HOLD_HOURS: u64 = 36;
+/// 48h clears Fiber's 24h default final TLC plus the release and solver windows.
+pub const HOLD_HOURS: u64 = 48;
 
 pub const fn hold_secs(hours: u64) -> u64 {
     hours * 3_600
@@ -96,6 +97,7 @@ pub const RELEASE_DUE: &str = "release-due";
 pub const NEW_INVOICE: &str = "new-invoice";
 pub const DISPUTED: &str = "disputed";
 pub const REFUNDING: &str = "refunding";
+pub const RELEASING: &str = "releasing";
 pub const SETTLED: &str = "settled";
 pub const CANCELED: &str = "canceled";
 pub const EXPIRED: &str = "expired";

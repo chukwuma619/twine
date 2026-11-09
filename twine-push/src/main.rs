@@ -21,10 +21,15 @@ use tracing::{info, warn};
 
 const KIND_ACTION: u16 = 4242;
 const KIND_CHAT: u16 = 4243;
+const PUSH_SUBSCRIPTION: &str = "twine-push-watch";
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RELAY_RETRY: Duration = Duration::from_secs(5);
 const RECONNECT_GRACE: Duration = Duration::from_millis(250);
 const SEEN_CAP: usize = 20_000;
+
+fn push_subscription_id() -> SubscriptionId {
+    SubscriptionId::new(PUSH_SUBSCRIPTION)
+}
 
 #[derive(Clone)]
 struct App {
@@ -194,7 +199,9 @@ async fn watch_relays(app: App, relays: Vec<String>) -> Result<()> {
     loop {
         wake_disconnected(&client).await;
         client.connect().and_wait(RELAY_CONNECT_TIMEOUT).await;
-        if let Err(error) = client.subscribe(watch_filter()).await {
+        let sub_id = push_subscription_id();
+        let _ = client.unsubscribe(&sub_id).await;
+        if let Err(error) = client.subscribe(watch_filter()).with_id(sub_id).await {
             warn!(%error, "push subscribe failed");
         }
         let mut notifications = client.notifications();

@@ -507,11 +507,12 @@ impl Db {
         Ok(())
     }
 
-    pub fn save_solver_evidence(&self, id: &str, evidence: &str) -> Result<()> {
+    /// Sets `chat_key_shared` only when the buyer's sealed chat is in `evidence`.
+    pub fn save_solver_evidence(&self, id: &str, evidence: &str, buyer_shared: bool) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         let updated = conn.execute(
-            "UPDATE trades SET solver_evidence = ?1, chat_key_shared = 1, evidence_pending = 1 WHERE id = ?2",
-            params![evidence, id],
+            "UPDATE trades SET solver_evidence = ?1, chat_key_shared = ?2, evidence_pending = 1 WHERE id = ?3",
+            params![evidence, i64::from(buyer_shared), id],
         )?;
         if updated != 1 {
             bail!("trade {id} not found");

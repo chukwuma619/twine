@@ -1,8 +1,11 @@
-use crate::engine::{Engine, RECORD_ALREADY, WINDOW_ENDED, cant_do, release_refusal};
+use crate::engine::{
+    Engine, RECORD_ALREADY, WINDOW_ENDED, cant_do, party_replies, release_refusal,
+};
 use crate::fiber::FiberRpc;
 use crate::types::Outbound;
 use crate::{
-    Actor, Envelope, Phase, ResolvePayload, Winner, apply_resolve, parse_winner, unix_now,
+    Actor, Envelope, Phase, RELEASING, ResolvePayload, Winner, apply_resolve, parse_winner,
+    unix_now,
 };
 use anyhow::Result;
 
@@ -94,7 +97,10 @@ pub(crate) async fn on_resolve<F: FiberRpc + 'static>(
             }
             engine.db.begin_release(&trade.id)?;
             engine.watch(&trade.id)?;
-            Ok(Vec::new())
+            Ok(party_replies(
+                &trade,
+                Envelope::new(RELEASING).with_trade(&trade.id),
+            ))
         }
         crate::Decision::Ok(_) => Ok(Vec::new()),
         crate::Decision::Reject(reason) => Ok(vec![cant_do(sender, Some(trade_id), reason)]),
