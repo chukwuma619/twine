@@ -394,13 +394,13 @@ mod tests {
     }
 }
 
-/// Live Fiber helpers for engine tests. A node must be running at `TWINE_RPC`.
+/// Live Fiber helpers for engine tests. Hub at `TWINE_RPC`; settle paths also need seller/buyer RPCs.
 #[cfg(test)]
 pub(crate) mod support {
     use crate::db::Db;
     use crate::engine::Engine;
     use crate::env::invoice_currency;
-    use crate::fiber::{HttpFiber, InvoiceInfo, InvoiceRpc, NodeRpc};
+    use crate::fiber::{HttpFiber, InvoiceInfo, InvoiceRpc, NodeRpc, PaymentRpc};
     use crate::{
         CANT_DO, Envelope, FIAT_SENT, FiatSentPayload, NEW_ORDER, NewOrderPayload, Outbound,
         PAY_INVOICE, PayInvoicePayload, TAKE, TakePayload,
@@ -418,11 +418,8 @@ pub(crate) mod support {
     impl FiberNode {
         pub fn from_env() -> Self {
             let url = env::var("TWINE_RPC").unwrap_or_else(|_| DEFAULT_RPC.to_string());
-            let network = env::var("FIBER_NETWORK").unwrap_or_else(|_| "testnet".to_string());
-            let currency = invoice_currency(&network).expect("FIBER_NETWORK");
-            let token = env::var("TWINE_RPC_TOKEN").unwrap_or_else(|_| "test-token".to_string());
             Self {
-                rpc: Arc::new(HttpFiber::new(url, currency, token).expect("TWINE_RPC_TOKEN")),
+                rpc: Arc::new(http_fiber_from_env(&url, "TWINE_RPC_TOKEN")),
             }
         }
 
@@ -430,24 +427,75 @@ pub(crate) mod support {
             self.rpc
                 .node_pubkey()
                 .await
-                .expect("Fiber RPC is not reachable; start fnn and set TWINE_RPC");
+                .expect("Fiber RPC is not reachable; run make e2e-up");
         }
+    }
+
+    fn network_currency() -> &'static str {
+        let network = env::var("FIBER_NETWORK").unwrap_or_else(|_| "testnet".to_string());
+        invoice_currency(network.trim()).expect("FIBER_NETWORK")
+    }
+
+    fn http_fiber_from_env(url: &str, token_var: &str) -> HttpFiber {
+        let currency = network_currency();
+        let token = env::var(token_var).unwrap_or_else(|_| {
+            env::var("TWINE_RPC_TOKEN").unwrap_or_else(|_| "test-token".to_string())
+        });
+        HttpFiber::new(url, currency, token).expect(token_var)
+    }
+
+    fn optional_peer(url_var: &str, token_var: &str) -> Option<Arc<HttpFiber>> {
+        let url = env::var(url_var).ok()?.trim().to_string();
+        if url.is_empty() {
+            return None;
+        }
+        Some(Arc::new(http_fiber_from_env(&url, token_var)))
     }
 
     pub struct TestContext {
         pub engine: Engine<HttpFiber>,
         pub fiber: Arc<HttpFiber>,
+        pub seller: Option<Arc<HttpFiber>>,
+        pub buyer: Option<Arc<HttpFiber>>,
     }
 
     impl TestContext {
         pub async fn new() -> Self {
             let node = FiberNode::from_env();
             node.require_ready().await;
+            let seller = optional_peer("TWINE_E2E_SELLER_RPC", "TWINE_E2E_SELLER_TOKEN");
+            let buyer = optional_peer("TWINE_E2E_BUYER_RPC", "TWINE_E2E_BUYER_TOKEN");
+            if let Some(seller) = seller.as_ref() {
+                seller
+                    .node_pubkey()
+                    .await
+                    .expect("TWINE_E2E_SELLER_RPC is not reachable");
+            }
+            if let Some(buyer) = buyer.as_ref() {
+                buyer
+                    .node_pubkey()
+                    .await
+                    .expect("TWINE_E2E_BUYER_RPC is not reachable");
+            }
             let db = Arc::new(Db::open_in_memory().expect("sqlite"));
             Self {
                 engine: Engine::new(db, node.rpc.clone(), None),
                 fiber: node.rpc,
+                seller,
+                buyer,
             }
+        }
+
+        pub fn require_seller(&self) -> &HttpFiber {
+            self.seller
+                .as_deref()
+                .expect("TWINE_E2E_SELLER_RPC; run make e2e")
+        }
+
+        pub fn require_buyer(&self) -> &HttpFiber {
+            self.buyer
+                .as_deref()
+                .expect("TWINE_E2E_BUYER_RPC; run make e2e")
         }
     }
 
@@ -475,16 +523,17 @@ pub(crate) mod support {
     }
 
     pub async fn take(
-        engine: &Engine<HttpFiber>,
+        ctx: &TestContext,
         buyer: &str,
         order_id: &str,
     ) -> (String, String, String) {
-        let payout = engine
-            .fiber
+        let payout_node = ctx.buyer.as_ref().unwrap_or(&ctx.fiber);
+        let payout = payout_node
             .new_payout_invoice(100_000_000, "twine payout", crate::MIN_TLC_EXPIRY_LIMIT_MS)
             .await
             .unwrap();
-        let outbound = engine
+        let outbound = ctx
+            .engine
             .handle(
                 buyer,
                 Envelope::new(TAKE)
@@ -512,6 +561,20 @@ pub(crate) mod support {
             payload.invoice,
             payload.amount_shannons,
         )
+    }
+
+    pub async fn pay_hold(ctx: &TestContext, hold_invoice: &str, payment_hash: &str) {
+        ctx.require_seller()
+            .send_payment(hold_invoice, crate::MAX_TLC_EXPIRY_LIMIT_MS)
+            .await
+            .expect("pay hold");
+        wait_invoice_status(
+            &ctx.fiber,
+            payment_hash,
+            "Received",
+            Duration::from_secs(120),
+        )
+        .await;
     }
 
     pub async fn fiat_sent(engine: &Engine<HttpFiber>, buyer: &str, trade_id: &str, invoice: &str) {

@@ -1820,8 +1820,8 @@ mod tests {
         ParsedInvoice, PaymentInfo, PaymentRpc, WatchtowerRpc,
     };
     use crate::util::support::{
-        TestContext, cant_do_reason, fiat_sent, open_order, outbound_replies, replies_contain,
-        take, wait_invoice_status,
+        TestContext, cant_do_reason, fiat_sent, open_order, outbound_replies, pay_hold,
+        replies_contain, take,
     };
     use crate::{
         CANCEL, CANCELED, DISPUTE, DISPUTED, DisputePayload, EXPIRED, FIAT_SENT, FIAT_SENT_OK,
@@ -4262,11 +4262,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Fiber node (TWINE_RPC)"]
+    #[ignore = "requires multi-fnn e2e (make e2e)"]
     async fn take_creates_hold_and_registers_preimage() {
         let ctx = TestContext::new().await;
         let order_id = open_order(&ctx.engine, "seller").await;
-        let (trade_id, invoice, amount) = take(&ctx.engine, "buyer", &order_id).await;
+        let (trade_id, invoice, amount) = take(&ctx, "buyer", &order_id).await;
         assert!(!invoice.is_empty());
         assert_eq!(amount, "100000000");
         let trade = ctx.engine.db.get_trade(&trade_id).unwrap().unwrap();
@@ -4277,12 +4277,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Fiber node (TWINE_RPC)"]
+    #[ignore = "requires multi-fnn e2e (make e2e)"]
     async fn pay_invoice_never_includes_preimage() {
         let ctx = TestContext::new().await;
         let order_id = open_order(&ctx.engine, "seller").await;
-        let payout = ctx
-            .fiber
+        let payout_node = ctx.buyer.as_ref().unwrap_or(&ctx.fiber);
+        let payout = payout_node
             .new_payout_invoice(100_000_000, "twine payout", crate::MIN_TLC_EXPIRY_LIMIT_MS)
             .await
             .unwrap();
@@ -4307,11 +4307,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Fiber node (TWINE_RPC)"]
+    #[ignore = "requires multi-fnn e2e (make e2e)"]
     async fn cancel_open_hold() {
         let ctx = TestContext::new().await;
         let order_id = open_order(&ctx.engine, "seller").await;
-        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id).await;
+        let (trade_id, _, _) = take(&ctx, "buyer", &order_id).await;
         let hash = ctx
             .engine
             .db
@@ -4384,11 +4384,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Fiber node (TWINE_RPC)"]
+    #[ignore = "requires multi-fnn e2e (make e2e)"]
     async fn lock_poll_and_release_pay_the_buyer_first() {
         let ctx = TestContext::new().await;
         let order_id = open_order(&ctx.engine, "seller").await;
-        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id).await;
+        let (trade_id, hold_invoice, _) = take(&ctx, "buyer", &order_id).await;
         let hash = ctx
             .engine
             .db
@@ -4399,12 +4399,12 @@ mod tests {
             .clone()
             .unwrap();
 
-        wait_invoice_status(&ctx.fiber, &hash, "Received", Duration::from_secs(120)).await;
+        pay_hold(&ctx, &hold_invoice, &hash).await;
         let waiting = ctx.engine.on_hold_status(&trade_id).await.unwrap();
         assert!(replies_contain(&waiting, WAITING_FIAT));
 
         let payout = ctx
-            .fiber
+            .require_buyer()
             .new_payout_invoice(100_000_000, "twine buyer", crate::MIN_TLC_EXPIRY_LIMIT_MS)
             .await
             .unwrap();
@@ -4424,11 +4424,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Fiber node (TWINE_RPC)"]
+    #[ignore = "requires multi-fnn e2e (make e2e)"]
     async fn reject_cancel_after_hold_received() {
         let ctx = TestContext::new().await;
         let order_id = open_order(&ctx.engine, "seller").await;
-        let (trade_id, _, _) = take(&ctx.engine, "buyer", &order_id).await;
+        let (trade_id, hold_invoice, _) = take(&ctx, "buyer", &order_id).await;
         let hash = ctx
             .engine
             .db
@@ -4437,7 +4437,7 @@ mod tests {
             .unwrap()
             .hold_payment_hash
             .unwrap();
-        wait_invoice_status(&ctx.fiber, &hash, "Received", Duration::from_secs(120)).await;
+        pay_hold(&ctx, &hold_invoice, &hash).await;
         ctx.engine.on_hold_status(&trade_id).await.unwrap();
         let rejected = ctx
             .engine

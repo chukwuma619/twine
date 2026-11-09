@@ -90,7 +90,7 @@ Export these before `cargo run`. On a VPS, systemd loads the same variables. See
 | `TWINE_RELAYS` | yes | Comma-separated websocket URLs. At least one. |
 | `TWINE_RPC` | yes | Fiber JSON-RPC URL, for example `http://127.0.0.1:8229`. |
 | `TWINE_RPC_TOKEN` | yes | Biscuit for that RPC, sent as `Authorization: Bearer`. |
-| `FIBER_NETWORK` | no | `testnet` (default) or `mainnet`. Selects invoice currency `Fibt` or `Fibb`. |
+| `FIBER_NETWORK` | no | `testnet` (default), `mainnet`, or `dev` (local e2e). Selects invoice currency `Fibt`, `Fibb`, or `Fibd`. |
 | `TWINE_SOLVER` | no | Nostr pubkey allowed to send `resolve`, hex or `npub`. Stored as lowercase hex. Empty means disputes are refused. |
 | `TWINE_DB` | no | SQLite path. Default `./twine.db`. |
 | `RUST_LOG` | no | Tracing filter. Default `info`. |
@@ -118,10 +118,11 @@ cargo test
 cargo run --release
 ```
 
-`cargo run` reads the variables above from the environment. Tests that talk to a live Fiber node stay ignored unless `TWINE_RPC` and `TWINE_RPC_TOKEN` are set:
+`cargo run` reads the variables above from the environment. Default `cargo test` uses an in-process FakeFiber. Live Fiber coverage is a separate multi-node e2e harness (`make e2e`): local CKB + three `fnn` processes (hub / seller / buyer). See [tests/e2e/README.md](tests/e2e/README.md).
 
 ```bash
-cargo test -- --ignored
+make e2e        # start nodes, then cargo test -- --ignored
+make e2e-down   # stop nodes
 ```
 
 Push doorbell:
@@ -137,6 +138,7 @@ cargo run --release
 | --- | --- |
 | `src/` | Daemon: trade engine (`engine.rs`), action handlers (`app/`), Nostr, Fiber RPC, SQLite, state machine (`state.rs`). |
 | `twine-push/` | Content-free FCM doorbell. |
+| `tests/e2e/` | Multi-`fnn` e2e harness wrapping a Fiber v0.9.1 checkout. |
 | `docker/` | Fiber node image. |
 | `config/` | Fiber config templates used with the image. |
 | `DEPLOY.md` | VPS install for the daemon, Fiber, and `twine-push`. |

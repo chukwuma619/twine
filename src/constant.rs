@@ -54,6 +54,8 @@ pub const TESTNET_INVOICE_CURRENCY: &str = "Fibt";
 
 pub const MAINNET_INVOICE_CURRENCY: &str = "Fibb";
 
+pub const DEV_INVOICE_CURRENCY: &str = "Fibd";
+
 pub const FIBER_POLL_SECS: u64 = 2;
 
 /// SQLite path when `TWINE_DB` is unset.

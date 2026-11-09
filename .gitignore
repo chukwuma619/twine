@@ -2,5 +2,8 @@ target
 .env
 fiber-node/
 *.db
+tests/e2e/.env
+tests/e2e/*.log
+tests/e2e/*.pid
 
 PROPOSAL.md

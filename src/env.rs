@@ -1,4 +1,6 @@
-use crate::constant::{DEFAULT_DB_PATH, MAINNET_INVOICE_CURRENCY, TESTNET_INVOICE_CURRENCY};
+use crate::constant::{
+    DEFAULT_DB_PATH, DEV_INVOICE_CURRENCY, MAINNET_INVOICE_CURRENCY, TESTNET_INVOICE_CURRENCY,
+};
 use anyhow::{Context, Result, bail};
 use nostr_sdk::prelude::PublicKey;
 use std::path::PathBuf;
@@ -72,7 +74,8 @@ pub fn invoice_currency(network: &str) -> Result<&'static str> {
     match network {
         "testnet" => Ok(TESTNET_INVOICE_CURRENCY),
         "mainnet" => Ok(MAINNET_INVOICE_CURRENCY),
-        other => bail!("FIBER_NETWORK must be testnet or mainnet, got {other}"),
+        "dev" => Ok(DEV_INVOICE_CURRENCY),
+        other => bail!("FIBER_NETWORK must be testnet, mainnet, or dev, got {other}"),
     }
 }
 
@@ -85,6 +88,7 @@ mod tests {
     fn invoice_currency_follows_fiber_network() {
         assert_eq!(invoice_currency("testnet").unwrap(), "Fibt");
         assert_eq!(invoice_currency("mainnet").unwrap(), "Fibb");
+        assert_eq!(invoice_currency("dev").unwrap(), "Fibd");
         assert!(invoice_currency("devnet").is_err());
     }
 
