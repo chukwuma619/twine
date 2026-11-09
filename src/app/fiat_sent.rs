@@ -74,7 +74,7 @@ pub(crate) async fn on_fiat_sent<F: FiberRpc + 'static>(
     } else {
         trade
     };
-    match apply_fiat_sent(trade.phase()?, actor) {
+    match apply_fiat_sent(trade.phase()?, actor, trade.fiat_opened) {
         crate::Decision::Ok(phase) => {
             if phase == Phase::Releasing && trade.fiat_acknowledged {
                 engine.db.set_trade_state(&trade.id, phase.as_str())?;

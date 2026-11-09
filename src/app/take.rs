@@ -2,7 +2,7 @@ use crate::engine::{Engine, cant_do};
 use crate::fiber::FiberRpc;
 use crate::types::{Outbound, Trade};
 use crate::{Envelope, Phase, Side, TakePayload, apply_take, unix_now};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use uuid::Uuid;
 
 pub(crate) async fn on_take<F: FiberRpc + 'static>(
@@ -75,6 +75,7 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         claim_margin_ms: None,
         final_tlc_expiry_delta_ms: None,
         fiat_acknowledged: false,
+        fiat_opened: false,
         fiat_sent_at: None,
         chat_key_shared: false,
         release_prompted: false,
@@ -83,13 +84,22 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
     if let Err(error) = engine.db.commit_take(&trade) {
         return Ok(vec![cant_do(sender, None, &error.to_string())]);
     }
-    match engine.bind_buyer_hold(&trade, &invoice).await? {
-        Ok(outbound) => Ok(outbound),
-        Err(reason) => {
+    match engine.bind_buyer_hold(&trade, &invoice).await {
+        Ok(Ok(outbound)) => Ok(outbound),
+        Ok(Err(reason)) => {
             engine
                 .db
                 .rollback_take(&trade.order_id, &trade.id, "", trade.shannons)?;
             Ok(vec![cant_do(sender, Some(trade_id), &reason)])
+        }
+        Err(error) => {
+            engine
+                .db
+                .rollback_take(&trade.order_id, &trade.id, "", trade.shannons)
+                .map_err(|rollback| {
+                    anyhow!("bind failed: {error:#}; rollback after bind failed: {rollback:#}")
+                })?;
+            Err(error)
         }
     }
 }

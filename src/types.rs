@@ -577,6 +577,8 @@ pub struct Trade {
     /// Seller released, or the solver decided the fiat arrived.
     /// A `fiat-sent` click does not set this.
     pub fiat_acknowledged: bool,
+    /// Fiat instructions were offered (`waiting-fiat` or later). Gates dispute `fiat-sent`.
+    pub fiat_opened: bool,
     /// Unix seconds when the buyer marked fiat sent. Starts the release grace.
     pub fiat_sent_at: Option<i64>,
     /// A party sealed this trade's chat to the solver. The ciphertext lives in `solver_evidence`.

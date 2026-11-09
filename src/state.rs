@@ -73,14 +73,17 @@ pub fn apply_route_failed_after_fiat(phase: Phase) -> Decision {
     }
 }
 
-pub fn apply_fiat_sent(phase: Phase, actor: Actor) -> Decision {
+pub fn apply_fiat_sent(phase: Phase, actor: Actor, fiat_opened: bool) -> Decision {
     match (phase, actor) {
         (Phase::AwaitingRoute, Actor::Buyer) => Decision::Reject(
             "the wallet cannot receive yet. Send the same invoice again before paying",
         ),
         (Phase::WaitingFiat, Actor::Buyer) => Decision::Ok(Phase::FiatSent),
         (Phase::AwaitingInvoice, Actor::Buyer) => Decision::Ok(Phase::Releasing),
-        (Phase::Disputed, Actor::Buyer) => Decision::Ok(Phase::Disputed),
+        (Phase::Disputed, Actor::Buyer) if fiat_opened => Decision::Ok(Phase::Disputed),
+        (Phase::Disputed, Actor::Buyer) => Decision::Reject(
+            "the wallet cannot receive yet. Send the same invoice again before paying",
+        ),
         (Phase::WaitingFiat | Phase::AwaitingInvoice | Phase::Disputed, _) => {
             Decision::Reject("only the buyer can submit a payout invoice")
         }
@@ -251,15 +254,15 @@ mod tests {
     #[test]
     fn fiat_sent_is_buyer_only() {
         assert_eq!(
-            apply_fiat_sent(Phase::WaitingFiat, buyer()),
+            apply_fiat_sent(Phase::WaitingFiat, buyer(), true),
             Decision::Ok(Phase::FiatSent)
         );
         assert!(matches!(
-            apply_fiat_sent(Phase::WaitingFiat, seller()),
+            apply_fiat_sent(Phase::WaitingFiat, seller(), true),
             Decision::Reject(_)
         ));
         assert!(matches!(
-            apply_fiat_sent(Phase::WaitingHold, buyer()),
+            apply_fiat_sent(Phase::WaitingHold, buyer(), false),
             Decision::Reject(_)
         ));
     }
@@ -275,7 +278,7 @@ mod tests {
             Decision::Ok(Phase::AwaitingInvoice)
         );
         assert_eq!(
-            apply_fiat_sent(Phase::AwaitingInvoice, buyer()),
+            apply_fiat_sent(Phase::AwaitingInvoice, buyer(), true),
             Decision::Ok(Phase::Releasing)
         );
         assert_eq!(
@@ -303,9 +306,13 @@ mod tests {
             Decision::Reject(_)
         ));
         assert_eq!(
-            apply_fiat_sent(Phase::Disputed, buyer()),
+            apply_fiat_sent(Phase::Disputed, buyer(), true),
             Decision::Ok(Phase::Disputed)
         );
+        assert!(matches!(
+            apply_fiat_sent(Phase::Disputed, buyer(), false),
+            Decision::Reject(_)
+        ));
     }
 
     #[test]
@@ -498,7 +505,7 @@ mod tests {
             Decision::Ok(Phase::Disputed)
         );
         assert!(matches!(
-            apply_fiat_sent(Phase::AwaitingRoute, buyer()),
+            apply_fiat_sent(Phase::AwaitingRoute, buyer(), false),
             Decision::Reject(_)
         ));
         assert!(matches!(

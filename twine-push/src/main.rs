@@ -1,9 +1,12 @@
+mod auth;
 mod fcm;
 mod tokens;
 
 use anyhow::{Context, Result};
+use auth::{authorize, payload_hash};
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use fcm::{Fcm, FcmOutcome, ServiceAccount};
@@ -28,6 +31,7 @@ struct App {
     tokens: Arc<Mutex<TokenStore>>,
     seen: Arc<Mutex<Seen>>,
     fcm: Arc<Fcm>,
+    public_url: Option<String>,
 }
 
 #[derive(Default)]
@@ -53,7 +57,6 @@ impl Seen {
 
 #[derive(Deserialize)]
 struct Register {
-    pubkey: String,
     token: String,
 }
 
@@ -79,10 +82,15 @@ async fn main() -> Result<()> {
     if !fcm.configured() {
         warn!("FCM_SERVICE_ACCOUNT unset; doorbells will be logged only");
     }
+    let public_url = std::env::var("TWINE_PUSH_PUBLIC_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let app = App {
         tokens: Arc::new(Mutex::new(TokenStore::load(tokens::tokens_path_from_env()))),
         seen: Arc::new(Mutex::new(Seen::default())),
         fcm: Arc::new(fcm),
+        public_url,
     };
     spawn_relay_watch(app.clone(), parse_relays(&relays));
     let router = router(app);
@@ -106,37 +114,49 @@ async fn health() -> Json<OkBody> {
     Json(OkBody { ok: true })
 }
 
-async fn register(State(app): State<App>, Json(body): Json<Register>) -> StatusCode {
-    let Some(pubkey) = normalize_pubkey(&body.pubkey) else {
-        return StatusCode::BAD_REQUEST;
-    };
-    if body.token.trim().is_empty() {
-        return StatusCode::BAD_REQUEST;
+async fn register(
+    State(app): State<App>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    match parse_authorized(&app, &headers, "/register", &body) {
+        Ok((pubkey, token)) => {
+            let token = token.trim();
+            if token.is_empty() {
+                return StatusCode::BAD_REQUEST;
+            }
+            app.tokens.lock().await.add(pubkey, token.to_string());
+            StatusCode::NO_CONTENT
+        }
+        Err(status) => status,
     }
-    app.tokens
-        .lock()
-        .await
-        .add(pubkey, body.token.trim().to_string());
-    StatusCode::NO_CONTENT
 }
 
-async fn unregister(State(app): State<App>, Json(body): Json<Register>) -> StatusCode {
-    let Some(pubkey) = normalize_pubkey(&body.pubkey) else {
-        return StatusCode::BAD_REQUEST;
-    };
-    app.tokens
-        .lock()
-        .await
-        .remove(&pubkey, body.token.trim());
-    StatusCode::NO_CONTENT
+async fn unregister(
+    State(app): State<App>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    match parse_authorized(&app, &headers, "/unregister", &body) {
+        Ok((pubkey, token)) => {
+            app.tokens.lock().await.remove(&pubkey, token.trim());
+            StatusCode::NO_CONTENT
+        }
+        Err(status) => status,
+    }
 }
 
-fn normalize_pubkey(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.to_ascii_lowercase().starts_with("nsec1") {
-        return None;
-    }
-    PublicKey::parse(trimmed).ok().map(|key| key.to_hex())
+fn parse_authorized(
+    app: &App,
+    headers: &HeaderMap,
+    path: &str,
+    body: &Bytes,
+) -> Result<(String, String), StatusCode> {
+    let pubkey = authorize(headers, path, body, app.public_url.as_deref())
+        .map_err(|deny| deny.status())?;
+    let payload: Register =
+        serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok((pubkey, payload.token))
 }
 
 fn parse_relays(raw: &str) -> Vec<String> {
@@ -270,6 +290,7 @@ mod tests {
             tokens: Arc::new(Mutex::new(TokenStore::memory())),
             seen: Arc::new(Mutex::new(Seen::default())),
             fcm: Arc::new(Fcm::new(None, reqwest::Client::new())),
+            public_url: None,
         }
     }
 
@@ -286,19 +307,27 @@ mod tests {
 
     #[tokio::test]
     async fn register_stores_a_token() {
+        use nostr::nips::nip98::{HttpData, HttpMethod};
         let app = test_app();
         let keys = Keys::generate();
-        let body = serde_json::json!({
-            "pubkey": keys.public_key().to_hex(),
-            "token": "fcm-token",
-        });
+        let body = serde_json::json!({ "token": "fcm-token" }).to_string();
+        let auth = HttpData::new(
+            Url::parse("http://127.0.0.1/register").unwrap(),
+            HttpMethod::POST,
+        )
+        .payload(payload_hash(body.as_bytes()))
+        .to_authorization(&keys)
+        .await
+        .unwrap();
         let response = router(app.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/register")
                     .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
+                    .header("host", "127.0.0.1")
+                    .header("authorization", auth)
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -313,10 +342,83 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nsec_is_not_a_registration_key() {
-        assert!(normalize_pubkey("nsec1qqqq").is_none());
-        assert!(normalize_pubkey("not-a-key").is_none());
+    #[tokio::test]
+    async fn register_without_auth_is_rejected() {
+        let body = serde_json::json!({ "token": "fcm-token" }).to_string();
+        let response = router(test_app())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn register_trims_and_rejects_blank_tokens() {
+        use nostr::nips::nip98::{HttpData, HttpMethod};
+        let app = test_app();
+        let keys = Keys::generate();
+        let blank = serde_json::json!({ "token": "   " }).to_string();
+        let blank_auth = HttpData::new(
+            Url::parse("http://127.0.0.1/register").unwrap(),
+            HttpMethod::POST,
+        )
+        .payload(payload_hash(blank.as_bytes()))
+        .to_authorization(&keys)
+        .await
+        .unwrap();
+        let blank_response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1")
+                    .header("authorization", blank_auth)
+                    .body(Body::from(blank))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blank_response.status(), StatusCode::BAD_REQUEST);
+
+        let padded = serde_json::json!({ "token": "  fcm-token  " }).to_string();
+        let padded_auth = HttpData::new(
+            Url::parse("http://127.0.0.1/register").unwrap(),
+            HttpMethod::POST,
+        )
+        .payload(payload_hash(padded.as_bytes()))
+        .to_authorization(&keys)
+        .await
+        .unwrap();
+        let padded_response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1")
+                    .header("authorization", padded_auth)
+                    .body(Body::from(padded))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(padded_response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            app.tokens
+                .lock()
+                .await
+                .tokens_for(&keys.public_key().to_hex())
+                .any(|token| token == "fcm-token")
+        );
     }
 
     #[test]

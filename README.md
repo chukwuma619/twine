@@ -48,7 +48,7 @@ Also: `canceled` (hold still Open), `refunding` / `expired` on timelock.
 
 - Sell posts with a price, a local currency, and min and max. Partial takes are allowed, and several trades can be open on one post while CKB remains.
 - Fiber hold invoices last 36 hours. An unpaid hold expires after 1 hour. The buyer can mark fiat sent only while a 2-hour release grace, a 4-hour solver window, and Fiber's routing time are still left. That routing time follows the inbound channel claim margin and the buyer invoice's lock, and is at least 30 minutes. After fiat is marked sent, the seller has 2 hours to release. If that grace passes, the buyer is told to open a dispute and seal this trade's chat to the solver.
-- If the buyer's invoice has no route when the hold locks, fiat stays closed (`awaiting-route`) until they paste that same invoice again. A later routing failure after fiat was marked sent keeps the fiat report and waits in `awaiting-invoice`. An invoice with an expiry has to stay payable through the hold. An expired one cannot be replaced, so the hold refunds. If the seller had released, or the solver recorded that the fiat arrived, that refund also publishes a public `fiat-owed` record.
+- If the buyer's invoice has no route when the hold locks, fiat stays closed (`awaiting-route`) until they paste that same invoice again. A dispute cannot open the release clock until fiat instructions were offered. A later routing failure after fiat was marked sent keeps the fiat report and waits in `awaiting-invoice`. An invoice with an expiry has to stay payable through the hold. An expired one cannot be replaced, so the hold refunds. If the seller had released, or the solver recorded that the fiat arrived, that refund also publishes a public `fiat-owed` record.
 - Disputes with sealed solver evidence. The daemon still cannot read the thread.
 - Public order book (kind `31420`), Fiber node announcement with pubkey, listen addresses, optional solver, and solver window (kind `31421`), and public trade outcomes (kind `31422`).
 - SQLite for orders, trades, and processed events. The preimage is removed from the daemon database after settle; the watchtower copy remains for channel safety.
@@ -101,6 +101,7 @@ Export these before `cargo run`. On a VPS, systemd loads the same variables. See
 | --- | --- | --- |
 | `TWINE_RELAYS` | no | Same relay list as the daemon. Default `wss://relay.backr.site`. |
 | `TWINE_PUSH_LISTEN` | no | HTTP bind. Default `0.0.0.0:8787`. |
+| `TWINE_PUSH_PUBLIC_URL` | no | Public base URL for NIP-98 auth (for example `https://push.backr.site`). Required behind a reverse proxy. |
 | `TWINE_PUSH_TOKENS` | no | JSON file of device tokens. Default `./twine-push-tokens.json`. |
 | `FCM_SERVICE_ACCOUNT` | no | Firebase service-account JSON path, or the JSON itself. Without it, doorbells are logged only. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | no | Fallback path if `FCM_SERVICE_ACCOUNT` is unset. |

@@ -81,13 +81,17 @@ async fn main() -> Result<()> {
                     {
                         continue;
                     }
-                    if !engine.db.mark_event(&event.id.to_hex())? {
+                    let event_id = event.id.to_hex();
+                    if !engine.db.mark_event(&event_id)? {
                         continue;
                     }
                     let envelope = match decrypt_action(&keys, &event) {
                         Ok(envelope) => envelope,
                         Err(error) => {
                             warn!(%error, "rejecting event");
+                            if let Err(unmark) = engine.db.unmark_event(&event_id) {
+                                warn!(%unmark, event_id = %event_id, "failed to unmark rejected event");
+                            }
                             continue;
                         }
                     };
@@ -100,7 +104,12 @@ async fn main() -> Result<()> {
                                 warn!(%error, "solver evidence was published but not marked delivered");
                             }
                         }
-                        Err(error) => warn!(%error, "handle failed"),
+                        Err(error) => {
+                            warn!(%error, "handle failed");
+                            if let Err(unmark) = engine.db.unmark_event(&event_id) {
+                                warn!(%unmark, event_id = %event_id, "failed to unmark failed event");
+                            }
+                        }
                     }
                 }
                 ClientNotification::Message { message, .. } => {

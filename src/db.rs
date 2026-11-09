@@ -10,7 +10,7 @@ const TRADE_COLUMNS: &str = "id, order_id, seller_nostr, seller_fiber, buyer_nos
      fiat_amount, shannons, state, hold_payment_hash, hold_invoice, payout_invoice, \
      payout_payment_hash, hold_received_at, hold_created_at, buyer_fiber_addr, \
      hold_expires_at_ms, claim_margin_ms, final_tlc_expiry_delta_ms, fiat_acknowledged, \
-     fiat_sent_at, chat_key_shared, release_prompted, outcome";
+     fiat_opened, fiat_sent_at, chat_key_shared, release_prompted, outcome";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -85,6 +85,7 @@ impl Db {
                 buyer_fiber_addr TEXT,
                 hold_expires_at_ms INTEGER,
                 fiat_acknowledged INTEGER NOT NULL DEFAULT 0,
+                fiat_opened INTEGER NOT NULL DEFAULT 0,
                 fiat_sent_at INTEGER,
                 chat_key_shared INTEGER NOT NULL DEFAULT 0,
                 release_prompted INTEGER NOT NULL DEFAULT 0,
@@ -135,6 +136,20 @@ impl Db {
             "ALTER TABLE trades ADD COLUMN final_tlc_expiry_delta_ms INTEGER",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE trades ADD COLUMN fiat_opened INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Backfill: fiat instructions were offered once the trade left awaiting-route.
+        let _ = conn.execute(
+            "UPDATE trades SET fiat_opened = 1
+             WHERE fiat_sent_at IS NOT NULL
+                OR state IN (
+                    'waiting-fiat', 'fiat-sent', 'awaiting-invoice',
+                    'releasing', 'settled'
+                )",
+            [],
+        );
         let _ = conn.execute("DROP TABLE IF EXISTS payment_methods", []);
         let _ = conn.execute("DROP TABLE IF EXISTS supported_payment_methods", []);
         for column in [
@@ -159,6 +174,16 @@ impl Db {
             params![event_id],
         )?;
         Ok(inserted == 1)
+    }
+
+    /// Drop a claimed event id so a decrypt or handle failure can be retried.
+    pub fn unmark_event(&self, event_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        conn.execute(
+            "DELETE FROM processed_events WHERE event_id = ?1",
+            params![event_id],
+        )?;
+        Ok(())
     }
 
     pub fn insert_order(&self, order: &Order) -> Result<()> {
@@ -449,8 +474,20 @@ impl Db {
     pub fn mark_fiat_sent(&self, id: &str, at: i64) -> Result<()> {
         let conn = self.conn.lock().expect("db");
         let updated = conn.execute(
-            "UPDATE trades SET state = ?1, fiat_sent_at = ?2, release_prompted = 0 WHERE id = ?3",
+            "UPDATE trades SET state = ?1, fiat_sent_at = ?2, fiat_opened = 1, release_prompted = 0 WHERE id = ?3",
             params![Phase::FiatSent.as_str(), at, id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
+    pub fn set_fiat_opened(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let updated = conn.execute(
+            "UPDATE trades SET fiat_opened = 1 WHERE id = ?1",
+            params![id],
         )?;
         if updated != 1 {
             bail!("trade {id} not found");
@@ -948,10 +985,11 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
             .map(|value| read_u64(value, 18))
             .transpose()?,
         fiat_acknowledged: row.get::<_, i64>(19)? != 0,
-        fiat_sent_at: row.get(20)?,
-        chat_key_shared: row.get::<_, i64>(21)? != 0,
-        release_prompted: row.get::<_, i64>(22)? != 0,
-        outcome: row.get(23)?,
+        fiat_opened: row.get::<_, i64>(20)? != 0,
+        fiat_sent_at: row.get(21)?,
+        chat_key_shared: row.get::<_, i64>(22)? != 0,
+        release_prompted: row.get::<_, i64>(23)? != 0,
+        outcome: row.get(24)?,
     })
 }
 
@@ -998,6 +1036,7 @@ mod tests {
             claim_margin_ms: None,
             final_tlc_expiry_delta_ms: None,
             fiat_acknowledged: false,
+            fiat_opened: false,
             fiat_sent_at: None,
             chat_key_shared: false,
             release_prompted: false,
@@ -1055,6 +1094,15 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].id, "order");
         assert_eq!(orders[0].fiat_currency, "NGN");
+    }
+
+    #[test]
+    fn mark_event_claims_once_and_unmark_allows_retry() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.mark_event("evt-1").unwrap());
+        assert!(!db.mark_event("evt-1").unwrap());
+        db.unmark_event("evt-1").unwrap();
+        assert!(db.mark_event("evt-1").unwrap());
     }
 
     #[test]

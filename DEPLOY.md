@@ -314,6 +314,7 @@ cat > /opt/twine/push.env << EOF
 RUST_LOG=info
 TWINE_RELAYS=wss://relay.backr.site
 TWINE_PUSH_LISTEN=127.0.0.1:8787
+TWINE_PUSH_PUBLIC_URL=https://push.backr.site
 TWINE_PUSH_TOKENS=/var/lib/twine-push/tokens.json
 FCM_SERVICE_ACCOUNT=/opt/twine/secrets/fcm.json
 EOF
@@ -346,7 +347,7 @@ curl -sS http://127.0.0.1:8787/health
 sudo journalctl -u twine-push -f
 ```
 
-`{"ok":true}` from `/health` means the process is up. Ctrl-C stops the log. A register from the app is `POST /register` with `{ "pubkey", "token" }`. Logout is `POST /unregister` with the same body. Tokens are rewritten to `TWINE_PUSH_TOKENS` after each change. Restarting the unit keeps them.
+`{"ok":true}` from `/health` means the process is up. Ctrl-C stops the log. Register is `POST /register` with body `{ "token" }` and a NIP-98 `Authorization: Nostr …` header signed by the device's Nostr key (pubkey comes from the event). Logout is `POST /unregister` the same way. Set `TWINE_PUSH_PUBLIC_URL=https://push.backr.site` in `push.env` so auth verifies against the public HTTPS URL behind Caddy. Tokens are rewritten to `TWINE_PUSH_TOKENS` after each change. Restarting the unit keeps them.
 
 Put TLS in front so the app can use HTTPS. This host already runs Caddy in Docker for `relay.backr.site` (`caddy:2`, config `/opt/twine/relay/Caddyfile`, host network). Add a site to that file. Do not `apt install caddy`: a second process will fail on port 2019 and the container will keep 80/443.
 

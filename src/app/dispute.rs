@@ -44,7 +44,8 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
         return Ok(vec![cant_do(sender, Some(trade_id), INVALID_EVIDENCE)]);
     }
     let actor = engine.trade_actor(&trade, sender);
-    match apply_dispute(trade.phase()?, actor) {
+    let prior = trade.phase()?;
+    match apply_dispute(prior, actor) {
         crate::Decision::Ok(phase) => {
             if actor == Actor::Buyer
                 && let Some(invoice) = payload
@@ -63,6 +64,12 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
                     None,
                     parsed.final_tlc_expiry_delta_ms,
                 )?;
+            }
+            if matches!(
+                prior,
+                crate::Phase::WaitingFiat | crate::Phase::FiatSent | crate::Phase::AwaitingInvoice
+            ) {
+                engine.db.set_fiat_opened(&trade.id)?;
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
             if let SubmittedEvidence::Ready(blobs) = evidence {
