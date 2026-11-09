@@ -16,12 +16,20 @@ pub fn unix_now_ms() -> i64 {
     unix_now() * 1000
 }
 
+/// Claim margin from the inbound channel's `tlc_expiry_delta`, floored at Fiber's default.
+pub fn claim_margin_ms(channel_tlc_expiry_delta_ms: Option<u64>) -> u64 {
+    let delay = channel_tlc_expiry_delta_ms.unwrap_or(crate::FIBER_TLC_EXPIRY_DELAY_MS);
+    delay
+        .saturating_add(crate::FIBER_CHECK_CHANNELS_MS)
+        .max(crate::CLAIM_MARGIN_MS)
+}
+
 /// Last second a payout can still start before Fiber drops the incoming TLC.
-pub fn payout_deadline_secs(expires_at_ms: i64) -> i64 {
-    let shortest = (crate::MIN_TLC_EXPIRY_LIMIT_MS + crate::FIBER_RANDOM_EXPIRY_RESERVE_MS) as i64;
+pub fn payout_deadline_secs(expires_at_ms: i64, claim_margin_ms: u64, final_delta_ms: u64) -> i64 {
+    let needed = final_delta_ms.saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS) as i64;
     expires_at_ms
-        .saturating_sub(crate::CLAIM_MARGIN_MS as i64)
-        .saturating_sub(shortest)
+        .saturating_sub(claim_margin_ms as i64)
+        .saturating_sub(needed)
         / 1000
 }
 
@@ -30,17 +38,21 @@ pub fn payout_deadline_secs(expires_at_ms: i64) -> i64 {
 /// Leaves the 2-hour release grace and the 4-hour solver window in front of
 /// [payout_deadline_secs]. That routing deadline is at least [crate::ROUTE_BUFFER_SECS]
 /// before the hold ends, and longer when Fiber needs more TLC time.
-pub fn fiat_deadline_secs(expires_at_ms: i64) -> i64 {
-    payout_deadline_secs(expires_at_ms)
+pub fn fiat_deadline_secs(expires_at_ms: i64, claim_margin_ms: u64, final_delta_ms: u64) -> i64 {
+    payout_deadline_secs(expires_at_ms, claim_margin_ms, final_delta_ms)
         .saturating_sub(crate::RELEASE_GRACE_SECS)
         .saturating_sub(crate::SOLVER_WINDOW_SECS)
 }
 
 /// Seconds a payout invoice must still be payable when the hold is created.
-pub fn payout_invoice_must_last_secs(hold_secs: u64) -> u64 {
-    let slack_secs = (crate::CLAIM_MARGIN_MS
-        + crate::MIN_TLC_EXPIRY_LIMIT_MS
-        + crate::FIBER_RANDOM_EXPIRY_RESERVE_MS)
+pub fn payout_invoice_must_last_secs(
+    hold_secs: u64,
+    claim_margin_ms: u64,
+    final_delta_ms: u64,
+) -> u64 {
+    let slack_secs = (claim_margin_ms
+        .saturating_add(final_delta_ms)
+        .saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS))
         / 1000;
     crate::INVOICE_EXPIRY_SECS
         .saturating_add(hold_secs)
@@ -56,9 +68,14 @@ pub fn invoice_payable_through(expires_at_ms: Option<i64>, until_ms: i64) -> boo
 }
 
 /// `tlc_expiry_limit` for this invoice, or a shorter invoice, or a refund.
-pub fn payout_budget(expires_at_ms: i64, now_ms: i64, final_delta_ms: u64) -> PayoutBudget {
+pub fn payout_budget(
+    expires_at_ms: i64,
+    now_ms: i64,
+    claim_margin_ms: u64,
+    final_delta_ms: u64,
+) -> PayoutBudget {
     let budget = expires_at_ms
-        .saturating_sub(crate::CLAIM_MARGIN_MS as i64)
+        .saturating_sub(claim_margin_ms as i64)
         .saturating_sub(now_ms);
     let budget = u64::try_from(budget).unwrap_or(0);
     let needed = final_delta_ms.saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS);
@@ -260,8 +277,10 @@ mod tests {
     #[test]
     fn fiat_deadline_leaves_the_release_grace_and_solver_window() {
         let expires_at_ms = 50_000_000_000_i64;
-        let route = payout_deadline_secs(expires_at_ms);
-        let fiat = fiat_deadline_secs(expires_at_ms);
+        let claim = crate::CLAIM_MARGIN_MS;
+        let final_delta = crate::MIN_TLC_EXPIRY_LIMIT_MS;
+        let route = payout_deadline_secs(expires_at_ms, claim, final_delta);
+        let fiat = fiat_deadline_secs(expires_at_ms, claim, final_delta);
         let hold_end = expires_at_ms / 1000;
         assert_eq!(
             fiat,
@@ -277,8 +296,34 @@ mod tests {
     }
 
     #[test]
+    fn deadlines_follow_the_invoice_lock_and_channel_delay() {
+        let expires_at_ms = 50_000_000_000_i64;
+        let short = payout_deadline_secs(
+            expires_at_ms,
+            crate::CLAIM_MARGIN_MS,
+            crate::MIN_TLC_EXPIRY_LIMIT_MS,
+        );
+        let long = payout_deadline_secs(
+            expires_at_ms,
+            crate::CLAIM_MARGIN_MS,
+            crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS,
+        );
+        assert!(long < short);
+        let slow_channel = claim_margin_ms(Some(8 * 60 * 60 * 1000));
+        assert!(slow_channel > crate::CLAIM_MARGIN_MS);
+        assert!(
+            payout_deadline_secs(expires_at_ms, slow_channel, crate::MIN_TLC_EXPIRY_LIMIT_MS)
+                < short
+        );
+    }
+
+    #[test]
     fn a_payout_invoice_has_to_outlast_the_hold() {
-        let must_last = payout_invoice_must_last_secs(crate::HOLD_SECS);
+        let must_last = payout_invoice_must_last_secs(
+            crate::HOLD_SECS,
+            crate::CLAIM_MARGIN_MS,
+            crate::MIN_TLC_EXPIRY_LIMIT_MS,
+        );
         assert!(must_last > 24 * 3_600);
         assert!(must_last < crate::HOLD_SECS);
         let now = 1_000_000_i64;
@@ -432,7 +477,7 @@ pub(crate) mod support {
     ) -> (String, String, String) {
         let payout = engine
             .fiber
-            .new_payout_invoice(100_000_000, "twine payout", 36 * 3_600 * 1_000)
+            .new_payout_invoice(100_000_000, "twine payout", crate::MIN_TLC_EXPIRY_LIMIT_MS)
             .await
             .unwrap();
         let outbound = engine

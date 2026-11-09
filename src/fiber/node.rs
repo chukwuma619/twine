@@ -10,13 +10,20 @@ pub struct FiberNodeInfo {
     pub addresses: Vec<String>,
 }
 
+/// Live inbound hold TLC and the channel delay used to claim it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundHold {
+    pub expires_at_ms: i64,
+    pub claim_margin_ms: u64,
+}
+
 #[async_trait]
 pub trait NodeRpc: Send + Sync {
     async fn node_info(&self) -> Result<FiberNodeInfo>;
     async fn node_pubkey(&self) -> Result<String> {
         Ok(self.node_info().await?.pubkey)
     }
-    async fn inbound_tlc_expiry(&self, payment_hash: &str) -> Result<Option<i64>>;
+    async fn inbound_hold(&self, payment_hash: &str) -> Result<Option<InboundHold>>;
 }
 
 #[async_trait]
@@ -25,21 +32,22 @@ impl NodeRpc for HttpFiber {
         parse_node_info(&self.call("node_info", None).await?)
     }
 
-    async fn inbound_tlc_expiry(&self, payment_hash: &str) -> Result<Option<i64>> {
+    async fn inbound_hold(&self, payment_hash: &str) -> Result<Option<InboundHold>> {
         let result = self
             .call(
                 "list_channels",
                 Some(serde_json::json!({ "include_closed": true })),
             )
             .await?;
-        Ok(earliest_inbound_expiry(&result, payment_hash))
+        Ok(earliest_inbound_hold(&result, payment_hash))
     }
 }
 
-fn earliest_inbound_expiry(channels: &Value, payment_hash: &str) -> Option<i64> {
-    let mut earliest: Option<i64> = None;
+fn earliest_inbound_hold(channels: &Value, payment_hash: &str) -> Option<InboundHold> {
+    let mut best: Option<(i64, Option<u64>)> = None;
     let rows = channels.get("channels").and_then(Value::as_array)?;
     for channel in rows {
+        let channel_delta = channel_tlc_expiry_delta_ms(channel);
         let Some(tlcs) = channel.get("pending_tlcs").and_then(Value::as_array) else {
             continue;
         };
@@ -65,13 +73,20 @@ fn earliest_inbound_expiry(channels: &Value, payment_hash: &str) -> Option<i64> 
             let Some(expiry) = tlc.get("expiry").and_then(hex_i64) else {
                 continue;
             };
-            earliest = Some(match earliest {
-                Some(current) => current.min(expiry),
-                None => expiry,
-            });
+            let replace = best.is_none_or(|(current, _)| expiry < current);
+            if replace {
+                best = Some((expiry, channel_delta));
+            }
         }
     }
-    earliest
+    best.map(|(expires_at_ms, channel_delta)| InboundHold {
+        expires_at_ms,
+        claim_margin_ms: crate::claim_margin_ms(channel_delta),
+    })
+}
+
+fn channel_tlc_expiry_delta_ms(channel: &Value) -> Option<u64> {
+    channel.get("tlc_expiry_delta").and_then(hex_or_u64)
 }
 
 fn inbound_still_held(status: Option<&Value>) -> bool {
@@ -91,6 +106,18 @@ fn hex_i64(value: &Value) -> Option<i64> {
         .or_else(|| text.strip_prefix("0X"))
         .unwrap_or(text);
     i64::from_str_radix(digits, 16).ok()
+}
+
+fn hex_or_u64(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    let text = value.as_str()?;
+    let digits = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    u64::from_str_radix(digits, 16).ok()
 }
 
 fn parse_node_info(result: &Value) -> Result<FiberNodeInfo> {
@@ -143,9 +170,10 @@ mod tests {
     }
 
     #[test]
-    fn inbound_expiry_is_the_earliest_live_tlc() {
+    fn inbound_hold_keeps_the_earliest_live_tlc_and_channel_delay() {
         let channels = json!({
             "channels": [{
+                "tlc_expiry_delta": "0x1b77400",
                 "pending_tlcs": [
                     {
                         "payment_hash": "0xabc",
@@ -177,7 +205,12 @@ mod tests {
                 ]
             }]
         });
-        assert_eq!(earliest_inbound_expiry(&channels, "0xabc"), Some(0x28));
-        assert_eq!(earliest_inbound_expiry(&channels, "0xother"), None);
+        let hold = earliest_inbound_hold(&channels, "0xabc").unwrap();
+        assert_eq!(hold.expires_at_ms, 0x28);
+        assert_eq!(
+            hold.claim_margin_ms,
+            crate::claim_margin_ms(Some(0x1b77400))
+        );
+        assert!(earliest_inbound_hold(&channels, "0xother").is_none());
     }
 }

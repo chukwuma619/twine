@@ -570,6 +570,10 @@ pub struct Trade {
     pub buyer_fiber_addr: Option<String>,
     /// Inbound TLC expiry in milliseconds.
     pub hold_expires_at_ms: Option<i64>,
+    /// Claim margin derived from the inbound channel's `tlc_expiry_delta`.
+    pub claim_margin_ms: Option<u64>,
+    /// Buyer payout invoice `final_htlc_minimum_expiry_delta`.
+    pub final_tlc_expiry_delta_ms: Option<u64>,
     /// Seller released, or the solver decided the fiat arrived.
     /// A `fiat-sent` click does not set this.
     pub fiat_acknowledged: bool,
@@ -601,14 +605,35 @@ impl Trade {
         self.hold_created_at.map(|at| at + hold_secs as i64)
     }
 
+    pub fn claim_margin_ms(&self) -> u64 {
+        self.claim_margin_ms.unwrap_or(crate::CLAIM_MARGIN_MS)
+    }
+
+    pub fn final_tlc_expiry_delta_ms(&self) -> u64 {
+        self.final_tlc_expiry_delta_ms
+            .unwrap_or(crate::DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS)
+    }
+
     /// Last second the buyer may mark fiat sent.
     pub fn pay_by(&self) -> Option<i64> {
-        self.hold_expires_at_ms.map(fiat_deadline_secs)
+        self.hold_expires_at_ms.map(|expires| {
+            fiat_deadline_secs(
+                expires,
+                self.claim_margin_ms(),
+                self.final_tlc_expiry_delta_ms(),
+            )
+        })
     }
 
     /// Last second a payout can start.
     pub fn route_by(&self) -> Option<i64> {
-        self.hold_expires_at_ms.map(payout_deadline_secs)
+        self.hold_expires_at_ms.map(|expires| {
+            payout_deadline_secs(
+                expires,
+                self.claim_margin_ms(),
+                self.final_tlc_expiry_delta_ms(),
+            )
+        })
     }
 
     /// Seller's deadline to release, measured from fiat-sent.

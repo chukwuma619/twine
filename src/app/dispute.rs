@@ -53,10 +53,16 @@ pub(crate) async fn on_dispute<F: FiberRpc + 'static>(
                     .map(str::trim)
                     .filter(|invoice| !invoice.is_empty())
             {
-                if let Err(reason) = engine.require_same_hold_hash(&trade, invoice).await? {
-                    return Ok(vec![cant_do(sender, Some(trade_id), &reason)]);
-                }
-                engine.db.set_payout(&trade.id, invoice, None)?;
+                let parsed = match engine.require_same_hold_hash(&trade, invoice).await? {
+                    Ok(parsed) => parsed,
+                    Err(reason) => return Ok(vec![cant_do(sender, Some(trade_id), &reason)]),
+                };
+                engine.db.set_payout_with_final_delta(
+                    &trade.id,
+                    invoice,
+                    None,
+                    parsed.final_tlc_expiry_delta_ms,
+                )?;
             }
             engine.db.set_trade_state(&trade.id, phase.as_str())?;
             if let SubmittedEvidence::Ready(blobs) = evidence {

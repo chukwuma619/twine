@@ -81,10 +81,16 @@ pub(crate) async fn on_resolve<F: FiberRpc + 'static>(
         },
         crate::Decision::Ok(Phase::Releasing) => {
             if let Some(invoice) = &supplied {
-                if let Err(reason) = engine.require_same_hold_hash(&trade, invoice).await? {
-                    return Ok(vec![cant_do(sender, Some(trade_id), &reason)]);
-                }
-                engine.db.set_payout(&trade.id, invoice, None)?;
+                let parsed = match engine.require_same_hold_hash(&trade, invoice).await? {
+                    Ok(parsed) => parsed,
+                    Err(reason) => return Ok(vec![cant_do(sender, Some(trade_id), &reason)]),
+                };
+                engine.db.set_payout_with_final_delta(
+                    &trade.id,
+                    invoice,
+                    None,
+                    parsed.final_tlc_expiry_delta_ms,
+                )?;
             }
             engine.db.begin_release(&trade.id)?;
             engine.watch(&trade.id)?;

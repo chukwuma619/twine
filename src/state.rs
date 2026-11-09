@@ -58,13 +58,18 @@ pub fn apply_route_ready(phase: Phase) -> Decision {
 }
 
 /// Coins are locked and the payout invoice cannot be paid yet.
-/// Waiting-fiat can return here when the fiat-sent dry run finds no route.
 pub fn apply_route_blocked(phase: Phase) -> Decision {
     match phase {
-        Phase::WaitingHold | Phase::AwaitingRoute | Phase::WaitingFiat => {
-            Decision::Ok(Phase::AwaitingRoute)
-        }
+        Phase::WaitingHold | Phase::AwaitingRoute => Decision::Ok(Phase::AwaitingRoute),
         _ => Decision::Reject("hold is not waiting on a route"),
+    }
+}
+
+/// Fiat was already marked sent, then the payout route disappeared.
+pub fn apply_route_failed_after_fiat(phase: Phase) -> Decision {
+    match phase {
+        Phase::FiatSent => Decision::Ok(Phase::AwaitingInvoice),
+        _ => Decision::Reject("route recovery after fiat requires fiat-sent"),
     }
 }
 
@@ -87,13 +92,17 @@ pub fn apply_fiat_sent(phase: Phase, actor: Actor) -> Decision {
 
 pub fn apply_release(phase: Phase, actor: Actor, has_invoice: bool) -> Decision {
     match (phase, actor) {
-        (Phase::FiatSent | Phase::Disputed, Actor::Seller) if has_invoice => {
+        (Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed, Actor::Seller)
+            if has_invoice =>
+        {
             Decision::Ok(Phase::Releasing)
         }
-        (Phase::FiatSent | Phase::Disputed, Actor::Seller) => {
+        (Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed, Actor::Seller) => {
             Decision::Reject("payout invoice is required")
         }
-        (Phase::FiatSent | Phase::Disputed, _) => Decision::Reject("only the seller can release"),
+        (Phase::FiatSent | Phase::AwaitingInvoice | Phase::Disputed, _) => {
+            Decision::Reject("only the seller can release")
+        }
         _ => Decision::Reject("release is only valid after fiat is sent or during a dispute"),
     }
 }
@@ -381,7 +390,11 @@ mod tests {
     #[test]
     fn hold_deadline_refunds_without_settling() {
         let expires_at_ms = 50_000_000_000;
-        let deadline = crate::payout_deadline_secs(expires_at_ms);
+        let deadline = crate::payout_deadline_secs(
+            expires_at_ms,
+            crate::CLAIM_MARGIN_MS,
+            crate::MIN_TLC_EXPIRY_LIMIT_MS,
+        );
         assert_eq!(
             apply_clock(Phase::WaitingFiat, deadline - 1, Some(deadline)),
             Decision::NoOp
@@ -409,29 +422,29 @@ mod tests {
     fn outgoing_budget_ends_before_fiber_drops_the_incoming_tlc() {
         let now_ms = 1_000_000_000_000;
         let expires_at_ms = now_ms + 36 * 3_600 * 1000;
+        let claim = crate::CLAIM_MARGIN_MS;
         let crate::PayoutBudget::Send {
             tlc_expiry_limit_ms,
-        } = crate::payout_budget(expires_at_ms, now_ms, 24 * 3_600 * 1000)
+        } = crate::payout_budget(expires_at_ms, now_ms, claim, 24 * 3_600 * 1000)
         else {
             panic!("a 36 hour hold fits a 24 hour final hop");
         };
-        assert!(
-            now_ms + tlc_expiry_limit_ms as i64 + crate::CLAIM_MARGIN_MS as i64 <= expires_at_ms
-        );
-        let late = expires_at_ms - crate::CLAIM_MARGIN_MS as i64 - 60_000;
+        assert!(now_ms + tlc_expiry_limit_ms as i64 + claim as i64 <= expires_at_ms);
+        let late = expires_at_ms - claim as i64 - 60_000;
         assert_eq!(
-            crate::payout_budget(expires_at_ms, late, crate::MIN_TLC_EXPIRY_LIMIT_MS),
+            crate::payout_budget(expires_at_ms, late, claim, crate::MIN_TLC_EXPIRY_LIMIT_MS),
             crate::PayoutBudget::Refund
         );
         let mid = now_ms + 20 * 3_600 * 1000;
         assert_eq!(
-            crate::payout_budget(expires_at_ms, mid, 24 * 3_600 * 1000),
+            crate::payout_budget(expires_at_ms, mid, claim, 24 * 3_600 * 1000),
             crate::PayoutBudget::ShorterInvoice
         );
         assert_eq!(
             crate::payout_budget(
                 expires_at_ms,
                 expires_at_ms + 1,
+                claim,
                 crate::MIN_TLC_EXPIRY_LIMIT_MS
             ),
             crate::PayoutBudget::Refund
@@ -488,9 +501,13 @@ mod tests {
             apply_fiat_sent(Phase::AwaitingRoute, buyer()),
             Decision::Reject(_)
         ));
-        assert_eq!(
+        assert!(matches!(
             apply_route_blocked(Phase::WaitingFiat),
-            Decision::Ok(Phase::AwaitingRoute)
+            Decision::Reject(_)
+        ));
+        assert_eq!(
+            apply_route_failed_after_fiat(Phase::FiatSent),
+            Decision::Ok(Phase::AwaitingInvoice)
         );
         assert_eq!(
             apply_route_blocked(Phase::WaitingHold),

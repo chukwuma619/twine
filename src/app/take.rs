@@ -72,6 +72,8 @@ pub(crate) async fn on_take<F: FiberRpc + 'static>(
         hold_created_at: Some(created_at),
         buyer_fiber_addr: None,
         hold_expires_at_ms: None,
+        claim_margin_ms: None,
+        final_tlc_expiry_delta_ms: None,
         fiat_acknowledged: false,
         fiat_sent_at: None,
         chat_key_shared: false,

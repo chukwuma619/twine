@@ -9,8 +9,8 @@ use std::sync::Mutex;
 const TRADE_COLUMNS: &str = "id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber, \
      fiat_amount, shannons, state, hold_payment_hash, hold_invoice, payout_invoice, \
      payout_payment_hash, hold_received_at, hold_created_at, buyer_fiber_addr, \
-     hold_expires_at_ms, fiat_acknowledged, fiat_sent_at, chat_key_shared, release_prompted, \
-     outcome";
+     hold_expires_at_ms, claim_margin_ms, final_tlc_expiry_delta_ms, fiat_acknowledged, \
+     fiat_sent_at, chat_key_shared, release_prompted, outcome";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -128,6 +128,11 @@ impl Db {
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN solver_evidence TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE trades ADD COLUMN evidence_pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN claim_margin_ms INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE trades ADD COLUMN final_tlc_expiry_delta_ms INTEGER",
             [],
         );
         let _ = conn.execute("DROP TABLE IF EXISTS payment_methods", []);
@@ -250,8 +255,8 @@ impl Db {
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
                 payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
-                buyer_fiber_addr, hold_expires_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                buyer_fiber_addr, hold_expires_at_ms, claim_margin_ms, final_tlc_expiry_delta_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 trade.id,
                 trade.order_id,
@@ -270,6 +275,16 @@ impl Db {
                 trade.hold_created_at,
                 trade.buyer_fiber_addr,
                 trade.hold_expires_at_ms,
+                trade
+                    .claim_margin_ms
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("claim margin does not fit sqlite")?,
+                trade
+                    .final_tlc_expiry_delta_ms
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("final tlc expiry delta does not fit sqlite")?,
             ],
         )?;
         tx.commit()?;
@@ -355,8 +370,8 @@ impl Db {
                 id, order_id, seller_nostr, seller_fiber, buyer_nostr, buyer_fiber,
                 fiat_amount, shannons, state, hold_payment_hash, hold_invoice,
                 payout_invoice, payout_payment_hash, hold_received_at, hold_created_at,
-                buyer_fiber_addr, hold_expires_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                buyer_fiber_addr, hold_expires_at_ms, claim_margin_ms, final_tlc_expiry_delta_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 trade.id,
                 trade.order_id,
@@ -375,6 +390,16 @@ impl Db {
                 trade.hold_created_at,
                 trade.buyer_fiber_addr,
                 trade.hold_expires_at_ms,
+                trade
+                    .claim_margin_ms
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("claim margin does not fit sqlite")?,
+                trade
+                    .final_tlc_expiry_delta_ms
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("final tlc expiry delta does not fit sqlite")?,
             ],
         )?;
         Ok(())
@@ -575,17 +600,50 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_hold_timing(
+        &self,
+        id: &str,
+        expires_at_ms: i64,
+        claim_margin_ms: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let claim = i64::try_from(claim_margin_ms).context("claim margin does not fit sqlite")?;
+        conn.execute(
+            "UPDATE trades SET hold_expires_at_ms = ?1, claim_margin_ms = ?2 WHERE id = ?3",
+            params![expires_at_ms, claim, id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_hold_received(
         &self,
         id: &str,
         state: &str,
         at: i64,
         expires_at_ms: Option<i64>,
+        claim_margin_ms: Option<u64>,
     ) -> Result<()> {
         let conn = self.conn.lock().expect("db");
+        let claim = claim_margin_ms
+            .map(|value| i64::try_from(value).context("claim margin does not fit sqlite"))
+            .transpose()?;
         let updated = conn.execute(
-            "UPDATE trades SET state = ?1, hold_received_at = ?2, hold_expires_at_ms = ?3 WHERE id = ?4",
-            params![state, at, expires_at_ms, id],
+            "UPDATE trades SET state = ?1, hold_received_at = ?2, hold_expires_at_ms = ?3, claim_margin_ms = COALESCE(?4, claim_margin_ms) WHERE id = ?5",
+            params![state, at, expires_at_ms, claim, id],
+        )?;
+        if updated != 1 {
+            bail!("trade {id} not found");
+        }
+        Ok(())
+    }
+
+    pub fn set_final_tlc_expiry_delta_ms(&self, id: &str, final_delta_ms: u64) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let value =
+            i64::try_from(final_delta_ms).context("final tlc expiry delta does not fit sqlite")?;
+        let updated = conn.execute(
+            "UPDATE trades SET final_tlc_expiry_delta_ms = ?1 WHERE id = ?2",
+            params![value, id],
         )?;
         if updated != 1 {
             bail!("trade {id} not found");
@@ -642,6 +700,23 @@ impl Db {
         conn.execute(
             "UPDATE trades SET payout_invoice = ?1, payout_payment_hash = ?2 WHERE id = ?3",
             params![invoice, payment_hash, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_payout_with_final_delta(
+        &self,
+        id: &str,
+        invoice: &str,
+        payment_hash: Option<&str>,
+        final_delta_ms: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db");
+        let final_delta =
+            i64::try_from(final_delta_ms).context("final tlc expiry delta does not fit sqlite")?;
+        conn.execute(
+            "UPDATE trades SET payout_invoice = ?1, payout_payment_hash = ?2, final_tlc_expiry_delta_ms = ?3 WHERE id = ?4",
+            params![invoice, payment_hash, final_delta, id],
         )?;
         Ok(())
     }
@@ -864,11 +939,19 @@ fn row_to_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<Trade> {
         hold_created_at: row.get(14)?,
         buyer_fiber_addr: row.get(15)?,
         hold_expires_at_ms: row.get(16)?,
-        fiat_acknowledged: row.get::<_, i64>(17)? != 0,
-        fiat_sent_at: row.get(18)?,
-        chat_key_shared: row.get::<_, i64>(19)? != 0,
-        release_prompted: row.get::<_, i64>(20)? != 0,
-        outcome: row.get(21)?,
+        claim_margin_ms: row
+            .get::<_, Option<i64>>(17)?
+            .map(|value| read_u64(value, 17))
+            .transpose()?,
+        final_tlc_expiry_delta_ms: row
+            .get::<_, Option<i64>>(18)?
+            .map(|value| read_u64(value, 18))
+            .transpose()?,
+        fiat_acknowledged: row.get::<_, i64>(19)? != 0,
+        fiat_sent_at: row.get(20)?,
+        chat_key_shared: row.get::<_, i64>(21)? != 0,
+        release_prompted: row.get::<_, i64>(22)? != 0,
+        outcome: row.get(23)?,
     })
 }
 
@@ -912,6 +995,8 @@ mod tests {
             hold_created_at: None,
             buyer_fiber_addr: None,
             hold_expires_at_ms: None,
+            claim_margin_ms: None,
+            final_tlc_expiry_delta_ms: None,
             fiat_acknowledged: false,
             fiat_sent_at: None,
             chat_key_shared: false,
