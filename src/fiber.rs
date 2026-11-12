@@ -1,8 +1,10 @@
+mod hint;
 mod invoice;
 mod node;
 mod payment;
 mod watchtower;
 
+pub use hint::{HintedInvoice, decode_hinted_invoice};
 pub use invoice::InvoiceRpc;
 pub use node::{FiberNodeInfo, InboundHold, NodeRpc};
 pub use payment::{

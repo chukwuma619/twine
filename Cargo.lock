@@ -40,6 +40,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arcode"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cf9ecf0f36fbecd0fd1be1eaa0b25fc67051d9a2f6b25892e6e6ebb7db629cb"
+dependencies = [
+ "bitbit",
+ "fenwick",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -114,6 +124,12 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bech32"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
+
+[[package]]
+name = "bech32"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
@@ -128,6 +144,12 @@ dependencies = [
  "serde",
  "unicode-normalization",
 ]
+
+[[package]]
+name = "bitbit"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "341ee439c53e593fa7de26dead9515601539b6cf9a53e3368c1405471e3ea322"
 
 [[package]]
 name = "bitcoin-consensus-encoding"
@@ -472,6 +494,12 @@ dependencies = [
  "heapless",
  "serde",
 ]
+
+[[package]]
+name = "fenwick"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ad8c7269456fd609f700340399dca5fa160c4785c9623f87b6079e5a479f28b"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1036,7 +1064,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38ca5c25a6df8d4d78fdf39b42792438f6ce22b4809ccbfdb27582ed9ca45407"
 dependencies = [
  "base64 0.22.1",
- "bech32",
+ "bech32 0.12.0",
  "bip39",
  "bitcoin_hashes 1.2.0",
  "cbc",
@@ -2041,8 +2069,10 @@ name = "twine-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arcode",
  "async-trait",
  "base64 0.22.1",
+ "bech32 0.9.1",
  "hex",
  "nostr",
  "nostr-sdk",

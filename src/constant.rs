@@ -41,6 +41,16 @@ pub const FIBER_RANDOM_EXPIRY_RESERVE_MS: u64 = 4 * 60 * 60 * 1000;
 /// `DEFAULT_FINAL_TLC_EXPIRY_DELTA` when the invoice omits the attribute.
 pub const DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Lock a trampoline payment adds on top of the payee's final lock: Fiber v0.9.1
+/// `trampoline_forward_expiry_delta` gives each trampoline segment
+/// 3 x `DEFAULT_TLC_EXPIRY_DELTA` + `MIN_TLC_EXPIRY_DELTA`, plus the hop into the
+/// trampoline node. Measured on testnet 2026-11-12: a 24h invoice behind one trampoline
+/// needed 42.8h from the trampoline's peer.
+pub const TRAMPOLINE_SLACK_MS: u64 = 3 * FIBER_RANDOM_EXPIRY_RESERVE_MS
+    + FIBER_TLC_EXPIRY_DELAY_MS
+    + FIBER_RANDOM_EXPIRY_RESERVE_MS
+    + 20 * 60 * 1000;
+
 /// `MAX_PAYMENT_TLC_EXPIRY_LIMIT`.
 pub const MAX_TLC_EXPIRY_LIMIT_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 

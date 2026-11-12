@@ -1,5 +1,5 @@
 use super::{HttpFiber, PaymentInfo};
-use crate::{MAX_FEE_RATE, hex_u64};
+use crate::{MAX_FEE_RATE, hex_u64, hex_u128};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::json;
@@ -20,11 +20,7 @@ impl PaymentRpc for HttpFiber {
         let result = self
             .call(
                 "send_payment",
-                Some(json!({
-                    "invoice": invoice,
-                    "max_fee_rate": hex_u64(MAX_FEE_RATE),
-                    "tlc_expiry_limit": hex_u64(tlc_expiry_limit_ms),
-                })),
+                Some(send_payment_params(invoice, tlc_expiry_limit_ms, false)),
             )
             .await?;
         payment_from_send(result)
@@ -59,12 +55,47 @@ impl PaymentRpc for HttpFiber {
 /// Params for Fiber `send_payment` `dry_run`. A missing path comes back as an
 /// RPC error whose message contains `Failed to build route`, not as a stored payment.
 pub fn probe_payment_params(invoice: &str, tlc_expiry_limit_ms: u64) -> serde_json::Value {
-    json!({
-        "invoice": invoice,
-        "max_fee_rate": hex_u64(MAX_FEE_RATE),
-        "tlc_expiry_limit": hex_u64(tlc_expiry_limit_ms),
-        "dry_run": true,
-    })
+    send_payment_params(invoice, tlc_expiry_limit_ms, true)
+}
+
+/// An invoice with a trampoline route hint is paid by fields through the hinted node,
+/// which Fiber v0.9.1 supports although it cannot parse the invoice. Trampoline routing
+/// needs `max_fee_amount`; it gets the same cap `max_fee_rate` gives a plain payment.
+pub fn send_payment_params(
+    invoice: &str,
+    tlc_expiry_limit_ms: u64,
+    dry_run: bool,
+) -> serde_json::Value {
+    let mut params = match super::hint::decode_hinted_invoice(invoice) {
+        Ok(hinted) => {
+            let amount = hinted.amount.unwrap_or(0);
+            let mut fields = json!({
+                "target_pubkey": hinted.payee,
+                "amount": hex_u128(amount),
+                "payment_hash": hinted.payment_hash,
+                "trampoline_hops": [hinted.trampoline_hint],
+                "max_fee_amount": hex_u128(amount * u128::from(MAX_FEE_RATE) / 1_000),
+                "max_fee_rate": hex_u64(MAX_FEE_RATE),
+                "tlc_expiry_limit": hex_u64(tlc_expiry_limit_ms),
+            });
+            if let Some(delta) = hinted.final_tlc_expiry_delta_ms {
+                fields["final_tlc_expiry_delta"] = json!(hex_u64(delta));
+            }
+            if hinted.hash_algorithm == 1 {
+                fields["hash_algorithm"] = json!("sha256");
+            }
+            fields
+        }
+        Err(_) => json!({
+            "invoice": invoice,
+            "max_fee_rate": hex_u64(MAX_FEE_RATE),
+            "tlc_expiry_limit": hex_u64(tlc_expiry_limit_ms),
+        }),
+    };
+    if dry_run {
+        params["dry_run"] = json!(true);
+    }
+    params
 }
 
 fn payment_from_send(result: serde_json::Value) -> Result<PaymentInfo> {
