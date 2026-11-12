@@ -24,6 +24,17 @@ pub fn claim_margin_ms(channel_tlc_expiry_delta_ms: Option<u64>) -> u64 {
         .max(crate::CLAIM_MARGIN_MS)
 }
 
+/// When the trade's clocks treat the hold as ending. A seller paying over many hops can
+/// deliver the hold with a TLC that lasts days longer than the hold asked for; the clocks
+/// keep the hold's own length so a failed trade refunds the seller on time. Ending earlier
+/// is always safe: the TLC stays claimable until its real expiry.
+pub fn hold_window_end_ms(tlc_expires_at_ms: i64, locked_at_secs: i64, hold_secs: u64) -> i64 {
+    let own = locked_at_secs
+        .saturating_add(i64::try_from(hold_secs).unwrap_or(i64::MAX))
+        .saturating_mul(1000);
+    tlc_expires_at_ms.min(own)
+}
+
 /// Last second a payout can still start before Fiber drops the incoming TLC.
 pub fn payout_deadline_secs(expires_at_ms: i64, claim_margin_ms: u64, final_delta_ms: u64) -> i64 {
     let needed = final_delta_ms.saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS) as i64;
@@ -276,6 +287,19 @@ pub fn i64_from_shannons(value: u128) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hold_window_keeps_the_hold_length() {
+        let locked_at = 1_000_000;
+        let hold = crate::HOLD_SECS;
+        let own_end = (locked_at + hold as i64) * 1000;
+        // A long seller route: the TLC lasts 132h, the trade still ends at 48h.
+        let long_tlc = (locked_at + 132 * 3_600) * 1000;
+        assert_eq!(hold_window_end_ms(long_tlc, locked_at, hold), own_end);
+        // A TLC that ends first is kept: never later than the TLC.
+        let short_tlc = own_end - 60_000;
+        assert_eq!(hold_window_end_ms(short_tlc, locked_at, hold), short_tlc);
+    }
 
     #[test]
     fn fiat_deadline_leaves_the_release_grace_and_solver_window() {
