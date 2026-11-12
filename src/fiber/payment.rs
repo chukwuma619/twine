@@ -1,6 +1,6 @@
 use super::{HttpFiber, PaymentInfo};
 use crate::{MAX_FEE_RATE, hex_u64, hex_u128};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -20,7 +20,7 @@ impl PaymentRpc for HttpFiber {
         let result = self
             .call(
                 "send_payment",
-                Some(send_payment_params(invoice, tlc_expiry_limit_ms, false)),
+                Some(send_payment_params(invoice, tlc_expiry_limit_ms, false)?),
             )
             .await?;
         payment_from_send(result)
@@ -30,7 +30,7 @@ impl PaymentRpc for HttpFiber {
         let result = self
             .call(
                 "send_payment",
-                Some(probe_payment_params(invoice, tlc_expiry_limit_ms)),
+                Some(probe_payment_params(invoice, tlc_expiry_limit_ms)?),
             )
             .await?;
         payment_from_send(result)
@@ -54,7 +54,7 @@ impl PaymentRpc for HttpFiber {
 
 /// Params for Fiber `send_payment` `dry_run`. A missing path comes back as an
 /// RPC error whose message contains `Failed to build route`, not as a stored payment.
-pub fn probe_payment_params(invoice: &str, tlc_expiry_limit_ms: u64) -> serde_json::Value {
+pub fn probe_payment_params(invoice: &str, tlc_expiry_limit_ms: u64) -> Result<serde_json::Value> {
     send_payment_params(invoice, tlc_expiry_limit_ms, true)
 }
 
@@ -65,10 +65,12 @@ pub fn send_payment_params(
     invoice: &str,
     tlc_expiry_limit_ms: u64,
     dry_run: bool,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
     let mut params = match super::hint::decode_hinted_invoice(invoice) {
         Ok(hinted) => {
-            let amount = hinted.amount.unwrap_or(0);
+            let Some(amount) = hinted.amount else {
+                bail!("trampoline invoice is missing an amount");
+            };
             let mut fields = json!({
                 "target_pubkey": hinted.payee,
                 "amount": hex_u128(amount),
@@ -95,7 +97,7 @@ pub fn send_payment_params(
     if dry_run {
         params["dry_run"] = json!(true);
     }
-    params
+    Ok(params)
 }
 
 fn payment_from_send(result: serde_json::Value) -> Result<PaymentInfo> {
@@ -205,10 +207,55 @@ mod tests {
 
     #[test]
     fn probe_asks_fiber_not_to_send() {
-        let params = probe_payment_params("invoice", 60_000);
+        let params = probe_payment_params("invoice", 60_000).unwrap();
         assert_eq!(params["dry_run"], true);
         assert_eq!(params["invoice"], "invoice");
         assert!(params.get("keysend").is_none());
+    }
+
+    #[test]
+    fn trampoline_payment_requires_an_amount() {
+        let mut payee = [0x22u8; 33];
+        payee[0] = 0x02;
+        let mut trampoline = [0x33u8; 33];
+        trampoline[0] = 0x03;
+        let invoice = super::super::hint::test_invoice::encode_hinted_invoice(
+            "fibt",
+            1_000,
+            &[0x11; 32],
+            None,
+            Some(86_400_000),
+            &payee,
+            0,
+            &trampoline,
+        );
+        let err = send_payment_params(&invoice, 60_000, false).unwrap_err();
+        assert!(err.to_string().contains("missing an amount"));
+    }
+
+    #[test]
+    fn trampoline_payment_uses_fields_and_fee_cap() {
+        let mut payee = [0x22u8; 33];
+        payee[0] = 0x02;
+        let mut trampoline = [0x33u8; 33];
+        trampoline[0] = 0x03;
+        let invoice = super::super::hint::test_invoice::encode_hinted_invoice(
+            "fibt10000000000",
+            1_000,
+            &[0x11; 32],
+            None,
+            Some(86_400_000),
+            &payee,
+            0,
+            &trampoline,
+        );
+        let params = send_payment_params(&invoice, 60_000, true).unwrap();
+        assert_eq!(params["dry_run"], true);
+        assert_eq!(params["target_pubkey"], hex::encode(payee));
+        assert_eq!(params["trampoline_hops"], json!([hex::encode(trampoline)]));
+        assert_eq!(params["amount"], "0x2540be400");
+        assert_eq!(params["max_fee_amount"], "0x2faf080");
+        assert!(params.get("invoice").is_none());
     }
 
     #[test]

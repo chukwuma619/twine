@@ -157,11 +157,15 @@ impl InvoiceRpc for HttpFiber {
             .await
         {
             Ok(result) => result,
-            // Fiber through 0.10.0-rc3 cannot read trampoline attr 10; read it here.
-            Err(error) => match super::hint::decode_hinted_invoice(invoice) {
-                Ok(hinted) => return parsed_from_hinted(&hinted),
-                Err(_) => return Err(error),
-            },
+            // Fiber through 0.10.0-rc3 cannot read trampoline attr 10.
+            Err(error) => {
+                if fiber_refuses_unknown_invoice_attr(&error)
+                    && let Ok(hinted) = super::hint::decode_hinted_invoice(invoice)
+                {
+                    return parsed_from_hinted(&hinted);
+                }
+                return Err(error);
+            }
         };
         let invoice = &result["invoice"];
         Ok(ParsedInvoice {
@@ -179,7 +183,15 @@ impl InvoiceRpc for HttpFiber {
     }
 }
 
+/// True when Fiber's parse error is molecule `UnknownItem` (attr 10 on 0.9.1 / 0.10.0-rc3).
+pub(crate) fn fiber_refuses_unknown_invoice_attr(error: &anyhow::Error) -> bool {
+    error.to_string().to_ascii_lowercase().contains("unknown id")
+}
+
 fn parsed_from_hinted(hinted: &super::HintedInvoice) -> Result<ParsedInvoice> {
+    let amount = hinted
+        .amount
+        .ok_or_else(|| anyhow!("trampoline invoice is missing an amount"))?;
     let hash_algorithm = match hinted.hash_algorithm {
         0 => HashAlgorithm::CkbHash,
         1 => HashAlgorithm::Sha256,
@@ -198,7 +210,7 @@ fn parsed_from_hinted(hinted: &super::HintedInvoice) -> Result<ParsedInvoice> {
     Ok(ParsedInvoice {
         payment_hash: hinted.payment_hash.clone(),
         currency: hinted.currency.clone(),
-        amount: hinted.amount,
+        amount: Some(amount),
         hash_algorithm,
         // Paid through a trampoline, so the payout needs more lock than the payee asks.
         final_tlc_expiry_delta_ms: hinted
@@ -237,5 +249,38 @@ mod tests {
         let needed_ms = parsed.final_tlc_expiry_delta_ms + crate::FIBER_RANDOM_EXPIRY_RESERVE_MS;
         assert!(needed_ms >= 46 * 3_600_000 + 40 * 60_000);
         assert_eq!(parsed.expires_at_ms, Some(1_000 + 172_800_000));
+        assert_eq!(parsed.amount, Some(10_000_000_000));
+    }
+
+    #[test]
+    fn trampoline_parse_requires_an_amount() {
+        let hinted = super::super::HintedInvoice {
+            currency: "Fibt".into(),
+            amount: None,
+            timestamp_ms: 1_000,
+            payment_hash: format!("0x{}", "11".repeat(32)),
+            expiry_secs: None,
+            final_tlc_expiry_delta_ms: Some(86_400_000),
+            payee: format!("02{}", "22".repeat(32)),
+            hash_algorithm: 0,
+            trampoline_hint: format!("03{}", "33".repeat(32)),
+        };
+        assert!(parsed_from_hinted(&hinted)
+            .unwrap_err()
+            .to_string()
+            .contains("missing an amount"));
+    }
+
+    #[test]
+    fn only_unknown_attr_errors_open_the_trampoline_fallback() {
+        assert!(fiber_refuses_unknown_invoice_attr(&anyhow!(
+            "parse_invoice failed: Molecule error: InvoiceAttr item id (=10) is an unknown id, only has 10 kind of items"
+        )));
+        assert!(!fiber_refuses_unknown_invoice_attr(&anyhow!(
+            "parse_invoice failed: connection refused"
+        )));
+        assert!(!fiber_refuses_unknown_invoice_attr(&anyhow!(
+            "parse_invoice failed: Invalid signature"
+        )));
     }
 }

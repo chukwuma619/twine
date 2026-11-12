@@ -7,8 +7,11 @@
 //! still pay it by fields with `trampoline_hops`, so this module reads such an invoice
 //! locally and the payment calls pay it that way.
 //!
-//! Only used after Fiber refuses an invoice. The signature is not checked here: the
-//! payee is the buyer's own wallet and a wrong one only misdirects the buyer's payout.
+//! Only used after Fiber refuses an invoice with an unknown attribute. The signature is
+//! not checked here: the payee is the buyer's own wallet and a wrong one only misdirects
+//! the buyer's payout.
+//!
+//! Drop this module once Fiber past 0.10.0-rc3 parses attr 10 (fiber#1623).
 
 use anyhow::{Result, anyhow, bail};
 use arcode::bitbit::{BitReader, MSB};
@@ -236,7 +239,109 @@ fn read_u32(buf: &[u8], at: usize) -> Result<u32> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_invoice {
+    use super::*;
+    use arcode::bitbit::BitWriter;
+    use arcode::ArithmeticEncoder;
+    use bech32::{ToBase32, encode, u5};
+    use std::io::Cursor;
+
+    /// Test invoice with attr 10. Signature is zeros (decoder does not verify it).
+    pub(crate) fn encode_hinted_invoice(
+        hrp: &str,
+        timestamp_ms: u128,
+        payment_hash: &[u8; 32],
+        expiry_secs: Option<u64>,
+        final_tlc_expiry_delta_ms: Option<u64>,
+        payee: &[u8; 33],
+        hash_algorithm: u8,
+        trampoline: &[u8; 33],
+    ) -> String {
+        let mut attrs = Vec::new();
+        if let Some(secs) = expiry_secs {
+            attrs.push(encode_union(ATTR_EXPIRY_TIME, &secs.to_le_bytes()));
+        }
+        if let Some(delta) = final_tlc_expiry_delta_ms {
+            attrs.push(encode_union(
+                ATTR_FINAL_HTLC_MINIMUM_EXPIRY_DELTA,
+                &delta.to_le_bytes(),
+            ));
+        }
+        attrs.push(encode_union(ATTR_PAYEE_PUBLIC_KEY, &encode_pubkey_attr(payee)));
+        attrs.push(encode_union(ATTR_HASH_ALGORITHM, &[hash_algorithm]));
+        attrs.push(encode_union(
+            ATTR_TRAMPOLINE_ROUTE_HINT,
+            &encode_pubkey_attr(trampoline),
+        ));
+
+        let raw = encode_dynvec(&[
+            timestamp_ms.to_le_bytes().to_vec(),
+            payment_hash.to_vec(),
+            encode_dynvec(&attrs),
+        ]);
+        let compressed = compress(&raw).expect("compress");
+
+        let mut data = vec![u5::try_from_u8(1).expect("signed flag")];
+        data.extend(compressed.to_base32());
+        data.extend(std::iter::repeat_n(
+            u5::try_from_u8(0).expect("sig"),
+            SIGNATURE_U5_SIZE,
+        ));
+        encode(hrp, data, Variant::Bech32m).expect("bech32m")
+    }
+
+    fn compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut model = Model::builder().num_bits(8).eof(EOFKind::EndAddOne).build();
+        let mut compressed_writer = BitWriter::new(Cursor::new(vec![]));
+        let mut encoder = ArithmeticEncoder::new(48);
+        for &sym in data {
+            encoder.encode(u32::from(sym), &model, &mut compressed_writer)?;
+            model.update_symbol(u32::from(sym));
+        }
+        encoder.encode(model.eof(), &model, &mut compressed_writer)?;
+        encoder.finish_encode(&mut compressed_writer)?;
+        compressed_writer.pad_to_byte()?;
+        Ok(compressed_writer.get_ref().get_ref().clone())
+    }
+
+    fn encode_pubkey_attr(bytes: &[u8]) -> Vec<u8> {
+        let mut field = Vec::with_capacity(4 + bytes.len());
+        field.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        field.extend_from_slice(bytes);
+        encode_dynvec(&[field])
+    }
+
+    fn encode_union(id: u32, content: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + content.len());
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn encode_dynvec(items: &[Vec<u8>]) -> Vec<u8> {
+        let header = 4 * (items.len() + 1);
+        let mut offsets = Vec::with_capacity(items.len());
+        let mut cursor = header;
+        for item in items {
+            offsets.push(cursor);
+            cursor += item.len();
+        }
+        let total = cursor;
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        for offset in offsets {
+            out.extend_from_slice(&(offset as u32).to_le_bytes());
+        }
+        for item in items {
+            out.extend_from_slice(item);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_invoice::encode_hinted_invoice;
     use super::*;
 
     #[test]
@@ -252,5 +357,37 @@ mod tests {
     #[test]
     fn plain_text_is_not_an_invoice() {
         assert!(decode_hinted_invoice("hello").is_err());
+    }
+
+    #[test]
+    fn trampoline_invoice_round_trips() {
+        let payment_hash = [0x11u8; 32];
+        let mut payee = [0x22u8; 33];
+        payee[0] = 0x02;
+        let mut trampoline = [0x33u8; 33];
+        trampoline[0] = 0x03;
+        let invoice = encode_hinted_invoice(
+            "fibt10000000000",
+            1_700_000_000_000,
+            &payment_hash,
+            Some(172_800),
+            Some(86_400_000),
+            &payee,
+            0,
+            &trampoline,
+        );
+        let decoded = decode_hinted_invoice(&invoice).unwrap();
+        assert_eq!(decoded.currency, "Fibt");
+        assert_eq!(decoded.amount, Some(10_000_000_000));
+        assert_eq!(decoded.timestamp_ms, 1_700_000_000_000);
+        assert_eq!(
+            decoded.payment_hash,
+            format!("0x{}", hex::encode(payment_hash))
+        );
+        assert_eq!(decoded.expiry_secs, Some(172_800));
+        assert_eq!(decoded.final_tlc_expiry_delta_ms, Some(86_400_000));
+        assert_eq!(decoded.payee, hex::encode(payee));
+        assert_eq!(decoded.hash_algorithm, 0);
+        assert_eq!(decoded.trampoline_hint, hex::encode(trampoline));
     }
 }
