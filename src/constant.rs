@@ -41,15 +41,16 @@ pub const FIBER_RANDOM_EXPIRY_RESERVE_MS: u64 = 4 * 60 * 60 * 1000;
 /// `DEFAULT_FINAL_TLC_EXPIRY_DELTA` when the invoice omits the attribute.
 pub const DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Lock a trampoline payment adds on top of the payee's final lock: Fiber v0.9.1
-/// `trampoline_forward_expiry_delta` gives each trampoline segment
-/// 3 x `DEFAULT_TLC_EXPIRY_DELTA` + `MIN_TLC_EXPIRY_DELTA`, plus the hop into the
-/// trampoline node. Measured on testnet 2026-11-12: a 24h invoice behind one trampoline
-/// needed 42.8h from the trampoline's peer.
-pub const TRAMPOLINE_SLACK_MS: u64 = 3 * FIBER_RANDOM_EXPIRY_RESERVE_MS
-    + FIBER_TLC_EXPIRY_DELAY_MS
-    + FIBER_RANDOM_EXPIRY_RESERVE_MS
-    + 20 * 60 * 1000;
+/// Lock one trampoline segment adds on top of the payee's final lock. Fiber's
+/// `trampoline_forward_expiry_delta` is `TRAMPOLINE_FORWARDING_ROUTE_DELTA_COUNT`
+/// (3) × `DEFAULT_TLC_EXPIRY_DELTA` + `MIN_TLC_EXPIRY_DELTA` per remaining segment.
+/// The hop into the trampoline is already counted by `payout_budget` /
+/// `payout_deadline_secs` via `FIBER_RANDOM_EXPIRY_RESERVE_MS`, so it is not
+/// included here. A 24h final behind one trampoline still needs ~42.7h of hold
+/// budget once that hop reserve is added, which leaves no fiat window on a 48h
+/// hold — Cellula invoices need a short final for 48h holds.
+pub const TRAMPOLINE_SLACK_MS: u64 =
+    3 * FIBER_RANDOM_EXPIRY_RESERVE_MS + FIBER_TLC_EXPIRY_DELAY_MS;
 
 /// `MAX_PAYMENT_TLC_EXPIRY_LIMIT`.
 pub const MAX_TLC_EXPIRY_LIMIT_MS: u64 = 14 * 24 * 60 * 60 * 1000;

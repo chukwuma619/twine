@@ -2,9 +2,9 @@
 //!
 //! Wallets behind an LSP (Cellula, for one) put a `TrampolineRouteHint` attribute
 //! (union id 10, from nervosnetwork/fiber#1623) in their invoices: the public node that
-//! reaches the private payee. Fiber v0.9.1 does not know that attribute, so
-//! `parse_invoice` and `send_payment` with the invoice both refuse it. v0.9.1 can still
-//! pay it by fields with `trampoline_hops`, so this module reads such an invoice
+//! reaches the private payee. Fiber through 0.10.0-rc3 does not know that attribute, so
+//! `parse_invoice` and `send_payment` with the invoice both refuse it. Those builds can
+//! still pay it by fields with `trampoline_hops`, so this module reads such an invoice
 //! locally and the payment calls pay it that way.
 //!
 //! Only used after Fiber refuses an invoice. The signature is not checked here: the

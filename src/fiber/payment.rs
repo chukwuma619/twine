@@ -59,8 +59,8 @@ pub fn probe_payment_params(invoice: &str, tlc_expiry_limit_ms: u64) -> serde_js
 }
 
 /// An invoice with a trampoline route hint is paid by fields through the hinted node,
-/// which Fiber v0.9.1 supports although it cannot parse the invoice. Trampoline routing
-/// needs `max_fee_amount`; it gets the same cap `max_fee_rate` gives a plain payment.
+/// which Fiber supports although it cannot parse attr 10 yet. Trampoline routing needs
+/// `max_fee_amount`; it gets the same cap `max_fee_rate` gives a plain payment.
 pub fn send_payment_params(
     invoice: &str,
     tlc_expiry_limit_ms: u64,

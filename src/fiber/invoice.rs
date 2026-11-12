@@ -157,7 +157,7 @@ impl InvoiceRpc for HttpFiber {
             .await
         {
             Ok(result) => result,
-            // Fiber v0.9.1 cannot read a trampoline route hint; read it here instead.
+            // Fiber through 0.10.0-rc3 cannot read trampoline attr 10; read it here.
             Err(error) => match super::hint::decode_hinted_invoice(invoice) {
                 Ok(hinted) => return parsed_from_hinted(&hinted),
                 Err(_) => return Err(error),
@@ -227,12 +227,16 @@ mod tests {
             trampoline_hint: format!("03{}", "33".repeat(32)),
         };
         let parsed = parsed_from_hinted(&hinted).unwrap();
-        // 24h asked by the wallet, about 43h needed through the trampoline (measured).
+        // 24h final + one trampoline segment (12h + 160min). The hop into the
+        // trampoline is added later by payout_budget, not here.
         assert_eq!(
             parsed.final_tlc_expiry_delta_ms,
             86_400_000 + crate::TRAMPOLINE_SLACK_MS
         );
-        assert!(parsed.final_tlc_expiry_delta_ms >= 42 * 3_600_000 + 48 * 60_000);
+        assert_eq!(
+            crate::TRAMPOLINE_SLACK_MS,
+            3 * crate::FIBER_RANDOM_EXPIRY_RESERVE_MS + crate::FIBER_TLC_EXPIRY_DELAY_MS
+        );
         assert_eq!(parsed.expires_at_ms, Some(1_000 + 172_800_000));
     }
 }
