@@ -11,6 +11,13 @@ pub const fn hold_secs(hours: u64) -> u64 {
 
 pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 
+/// Hold length when the buyer's payout invoice is trampoline (Cellula, for one).
+/// A 24h trampoline final needs ~42.7h of lock budget; 64h leaves ~11–13h for fiat
+/// while plain invoices keep [HOLD_HOURS].
+pub const TRAMPOLINE_HOLD_HOURS: u64 = 64;
+
+pub const TRAMPOLINE_HOLD_SECS: u64 = hold_secs(TRAMPOLINE_HOLD_HOURS);
+
 /// How long an unpaid hold invoice stays open for the seller to lock.
 pub const INVOICE_EXPIRY_SECS: u64 = 60 * 60;
 
@@ -46,9 +53,8 @@ pub const DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS: u64 = 24 * 60 * 60 * 1000;
 /// (3) × `DEFAULT_TLC_EXPIRY_DELTA` + `MIN_TLC_EXPIRY_DELTA` per remaining segment.
 /// The hop into the trampoline is already counted by `payout_budget` /
 /// `payout_deadline_secs` via `FIBER_RANDOM_EXPIRY_RESERVE_MS`, so it is not
-/// included here. A 24h final behind one trampoline still needs ~42.7h of hold
-/// budget once that hop reserve is added, which leaves no fiat window on a 48h
-/// hold — Cellula invoices need a short final for 48h holds.
+/// included here. Trampoline payouts use [TRAMPOLINE_HOLD_HOURS] so a 24h final
+/// still leaves a fiat window.
 pub const TRAMPOLINE_SLACK_MS: u64 =
     3 * FIBER_RANDOM_EXPIRY_RESERVE_MS + FIBER_TLC_EXPIRY_DELAY_MS;
 

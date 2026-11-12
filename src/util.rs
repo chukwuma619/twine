@@ -35,6 +35,23 @@ pub fn hold_window_end_ms(tlc_expires_at_ms: i64, locked_at_secs: i64, hold_secs
     tlc_expires_at_ms.min(own)
 }
 
+/// Hold length for this payout invoice. Trampoline invoices (attr 10) use at least
+/// [crate::TRAMPOLINE_HOLD_SECS]; plain invoices keep the order's hold.
+pub fn hold_secs_for_payout(invoice: &str, order_hold_secs: u64) -> u64 {
+    hold_secs_for_trampoline(
+        crate::fiber::decode_hinted_invoice(invoice).is_ok(),
+        order_hold_secs,
+    )
+}
+
+pub fn hold_secs_for_trampoline(via_trampoline: bool, order_hold_secs: u64) -> u64 {
+    if via_trampoline {
+        order_hold_secs.max(crate::TRAMPOLINE_HOLD_SECS)
+    } else {
+        order_hold_secs
+    }
+}
+
 /// Last second a payout can still start before Fiber drops the incoming TLC.
 pub fn payout_deadline_secs(expires_at_ms: i64, claim_margin_ms: u64, final_delta_ms: u64) -> i64 {
     let needed = final_delta_ms.saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS) as i64;
@@ -299,6 +316,40 @@ mod tests {
         // A TLC that ends first is kept: never later than the TLC.
         let short_tlc = own_end - 60_000;
         assert_eq!(hold_window_end_ms(short_tlc, locked_at, hold), short_tlc);
+    }
+
+    #[test]
+    fn trampoline_payouts_use_the_longer_hold() {
+        assert_eq!(
+            hold_secs_for_trampoline(false, crate::HOLD_SECS),
+            crate::HOLD_SECS
+        );
+        assert_eq!(
+            hold_secs_for_trampoline(true, crate::HOLD_SECS),
+            crate::TRAMPOLINE_HOLD_SECS
+        );
+        assert_eq!(crate::TRAMPOLINE_HOLD_HOURS, 64);
+        // A 24h trampoline final (plus Fiber segment slack) still leaves fiat time.
+        let final_ms = 24 * 3_600 * 1_000 + crate::TRAMPOLINE_SLACK_MS;
+        assert!(
+            fiat_deadline_secs(
+                crate::TRAMPOLINE_HOLD_SECS as i64 * 1_000,
+                crate::CLAIM_MARGIN_MS,
+                final_ms,
+            ) > 0
+        );
+        assert!(
+            fiat_deadline_secs(
+                crate::HOLD_SECS as i64 * 1_000,
+                crate::CLAIM_MARGIN_MS,
+                final_ms,
+            ) <= 0
+        );
+        // Plain strings are not trampoline invoices.
+        assert_eq!(
+            hold_secs_for_payout("not-an-invoice", crate::HOLD_SECS),
+            crate::HOLD_SECS
+        );
     }
 
     #[test]
