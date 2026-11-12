@@ -17,11 +17,11 @@ Local CKB + three `fnn` nodes. Rust `Engine` tests drive the trade flow. FakeFib
 - Rust toolchain (Twine + building Fiber `fnn`)
 - [`ckb`](https://github.com/nervosnetwork/ckb) and `ckb-cli` on `PATH`
 - curl, python3
-- Fiber checkout at **v0.9.1** (override with `FIBER_REPO`):
+- Fiber checkout at **v0.10.0-rc3** (override with `FIBER_REPO`):
 
 ```bash
 git clone https://github.com/nervosnetwork/fiber.git ../fiber
-git -C ../fiber checkout v0.9.1
+git -C ../fiber checkout v0.10.0-rc3
 ```
 
 ## Run

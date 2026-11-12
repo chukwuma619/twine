@@ -860,7 +860,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
         Ok(Vec::new())
     }
 
-    /// Fiber v0.9.1 dry run. A returned preimage is ignored and does not open fiat.
+    /// Fiber dry run. A returned preimage is ignored and does not open fiat.
     /// Ready carries the TLC limit so release can send without a second budget pass.
     async fn probe_payout(&self, trade: &Trade) -> Result<PayoutProbe> {
         let Some(invoice) = trade

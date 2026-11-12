@@ -8,7 +8,7 @@ This repository is the coordinator stack:
 | --- | --- |
 | `twine-daemon` | Rust trade engine. Talks to traders over Nostr and to one Fiber node over JSON-RPC. |
 | `twine-push` | Content-free FCM doorbell so a phone can wake without trade data in the notification. |
-| `docker/` | Fiber (`fnn` 0.9.1) image used by the operator hub. |
+| `docker/` | Fiber (`fnn` 0.10.0-rc3) image used by the operator hub. |
 | `DEPLOY.md` | VPS install for Fiber, the daemon, and push. |
 
 Related repos: the [Flutter client](https://github.com/chukwuma619/twine_app) and the early [twine-web](https://github.com/chukwuma619/twine-web) download site. 
@@ -109,7 +109,7 @@ Export these before `cargo run`. On a VPS, systemd loads the same variables. See
 
 ## Fiber channels
 
-The daemon pays the buyer's invoice. It does not open, fund, or rebalance a channel. Before fiat, it checks the route with Fiber `send_payment` `dry_run: true` (v0.9.1: the call builds a path, stores no session, and sends no onion). A wallet that cannot receive gets its own inbound, then sends the same invoice again. Kind `31421` publishes this node's pubkey and listen addresses. Kind `31422` publishes a `fiat-owed` trade record when the CKB returns after the fiat had arrived, a `buyer-unpaid` record when the solver finds the buyer did not pay, and an `unresolved` record when the solver window ends with no decision.
+The daemon pays the buyer's invoice. It does not open, fund, or rebalance a channel. Before fiat, it checks the route with Fiber `send_payment` `dry_run: true` (the call builds a path, stores no session, and sends no onion). A wallet that cannot receive gets its own inbound, then sends the same invoice again. Kind `31421` publishes this node's pubkey and listen addresses. Kind `31422` publishes a `fiat-owed` trade record when the CKB returns after the fiat had arrived, a `buyer-unpaid` record when the solver finds the buyer did not pay, and an `unresolved` record when the solver window ends with no decision.
 
 ## Develop
 
@@ -138,7 +138,7 @@ cargo run --release
 | --- | --- |
 | `src/` | Daemon: trade engine (`engine.rs`), action handlers (`app/`), Nostr, Fiber RPC, SQLite, state machine (`state.rs`). |
 | `twine-push/` | Content-free FCM doorbell. |
-| `tests/e2e/` | Multi-`fnn` e2e harness wrapping a Fiber v0.9.1 checkout. |
+| `tests/e2e/` | Multi-`fnn` e2e harness wrapping a Fiber v0.10.0-rc3 checkout. |
 | `docker/` | Fiber node image. |
 | `config/` | Fiber config templates used with the image. |
 | `DEPLOY.md` | VPS install for the daemon, Fiber, and `twine-push`. |

@@ -1,6 +1,6 @@
 # Deploy
 
-A Twine host runs three processes on one machine: a Fiber node (`nervos/fiber:0.9.1`), `twine-daemon`, and `twine-push`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8230**. Fiber's JSON-RPC stays on `127.0.0.1:8229`. Ports `8227` and `8228` stay free for Fiber Studio. The app wakes from the background by registering at `https://push.backr.site`, which terminates TLS in front of `twine-push` on `127.0.0.1:8787`.
+A Twine host runs three processes on one machine: a Fiber node (`nervos/fiber:0.10.0-rc3`), `twine-daemon`, and `twine-push`. Traders reach the daemon through Nostr. They open a Fiber channel to port **8230**. Fiber's JSON-RPC stays on `127.0.0.1:8229`. Ports `8227` and `8228` stay free for Fiber Studio. The app wakes from the background by registering at `https://push.backr.site`, which terminates TLS in front of `twine-push` on `127.0.0.1:8787`.
 
 systemd passes the daemon its environment from `/opt/twine/.env`. `twine-push` loads `/opt/twine/push.env`. Variable meanings are in the [README](README.md#configuration).
 
@@ -120,7 +120,7 @@ sudo docker run -d --name fiber-node --restart unless-stopped \
   --env-file /opt/twine/secrets/fiber.env \
   -e RUST_LOG=info \
   -v /opt/twine/fiber-node:/fiber \
-  nervos/fiber:0.9.1
+  nervos/fiber:0.10.0-rc3
 ```
 
 The first start writes `fiber-node/config.yml`. On testnet that file points at `https://testnet.ckbapp.dev/`. Decrypting the key can take about half a minute. Continue once the container is `Up` and the config file exists. If the container is not `Up`, `sudo docker logs --tail 50 fiber-node` prints the reason.
@@ -146,7 +146,7 @@ Continue when the address line is uncommented and shows your public IP. Leave th
 
 ## RPC token
 
-Still on the VPS. `biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.9.1 checks. `-j1` keeps the compile inside the memory above.
+Still on the VPS. `biscuit-cli` 0.6.0-beta.2 matches the token format Fiber 0.10.0-rc3 checks. `-j1` keeps the compile inside the memory above.
 
 ```bash
 . "$HOME/.cargo/env"
@@ -275,7 +275,7 @@ sudo systemctl restart twine
 sudo journalctl -u twine -f
 ```
 
-Ctrl-C stops the log. Continue at [Push doorbell](#push-doorbell): copy the service-account JSON, build `twine-push`, install its unit, and put Caddy in front. Point DNS for `push.backr.site` at this VPS first. Open 80 and 443 when Caddy is installed. Fiber stays on 0.9.1.
+Ctrl-C stops the log. Continue at [Push doorbell](#push-doorbell): copy the service-account JSON, build `twine-push`, install its unit, and put Caddy in front. Point DNS for `push.backr.site` at this VPS first. Open 80 and 443 when Caddy is installed. Fiber stays on `0.10.0-rc3`.
 
 Later pulls that already include `twine-push` are [Upgrade](#upgrade).
 
@@ -389,7 +389,9 @@ Restart Fiber first, then `sudo systemctl restart twine`, then `sudo systemctl r
 
 ## Upgrade
 
-A host that already runs Fiber, `twine`, and `twine-push` only needs a pull and two compiles. Do not rewrite `.env` or `push.env`. Stay on `nervos/fiber:0.9.1` until a Fiber upgrade is intentional. Store migration for a Fiber version change is in [docker/README.md](docker/README.md).
+### Daemon and push only
+
+A host that already runs Fiber, `twine`, and `twine-push` only needs a pull and two compiles when Fiber stays on the same image tag. Do not rewrite `.env` or `push.env`.
 
 ```bash
 cd /opt/twine
@@ -403,3 +405,63 @@ sudo systemctl restart twine-push
 ```
 
 A host that has Fiber and `twine` but not `twine-push` yet is [Already deployed](#already-deployed).
+
+### Fiber `0.9.1` → `0.10.0-rc3`
+
+Twine pins `nervos/fiber:0.10.0-rc3` (includes the same-hash invoice settlement fix from [fiber#1672](https://github.com/nervosnetwork/fiber/pull/1672)). This is a Fiber prerelease. Back up the store before replacing the container. Keep the same `fiber-node/` bind mount so channels migrate in place; do not delete the store.
+
+Pause open desk activity first (no live holds/payouts). Then on the VPS:
+
+```bash
+# 1. Stop the daemon so it does not hit RPC mid-migration.
+sudo systemctl stop twine
+
+# 2. Stop Fiber cleanly. Never run two fnn processes on the same data dir.
+sudo docker stop fiber-node
+
+# 3. Back up the whole Fiber data dir (config, store, encrypted key).
+sudo tar -C /opt/twine -czf "/opt/twine/fiber-node-backup-$(date -u +%Y%m%dT%H%M%SZ).tgz" fiber-node
+ls -lh /opt/twine/fiber-node-backup-*.tgz
+
+# 4. Pull the new image and recreate the container with the same mounts/env.
+sudo docker pull nervos/fiber:0.10.0-rc3
+sudo docker rm fiber-node
+sudo docker run -d --name fiber-node --restart unless-stopped \
+  --network host \
+  --env-file /opt/twine/secrets/fiber.env \
+  -e RUST_LOG=info \
+  -v /opt/twine/fiber-node:/fiber \
+  nervos/fiber:0.10.0-rc3
+```
+
+Watch startup. Key decrypt can take about half a minute. Built-in store migrations run when `fnn` opens the existing directory:
+
+```bash
+sudo docker ps --filter name=fiber-node
+sudo docker logs -f fiber-node
+```
+
+Ctrl-C leaves the container running. Confirm RPC and the node pubkey still match what `twine.db` was pinned to:
+
+```bash
+curl -sS http://127.0.0.1:8229 \
+  -H "Authorization: Bearer $(tr -d '\n' < /opt/twine/secrets/rpc-token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}'
+sudo docker exec fiber-node fnn-cli --auth-token "$(tr -d '\n' < /opt/twine/secrets/rpc-token)" info
+```
+
+If the container exits or migration fails, restore the tarball, put `nervos/fiber:0.9.1` back, and reopen an issue with the log. Do not wipe `fiber-node/` to “fix” a failed start.
+
+When RPC answers, bring the daemon back (and refresh Twine binaries if you have not pulled yet):
+
+```bash
+cd /opt/twine
+git pull
+. "$HOME/.cargo/env"
+cargo build --release -j1
+sudo systemctl start twine
+sudo systemctl status twine --no-pager
+```
+
+Then run one same-hash test trade end to end and confirm the seller’s inbound hold TLC is fulfilled (hub balance moves; no `HoldTlcTimeout` refund to the seller).

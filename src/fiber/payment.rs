@@ -7,7 +7,7 @@ use serde_json::json;
 #[async_trait]
 pub trait PaymentRpc: Send + Sync {
     async fn send_payment(&self, invoice: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo>;
-    /// Route check only. Fiber v0.9.1 `send_payment` with `dry_run: true` builds a path,
+    /// Route check only. Fiber `send_payment` with `dry_run: true` builds a path,
     /// returns `Created`, and does not store a session or send an onion, so it cannot
     /// reveal the preimage. `build_router` is the wrong call: it requires `hops_info`.
     async fn probe_payment(&self, invoice: &str, tlc_expiry_limit_ms: u64) -> Result<PaymentInfo>;
@@ -56,7 +56,7 @@ impl PaymentRpc for HttpFiber {
     }
 }
 
-/// Params for Fiber v0.9.1 `send_payment` `dry_run`. A missing path comes back as an
+/// Params for Fiber `send_payment` `dry_run`. A missing path comes back as an
 /// RPC error whose message contains `Failed to build route`, not as a stored payment.
 pub fn probe_payment_params(invoice: &str, tlc_expiry_limit_ms: u64) -> serde_json::Value {
     json!({
