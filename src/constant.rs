@@ -12,9 +12,9 @@ pub const fn hold_secs(hours: u64) -> u64 {
 pub const HOLD_SECS: u64 = hold_secs(HOLD_HOURS);
 
 /// Hold length when the buyer's payout invoice is trampoline (Cellula, for one).
-/// A 24h trampoline final needs ~42.7h of lock budget; 64h leaves ~11–13h for fiat
-/// while plain invoices keep [HOLD_HOURS].
-pub const TRAMPOLINE_HOLD_HOURS: u64 = 64;
+/// A 24h trampoline final needs ~46.9h of lock budget from a desk one hop from the
+/// trampoline's peer; 68h leaves ~11h for fiat while plain invoices keep [HOLD_HOURS].
+pub const TRAMPOLINE_HOLD_HOURS: u64 = 68;
 
 pub const TRAMPOLINE_HOLD_SECS: u64 = hold_secs(TRAMPOLINE_HOLD_HOURS);
 
@@ -48,15 +48,18 @@ pub const FIBER_RANDOM_EXPIRY_RESERVE_MS: u64 = 4 * 60 * 60 * 1000;
 /// `DEFAULT_FINAL_TLC_EXPIRY_DELTA` when the invoice omits the attribute.
 pub const DEFAULT_FINAL_TLC_EXPIRY_DELTA_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Lock one trampoline segment adds on top of the payee's final lock. Fiber's
+/// Lock a trampoline payout adds on top of the payee's final lock. Fiber's
 /// `trampoline_forward_expiry_delta` is `TRAMPOLINE_FORWARDING_ROUTE_DELTA_COUNT`
-/// (3) × `DEFAULT_TLC_EXPIRY_DELTA` + `MIN_TLC_EXPIRY_DELTA` per remaining segment.
-/// The hop into the trampoline is already counted by `payout_budget` /
-/// `payout_deadline_secs` via `FIBER_RANDOM_EXPIRY_RESERVE_MS`, so it is not
-/// included here. Trampoline payouts use [TRAMPOLINE_HOLD_HOURS] so a 24h final
-/// still leaves a fiat window.
-pub const TRAMPOLINE_SLACK_MS: u64 =
-    3 * FIBER_RANDOM_EXPIRY_RESERVE_MS + FIBER_TLC_EXPIRY_DELAY_MS;
+/// (3) × `DEFAULT_TLC_EXPIRY_DELTA` + `MIN_TLC_EXPIRY_DELTA` per segment. The 4h in
+/// `payout_budget` covers a payer that is the trampoline's peer; a desk one hop
+/// further needs another `DEFAULT_TLC_EXPIRY_DELTA`. Measured on testnet 2026-11-12
+/// for a 24h Cellula invoice: 42.7h from the trampoline's peer, 46.7h from a node one
+/// hop away (a send at 42.7h from there found no path, 46.9h arrived). 15 minutes of
+/// margin on top. Trampoline payouts use [TRAMPOLINE_HOLD_HOURS].
+pub const TRAMPOLINE_SLACK_MS: u64 = 3 * FIBER_RANDOM_EXPIRY_RESERVE_MS
+    + FIBER_TLC_EXPIRY_DELAY_MS
+    + FIBER_RANDOM_EXPIRY_RESERVE_MS
+    + 15 * 60 * 1000;
 
 /// `MAX_PAYMENT_TLC_EXPIRY_LIMIT`.
 pub const MAX_TLC_EXPIRY_LIMIT_MS: u64 = 14 * 24 * 60 * 60 * 1000;

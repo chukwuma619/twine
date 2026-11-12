@@ -227,16 +227,15 @@ mod tests {
             trampoline_hint: format!("03{}", "33".repeat(32)),
         };
         let parsed = parsed_from_hinted(&hinted).unwrap();
-        // 24h final + one trampoline segment (12h + 160min). The hop into the
-        // trampoline is added later by payout_budget, not here.
+        // 24h final + one trampoline segment (12h + 160min) + the hop to the
+        // trampoline's peer (4h) + 15min margin; payout_budget adds its own 4h.
         assert_eq!(
             parsed.final_tlc_expiry_delta_ms,
             86_400_000 + crate::TRAMPOLINE_SLACK_MS
         );
-        assert_eq!(
-            crate::TRAMPOLINE_SLACK_MS,
-            3 * crate::FIBER_RANDOM_EXPIRY_RESERVE_MS + crate::FIBER_TLC_EXPIRY_DELAY_MS
-        );
+        // Measured 2026-11-12: 46.67h needed from a node one hop from the trampoline's peer.
+        let needed_ms = parsed.final_tlc_expiry_delta_ms + crate::FIBER_RANDOM_EXPIRY_RESERVE_MS;
+        assert!(needed_ms >= 46 * 3_600_000 + 40 * 60_000);
         assert_eq!(parsed.expires_at_ms, Some(1_000 + 172_800_000));
     }
 }

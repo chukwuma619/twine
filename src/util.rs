@@ -328,7 +328,15 @@ mod tests {
             hold_secs_for_trampoline(true, crate::HOLD_SECS),
             crate::TRAMPOLINE_HOLD_SECS
         );
-        assert_eq!(crate::TRAMPOLINE_HOLD_HOURS, 64);
+        assert_eq!(crate::TRAMPOLINE_HOLD_HOURS, 68);
+        // About 11h for fiat on a 68h hold behind a 4h inbound channel.
+        let claim_4h = claim_margin_ms(Some(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS));
+        let window = fiat_deadline_secs(
+            crate::TRAMPOLINE_HOLD_SECS as i64 * 1_000,
+            claim_4h,
+            24 * 3_600 * 1_000 + crate::TRAMPOLINE_SLACK_MS,
+        );
+        assert!(window >= 11 * 3_600, "fiat window {window}s");
         // A 24h trampoline final (plus Fiber segment slack) still leaves fiat time.
         let final_ms = 24 * 3_600 * 1_000 + crate::TRAMPOLINE_SLACK_MS;
         assert!(
