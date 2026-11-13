@@ -158,7 +158,7 @@ impl InvoiceRpc for HttpFiber {
             .await
         {
             Ok(result) => result,
-            // Fiber through 0.10.0-rc3 cannot read trampoline attr 10.
+            // Fiber through 0.10.0 cannot read trampoline attr 10.
             Err(error) => {
                 if fiber_refuses_unknown_invoice_attr(&error)
                     && let Ok(hinted) = super::hint::decode_hinted_invoice(invoice)
@@ -184,7 +184,7 @@ impl InvoiceRpc for HttpFiber {
     }
 }
 
-/// True when Fiber's parse error is molecule `UnknownItem` (attr 10 on 0.9.1 / 0.10.0-rc3).
+/// True when Fiber's parse error is molecule `UnknownItem` (attr 10 on 0.9.1 / 0.10.0).
 pub(crate) fn fiber_refuses_unknown_invoice_attr(error: &anyhow::Error) -> bool {
     error.to_string().to_ascii_lowercase().contains("unknown id")
 }

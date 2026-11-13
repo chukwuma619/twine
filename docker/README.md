@@ -4,9 +4,9 @@ Fiber release tags publish official container images to Docker Hub at `nervos/fi
 
 ## Build locally
 
-This directory is the [Fiber Docker setup](https://github.com/nervosnetwork/fiber/tree/v0.10.0-rc3/docker), adapted so it can build from the Twine repo. Twine does not contain the `fnn` source, so the image checks out [nervosnetwork/fiber](https://github.com/nervosnetwork/fiber) `v0.10.0-rc3` and compiles `fiber-bin` and `fnn-cli` the same way upstream does. Config templates are copied from that checkout (`config/testnet`, `config/mainnet`).
+This directory is the [Fiber Docker setup](https://github.com/nervosnetwork/fiber/tree/v0.10.0/docker), adapted so it can build from the Twine repo. Twine does not contain the `fnn` source, so the image checks out [nervosnetwork/fiber](https://github.com/nervosnetwork/fiber) `v0.10.0` and compiles `fiber-bin` and `fnn-cli` the same way upstream does. Config templates are copied from that checkout (`config/testnet`, `config/mainnet`).
 
-`v0.10.0-rc3` uses Rust `1.95.0`. That is the Fiber version a Twine host runs. Override the git ref with `FIBER_REF` (branch or tag). Host setup is [DEPLOY.md](../DEPLOY.md).
+`v0.10.0` uses Rust `1.95.0`. That is the Fiber version a Twine host runs. Override the git ref with `FIBER_REF` (branch or tag). Host setup is [DEPLOY.md](../DEPLOY.md).
 
 ```bash
 docker build -f docker/Dockerfile -t fiber:local .
@@ -15,7 +15,7 @@ docker build -f docker/Dockerfile -t fiber:local .
 
 ## Run the published image
 
-The node's CKB wallet, the two passwords, and how the daemon reaches RPC are in [DEPLOY.md](../DEPLOY.md#ckb-key). Use `nervos/fiber:0.10.0-rc3` with this daemon. The key file is 64 hex characters with no `0x` prefix.
+The node's CKB wallet, the two passwords, and how the daemon reaches RPC are in [DEPLOY.md](../DEPLOY.md#ckb-key). Use `nervos/fiber:0.10.0` with this daemon. The key file is 64 hex characters with no `0x` prefix.
 
 ```bash
 mkdir -p ./fiber-node/ckb

@@ -8,7 +8,7 @@ This repository is the coordinator stack:
 | --- | --- |
 | `twine-daemon` | Rust trade engine. Talks to traders over Nostr and to one Fiber node over JSON-RPC. |
 | `twine-push` | Content-free FCM doorbell so a phone can wake without trade data in the notification. |
-| `docker/` | Fiber (`fnn` 0.10.0-rc3) image used by the operator hub. |
+| `docker/` | Fiber (`fnn` 0.10.0) image used by the operator hub. |
 | `DEPLOY.md` | VPS install for Fiber, the daemon, and push. |
 
 Related repos: the [Flutter client](https://github.com/chukwuma619/twine_app) and the early [twine-web](https://github.com/chukwuma619/twine-web) download site. 
@@ -264,7 +264,7 @@ cargo run --release
 | --- | --- |
 | `src/` | Daemon: trade engine (`engine.rs`), action handlers (`app/`), Nostr, Fiber RPC, SQLite, state machine (`state.rs`). |
 | `twine-push/` | Content-free FCM doorbell. |
-| `tests/e2e/` | Multi-`fnn` e2e harness wrapping a Fiber v0.10.0-rc3 checkout. |
+| `tests/e2e/` | Multi-`fnn` e2e harness wrapping a Fiber v0.10.0 checkout. |
 | `docker/` | Fiber node image. |
 | `config/` | Fiber config templates used with the image. |
 | `DEPLOY.md` | VPS install for the daemon, Fiber, and `twine-push`. |

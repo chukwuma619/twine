@@ -25,14 +25,14 @@ require_cmd() {
 }
 
 resolve_fiber_repo() {
-  [[ -d "$fiber_repo" ]] || die "FIBER_REPO not found at $fiber_repo (clone nervosnetwork/fiber and check out v0.10.0-rc3)"
+  [[ -d "$fiber_repo" ]] || die "FIBER_REPO not found at $fiber_repo (clone nervosnetwork/fiber and check out v0.10.0)"
   fiber_repo="$(cd -- "$fiber_repo" &>/dev/null && pwd)"
   [[ -x "$fiber_repo/tests/nodes/start.sh" ]] || die "FIBER_REPO does not look like a Fiber checkout: $fiber_repo"
   local tag
   tag=$(git -C "$fiber_repo" describe --tags --exact-match 2>/dev/null || true)
-  if [[ "$tag" != "v0.10.0-rc3" ]]; then
-    echo "warning: Twine pins Fiber 0.10.0-rc3; FIBER_REPO is currently '${tag:-detached/branch}'" >&2
-    echo "warning: run: git -C \"$fiber_repo\" checkout v0.10.0-rc3" >&2
+  if [[ "$tag" != "v0.10.0" ]]; then
+    echo "warning: Twine pins Fiber 0.10.0; FIBER_REPO is currently '${tag:-detached/branch}'" >&2
+    echo "warning: run: git -C \"$fiber_repo\" checkout v0.10.0" >&2
   fi
 }
 
