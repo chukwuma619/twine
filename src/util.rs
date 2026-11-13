@@ -24,6 +24,34 @@ pub fn claim_margin_ms(channel_tlc_expiry_delta_ms: Option<u64>) -> u64 {
         .max(crate::CLAIM_MARGIN_MS)
 }
 
+/// When the trade's clocks treat the hold as ending. A seller paying over many hops can
+/// deliver the hold with a TLC that lasts days longer than the hold asked for; the clocks
+/// keep the hold's own length so a failed trade refunds the seller on time. Ending earlier
+/// is always safe: the TLC stays claimable until its real expiry.
+pub fn hold_window_end_ms(tlc_expires_at_ms: i64, locked_at_secs: i64, hold_secs: u64) -> i64 {
+    let own = locked_at_secs
+        .saturating_add(i64::try_from(hold_secs).unwrap_or(i64::MAX))
+        .saturating_mul(1000);
+    tlc_expires_at_ms.min(own)
+}
+
+/// Hold length for this payout invoice. Trampoline invoices (attr 10) use at least
+/// [crate::TRAMPOLINE_HOLD_SECS]; plain invoices keep the order's hold.
+pub fn hold_secs_for_payout(invoice: &str, order_hold_secs: u64) -> u64 {
+    hold_secs_for_trampoline(
+        crate::fiber::decode_hinted_invoice(invoice).is_ok(),
+        order_hold_secs,
+    )
+}
+
+pub fn hold_secs_for_trampoline(via_trampoline: bool, order_hold_secs: u64) -> u64 {
+    if via_trampoline {
+        order_hold_secs.max(crate::TRAMPOLINE_HOLD_SECS)
+    } else {
+        order_hold_secs
+    }
+}
+
 /// Last second a payout can still start before Fiber drops the incoming TLC.
 pub fn payout_deadline_secs(expires_at_ms: i64, claim_margin_ms: u64, final_delta_ms: u64) -> i64 {
     let needed = final_delta_ms.saturating_add(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS) as i64;
@@ -276,6 +304,61 @@ pub fn i64_from_shannons(value: u128) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hold_window_keeps_the_hold_length() {
+        let locked_at = 1_000_000;
+        let hold = crate::HOLD_SECS;
+        let own_end = (locked_at + hold as i64) * 1000;
+        // A long seller route: the TLC lasts 132h, the trade still ends at 48h.
+        let long_tlc = (locked_at + 132 * 3_600) * 1000;
+        assert_eq!(hold_window_end_ms(long_tlc, locked_at, hold), own_end);
+        // A TLC that ends first is kept: never later than the TLC.
+        let short_tlc = own_end - 60_000;
+        assert_eq!(hold_window_end_ms(short_tlc, locked_at, hold), short_tlc);
+    }
+
+    #[test]
+    fn trampoline_payouts_use_the_longer_hold() {
+        assert_eq!(
+            hold_secs_for_trampoline(false, crate::HOLD_SECS),
+            crate::HOLD_SECS
+        );
+        assert_eq!(
+            hold_secs_for_trampoline(true, crate::HOLD_SECS),
+            crate::TRAMPOLINE_HOLD_SECS
+        );
+        assert_eq!(crate::TRAMPOLINE_HOLD_HOURS, 68);
+        // About 11h for fiat on a 68h hold behind a 4h inbound channel.
+        let claim_4h = claim_margin_ms(Some(crate::FIBER_RANDOM_EXPIRY_RESERVE_MS));
+        let window = fiat_deadline_secs(
+            crate::TRAMPOLINE_HOLD_SECS as i64 * 1_000,
+            claim_4h,
+            24 * 3_600 * 1_000 + crate::TRAMPOLINE_SLACK_MS,
+        );
+        assert!(window >= 11 * 3_600, "fiat window {window}s");
+        // A 24h trampoline final (plus Fiber segment slack) still leaves fiat time.
+        let final_ms = 24 * 3_600 * 1_000 + crate::TRAMPOLINE_SLACK_MS;
+        assert!(
+            fiat_deadline_secs(
+                crate::TRAMPOLINE_HOLD_SECS as i64 * 1_000,
+                crate::CLAIM_MARGIN_MS,
+                final_ms,
+            ) > 0
+        );
+        assert!(
+            fiat_deadline_secs(
+                crate::HOLD_SECS as i64 * 1_000,
+                crate::CLAIM_MARGIN_MS,
+                final_ms,
+            ) <= 0
+        );
+        // Plain strings are not trampoline invoices.
+        assert_eq!(
+            hold_secs_for_payout("not-an-invoice", crate::HOLD_SECS),
+            crate::HOLD_SECS
+        );
+    }
 
     #[test]
     fn fiat_deadline_leaves_the_release_grace_and_solver_window() {

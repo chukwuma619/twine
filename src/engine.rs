@@ -12,8 +12,9 @@ use crate::{
     PAY_INVOICE, PayInvoicePayload, PayoutBudget, Phase, REFUNDING, RELEASE_DUE, ReleaseDuePayload,
     SETTLED, SOLVER_WINDOW_SECS, TRADE_RECORD, TradeRecord, TradeRecordNotice, WAITING_FIAT,
     WaitingFiatPayload, apply_clock, apply_expired, apply_release_failed, apply_release_succeeded,
-    apply_route_blocked, apply_route_failed_after_fiat, apply_route_ready, invoice_payable_through,
-    payout_budget, payout_invoice_must_last_secs, trade_actor, unix_now, unix_now_ms,
+    apply_route_blocked, apply_route_failed_after_fiat, apply_route_ready, hold_secs_for_payout,
+    invoice_payable_through, payout_budget, payout_invoice_must_last_secs, trade_actor, unix_now,
+    unix_now_ms,
 };
 use anyhow::{Result, anyhow, bail};
 use nostr_sdk::prelude::*;
@@ -453,9 +454,20 @@ impl<F: FiberRpc + 'static> Engine<F> {
         let Some(hold) = self.fiber.inbound_hold(payment_hash).await? else {
             return Ok(());
         };
+        let locked_at = trade.hold_received_at.unwrap_or_else(unix_now);
+        let order_hold_secs = self
+            .db
+            .get_order(&trade.order_id)?
+            .map_or(crate::HOLD_SECS, |order| order.hold_secs);
+        let hold_secs = trade
+            .payout_invoice
+            .as_deref()
+            .map(|invoice| hold_secs_for_payout(invoice, order_hold_secs))
+            .unwrap_or(order_hold_secs);
+        let expires_at_ms = crate::hold_window_end_ms(hold.expires_at_ms, locked_at, hold_secs);
         self.db
-            .set_hold_timing(&trade.id, hold.expires_at_ms, hold.claim_margin_ms)?;
-        trade.hold_expires_at_ms = Some(hold.expires_at_ms);
+            .set_hold_timing(&trade.id, expires_at_ms, hold.claim_margin_ms)?;
+        trade.hold_expires_at_ms = Some(expires_at_ms);
         trade.claim_margin_ms = Some(hold.claim_margin_ms);
         if trade.hold_received_at.is_none() {
             let now = unix_now();
@@ -686,14 +698,20 @@ impl<F: FiberRpc + 'static> Engine<F> {
         hold: crate::fiber::InboundHold,
     ) -> Result<Vec<Outbound>> {
         let received_at = unix_now();
+        let hold_secs = trade
+            .payout_invoice
+            .as_deref()
+            .map(|invoice| hold_secs_for_payout(invoice, order.hold_secs))
+            .unwrap_or(order.hold_secs);
+        let expires_at_ms = crate::hold_window_end_ms(hold.expires_at_ms, received_at, hold_secs);
         trade.hold_received_at = Some(received_at);
-        trade.hold_expires_at_ms = Some(hold.expires_at_ms);
+        trade.hold_expires_at_ms = Some(expires_at_ms);
         trade.claim_margin_ms = Some(hold.claim_margin_ms);
         self.db.set_hold_received(
             &trade.id,
             Phase::WaitingHold.as_str(),
             received_at,
-            Some(hold.expires_at_ms),
+            Some(expires_at_ms),
             Some(hold.claim_margin_ms),
         )?;
         self.finish_route_probe(trade, order).await
@@ -979,8 +997,9 @@ impl<F: FiberRpc + 'static> Engine<F> {
             return Ok(Err("this payout hash was already used".into()));
         }
         let order = self.require_order(&trade.order_id)?;
+        let hold_secs = hold_secs_for_payout(invoice, order.hold_secs);
         if crate::fiat_deadline_secs(
-            order.hold_secs as i64 * 1_000,
+            hold_secs as i64 * 1_000,
             crate::CLAIM_MARGIN_MS,
             parsed.final_tlc_expiry_delta_ms,
         ) <= 0
@@ -990,7 +1009,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             ));
         }
         let must_last = payout_invoice_must_last_secs(
-            order.hold_secs,
+            hold_secs,
             crate::CLAIM_MARGIN_MS,
             parsed.final_tlc_expiry_delta_ms,
         );
@@ -1008,7 +1027,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
                 &parsed.payment_hash,
                 parsed.hash_algorithm,
                 &format!("twine {}", trade.id),
-                order.hold_secs * 1_000,
+                hold_secs * 1_000,
                 INVOICE_EXPIRY_SECS,
             )
             .await
@@ -1038,6 +1057,7 @@ impl<F: FiberRpc + 'static> Engine<F> {
             &order,
             created.invoice,
             created_at,
+            hold_secs,
         )?))
     }
 
@@ -1647,6 +1667,7 @@ fn pay_invoice_replies(
     order: &Order,
     invoice: String,
     created_at: i64,
+    hold_secs: u64,
 ) -> Result<Vec<Outbound>> {
     let pay = Envelope::new(PAY_INVOICE)
         .with_trade(&trade.id)
@@ -1657,7 +1678,7 @@ fn pay_invoice_replies(
             seller_nostr: trade.seller_nostr.clone(),
             buyer_nostr: trade.buyer_nostr.clone(),
             lock_by: Some(created_at + INVOICE_EXPIRY_SECS as i64),
-            hold_ends_at: Some(created_at + order.hold_secs as i64),
+            hold_ends_at: Some(created_at + hold_secs as i64),
         })?;
     Ok(vec![
         Outbound::PublicOrder(order.public()),

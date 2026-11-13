@@ -14,10 +14,15 @@ pub(crate) fn on_my_trades<F: FiberRpc + 'static>(
         let Some(order) = engine.db.get_order(&trade.order_id)? else {
             continue;
         };
+        let hold_secs = trade
+            .payout_invoice
+            .as_deref()
+            .map(|invoice| crate::hold_secs_for_payout(invoice, order.hold_secs))
+            .unwrap_or(order.hold_secs);
         snapshots.push(TradeSnapshot::from_trade(
             &trade,
             &order.fiat_currency,
-            order.hold_secs,
+            hold_secs,
         ));
     }
     Ok(vec![Outbound::Reply {
