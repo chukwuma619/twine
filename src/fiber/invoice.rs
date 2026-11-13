@@ -152,6 +152,7 @@ impl InvoiceRpc for HttpFiber {
     }
 
     async fn parse_invoice(&self, invoice: &str) -> Result<ParsedInvoice> {
+        let invoice = super::hint::bare_invoice(invoice);
         let result = match self
             .call("parse_invoice", Some(json!({ "invoice": invoice })))
             .await

@@ -44,10 +44,21 @@ pub struct HintedInvoice {
     pub trampoline_hint: String,
 }
 
+/// A Cellula wallet shares its invoice as a pay link, `https://<wallet>/pay#<invoice>`,
+/// from its copy button and its QR code. Returns the invoice inside such a link; any
+/// other input comes back trimmed.
+pub fn bare_invoice(input: &str) -> &str {
+    let input = input.trim();
+    match input.rsplit_once('#') {
+        Some((_, tail)) if tail.trim_start().starts_with("fib") => tail.trim(),
+        _ => input,
+    }
+}
+
 /// Reads an invoice that carries a trampoline route hint. Errors for anything else,
 /// so a plain invoice keeps going through Fiber.
 pub fn decode_hinted_invoice(invoice: &str) -> Result<HintedInvoice> {
-    let invoice = invoice.trim();
+    let invoice = bare_invoice(invoice);
     let (hrp, data, variant) = bech32::decode(invoice).map_err(|e| anyhow!("bech32: {e}"))?;
     if variant != Variant::Bech32m {
         bail!("not a bech32m invoice");
@@ -352,6 +363,32 @@ mod tests {
         );
         assert_eq!(parse_hrp("fibb").unwrap(), ("Fibb".to_string(), None));
         assert!(parse_hrp("lnbc1").is_err());
+    }
+
+    /// A real Cellula testnet invoice (100 CKB, 12 Nov 2026), as the wallet's copy
+    /// button gives it: inside a pay link.
+    const CELLULA_INVOICE: &str = "fibt100000000001pqhasxqgu6cqzg7dwfhddw5evfz5kufnshtzynsv3cyx58dcc7nylpu0hmsgjen7uyhjneh6y0dczut76tuvm970usl2ypq4mclhtn6hhnt5xwgtv9kjlcumantv08l82elx0apuuw7fnn99zj88hp2nymmvq84xj3pxa4qlcxl9s3wt2z2mpfpqzznafw9gvxwezc455q3gg2wf8ugc8mgz2mxvqu0wyy05v00ymcj4w8hx44m2lv2d6fjgzyeyalqjttnk5auvt6lsg6uch5627glxfdp6ycdraldhm7af0jyrc0ufy77wemklmft47mv7qem7fqwcvf8e5sw0a60u5sm6mfenuf3xk2tgwp0l00gjr75zylg3nax2xc204kp48jx5wsu2y58xyem7n4kg6qmaakmhurn0www5lwrqqrv6net";
+
+    #[test]
+    fn a_cellula_pay_link_gives_its_invoice() {
+        let link = format!("https://wallet.testnet.cellula.id/pay#{CELLULA_INVOICE}");
+        assert_eq!(bare_invoice(&link), CELLULA_INVOICE);
+        assert_eq!(
+            bare_invoice(&format!("  {CELLULA_INVOICE}\n")),
+            CELLULA_INVOICE
+        );
+        assert_eq!(
+            bare_invoice("https://example.com/#top"),
+            "https://example.com/#top"
+        );
+        let from_link = decode_hinted_invoice(&link).unwrap();
+        assert_eq!(from_link, decode_hinted_invoice(CELLULA_INVOICE).unwrap());
+        assert_eq!(
+            from_link.trampoline_hint,
+            "032c85c1eea830ba51e78502c9385b707849710d541c67f9dae8229e6781b65476"
+        );
+        assert_eq!(from_link.amount, Some(10_000_000_000));
+        assert_eq!(from_link.final_tlc_expiry_delta_ms, Some(86_400_000));
     }
 
     #[test]

@@ -66,6 +66,7 @@ pub fn send_payment_params(
     tlc_expiry_limit_ms: u64,
     dry_run: bool,
 ) -> Result<serde_json::Value> {
+    let invoice = super::hint::bare_invoice(invoice);
     let mut params = match super::hint::decode_hinted_invoice(invoice) {
         Ok(hinted) => {
             let Some(amount) = hinted.amount else {
